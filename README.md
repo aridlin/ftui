@@ -113,9 +113,14 @@ if (ftui::input("Label", buf, sizeof(buf))) {
 // With flags
 ftui::input("Password", pw, sizeof(pw), ftui::InputFlags::Password);
 ftui::input("Read only", buf, sizeof(buf), ftui::InputFlags::ReadOnly);
+
+// Enter to submit
+bool submitted = false;
+ftui::input("Search", query, sizeof(query), ftui::InputFlags::None, &submitted);
+if (ftui::button("Go") || submitted) { /* run search */ }
 ```
 
-Clicking focuses the field. Backspace removes the last character. Multiple fields switch focus correctly.
+**Tab / Shift+Tab** cycle focus between all visible inputs without touching the mouse. Clicking focuses a field. Backspace removes the last character.
 
 ### Checkbox
 
@@ -229,6 +234,23 @@ By default FTUI suppresses the console window via a linker pragma. To keep it (e
 #define FTUI_KEEP_CONSOLE
 #define FTUI_IMPLEMENTATION
 #include "ftui.hpp"
+```
+
+---
+
+## Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| **Tab** | Focus next input field |
+| **Shift+Tab** | Focus previous input field |
+| **Enter** | Signals `enter_pressed` in the focused input |
+| **Backspace** | Deletes last character in focused input |
+| **Ctrl+Q** | Quit (enabled by default, disable with `ftui::set_quit_on_ctrl_q(false)`) |
+
+```cpp
+// Disable Ctrl+Q (e.g. for a shipped app where accidental quit would be bad)
+ftui::set_quit_on_ctrl_q(false);
 ```
 
 ---

@@ -47,14 +47,16 @@ int main() {
         ftui::text("Tiny immediate-mode GUI for Windows");
         ftui::separator();
 
-        ftui::input("Username", username, sizeof(username));
-        ftui::input("Password", password, sizeof(password), ftui::InputFlags::Password);
+        bool login = false;
+        ftui::input("Username", username, sizeof(username), ftui::InputFlags::None, &login);
+        ftui::input("Password", password, sizeof(password), ftui::InputFlags::Password, &login);
         ftui::input("Notes",    notes,    sizeof(notes));
 
+        ftui::text("Tab / Shift+Tab cycle fields  |  Enter submits  |  Ctrl+Q quit");
         ftui::separator();
 
-        if (ftui::button("Increment counter")) click_count++;
-        if (ftui::button("Reset counter"))     click_count = 0;
+        if (ftui::button("Sign in") || login) click_count++;
+        if (ftui::button("Reset counter"))    click_count = 0;
 
         ftui::separator();
 

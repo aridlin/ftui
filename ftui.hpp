@@ -81,6 +81,9 @@ void begin();
 void end();
 void shutdown();
 
+// Ctrl+Q closes the window by default. Call with false to disable (e.g. for production apps).
+void set_quit_on_ctrl_q(bool enabled);
+
 // --- Widgets ---
 
 void text(const char* label);
@@ -100,8 +103,11 @@ inline bool operator&(InputFlags a, InputFlags b) {
     return (static_cast<unsigned>(a) & static_cast<unsigned>(b)) != 0;
 }
 
+// Returns true when contents changed. If enter_pressed is non-null it is set true
+// when the user hits Enter while this field is focused (independent of text change).
 bool input(const char* label, char* buffer, int buffer_size,
-           InputFlags flags = InputFlags::None);
+           InputFlags flags         = InputFlags::None,
+           bool*       enter_pressed = nullptr);
 
 bool checkbox(const char* label, bool* value);
 bool slider_float(const char* label, float* value, float min_v, float max_v);
@@ -242,6 +248,8 @@ struct InputState {
     bool  mouse_released   = false;
     bool  key_backspace    = false;
     bool  key_enter        = false;
+    bool  key_tab          = false;
+    bool  key_shift_tab    = false;
     char  text_input[64]   = {};
     int   text_input_count = 0;
     bool  focused          = true;
@@ -255,6 +263,9 @@ struct UIContext {
     Rect  content_region   = {};
     float cursor_x         = 0;
     float cursor_y         = 0;
+    // Tab-stop lists: built during a frame, used next frame for Tab navigation
+    std::vector<int> tab_stops;
+    std::vector<int> tab_stops_prev;
 };
 
 // ---- Globals -----------------------------------------------
@@ -267,11 +278,14 @@ static DebugState    g_debug;
 static Style         g_style;
 static LARGE_INTEGER g_freq;
 static LARGE_INTEGER g_last_time;
-static float         g_fps        = 0.0f;
-static int           g_fps_frames = 0;
-static float         g_fps_accum  = 0.0f;
+static float         g_fps           = 0.0f;
+static int           g_fps_frames    = 0;
+static float         g_fps_accum     = 0.0f;
+static bool          g_ctrl_q_quit   = true;
 
 } // namespace internal
+
+void set_quit_on_ctrl_q(bool enabled) { internal::g_ctrl_q_quit = enabled; }
 
 // ============================================================
 // Themes
@@ -771,6 +785,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_BACK)   g_input.key_backspace = true;
         if (wp == VK_RETURN) g_input.key_enter     = true;
+        if (wp == VK_TAB) {
+            if (GetKeyState(VK_SHIFT) & 0x8000) g_input.key_shift_tab = true;
+            else                                 g_input.key_tab       = true;
+        }
+        if (wp == 'Q' && (GetKeyState(VK_CONTROL) & 0x8000) && g_ctrl_q_quit)
+            PostQuitMessage(0);
         return 0;
 
     case WM_SETFOCUS:
@@ -827,17 +847,16 @@ bool create_window(const Config& cfg) {
     DWORD style = WS_OVERLAPPEDWINDOW;
     if (!cfg.resizable) style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
 
-    // Use AdjustWindowRectExForDpi if available (Windows 10+); fall back gracefully
-    RECT rc = {0, 0, cfg.width, cfg.height};
+    // Convert logical (DIP) client size → physical pixels using system DPI.
+    // Without this the window opens at 96-DPI logical size and looks tiny on HiDPI screens.
+    UINT sys_dpi   = GetDpiForSystem();
+    float pre_scale = (float)sys_dpi / 96.0f;
+    RECT rc = {0, 0, (LONG)(cfg.width * pre_scale + 0.5f), (LONG)(cfg.height * pre_scale + 0.5f)};
+
     using AdjustFn = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
     auto adjust_dpi = (AdjustFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi");
-    if (adjust_dpi) {
-        // Use system DPI as best estimate before window exists
-        UINT sys_dpi = GetDpiForSystem();
-        adjust_dpi(&rc, style, FALSE, 0, sys_dpi);
-    } else {
-        AdjustWindowRect(&rc, style, FALSE);
-    }
+    if (adjust_dpi) adjust_dpi(&rc, style, FALSE, 0, sys_dpi);
+    else            AdjustWindowRect(&rc, style, FALSE);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
 
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
@@ -884,6 +903,8 @@ bool pump() {
     g_input.mouse_released   = false;
     g_input.key_backspace    = false;
     g_input.key_enter        = false;
+    g_input.key_tab          = false;
+    g_input.key_shift_tab    = false;
     g_input.text_input_count = 0;
     memset(g_input.text_input, 0, sizeof(g_input.text_input));
 
@@ -900,6 +921,19 @@ void begin() {
     using namespace internal;
 
     g_ctx.hot_id = 0;
+
+    // Tab / Shift+Tab: navigate focus across input fields using last frame's order
+    if ((g_input.key_tab || g_input.key_shift_tab) && !g_ctx.tab_stops_prev.empty()) {
+        auto& stops = g_ctx.tab_stops_prev;
+        int cur = g_ctx.focused_input_id;
+        int idx = -1;
+        for (int i = 0; i < (int)stops.size(); i++) { if (stops[i] == cur) { idx = i; break; } }
+        if (g_input.key_shift_tab)
+            g_ctx.focused_input_id = stops[(idx <= 0 ? (int)stops.size() : idx) - 1];
+        else
+            g_ctx.focused_input_id = stops[(idx + 1) % (int)stops.size()];
+    }
+    g_ctx.tab_stops.clear();
 
     float pad = g_style.window_padding;
     g_ctx.content_region = {pad, pad,
@@ -961,6 +995,7 @@ void end() {
         create_render_target();
     }
 
+    g_ctx.tab_stops_prev = g_ctx.tab_stops;
     g_ctx.frame_index++;
 }
 
@@ -1047,7 +1082,7 @@ bool button(const char* label) {
     return clicked;
 }
 
-bool input(const char* label, char* buffer, int buffer_size, InputFlags flags) {
+bool input(const char* label, char* buffer, int buffer_size, InputFlags flags, bool* enter_pressed) {
     using namespace internal;
     if (!g_renderer.drawing) return false;
 
@@ -1057,6 +1092,9 @@ bool input(const char* label, char* buffer, int buffer_size, InputFlags flags) {
 
     bool is_password = (flags & InputFlags::Password);
     bool is_readonly = (flags & InputFlags::ReadOnly);
+
+    // Register as a tab stop so Tab/Shift+Tab can cycle to/from this field
+    g_ctx.tab_stops.push_back(id);
 
     float label_h = text_line_height();
     float box_h   = g_style.item_height;
@@ -1075,6 +1113,8 @@ bool input(const char* label, char* buffer, int buffer_size, InputFlags flags) {
     bool focused = (g_ctx.focused_input_id == id);
     bool changed = false;
 
+    if (enter_pressed) *enter_pressed = false;
+
     if (focused && !is_readonly) {
         if (g_input.key_backspace) {
             int len = (int)strlen(buffer);
@@ -1084,6 +1124,9 @@ bool input(const char* label, char* buffer, int buffer_size, InputFlags flags) {
                 buffer[i] = '\0';
                 changed = true;
             }
+        }
+        if (g_input.key_enter) {
+            if (enter_pressed) *enter_pressed = true;
         }
         if (g_input.text_input_count > 0) {
             int len   = (int)strlen(buffer);
