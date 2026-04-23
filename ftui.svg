@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 4961 4961" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:1.5;">
+    <rect x="552.816" y="552.816" width="3854.998" height="3854.998" style="stroke:black;stroke-width:88.34px;"/>
+    <path d="M2480.315,552.816L4407.814,4407.814L552.816,4407.814L2480.315,552.816Z" style="fill:white;stroke:white;stroke-width:88.34px;"/>
+    <g transform="matrix(1,0,0,1,50.447036,11.911176)">
+        <path d="M502.369,540.905L4357.367,4395.903" style="fill:none;stroke:rgb(255,130,0);stroke-width:88.34px;"/>
+    </g>
+    <rect x="552.816" y="552.816" width="3854.998" height="3854.998" style="fill:rgb(255,130,0);fill-opacity:0;stroke:rgb(255,130,0);stroke-width:88.34px;"/>
+    <g transform="matrix(1.08617,1.08617,-1.08617,1.08617,2398.44923,-1552.107782)">
+        <g transform="matrix(1330.27787,0,0,1330.27787,2596.765614,1703.990477)">
+        </g>
+        <text x="1146.971px" y="1703.99px" style="font-family:'BerlinSansFBDemi-Bold', 'Berlin Sans FB Demi', sans-serif;font-weight:700;font-size:1330.278px;fill:rgb(255,130,0);">FT</text>
+    </g>
+    <g transform="matrix(-1.08617,-1.08617,1.08617,-1.08617,2352.598528,6509.979903)">
+        <g transform="matrix(1330.27787,0,0,1330.27787,2446.719623,1703.990477)">
+        </g>
+        <text x="1146.971px" y="1703.99px" style="font-family:'BerlinSansFBDemi-Bold', 'Berlin Sans FB Demi', sans-serif;font-weight:700;font-size:1330.278px;fill:rgb(255,130,0);">UI</text>
+    </g>
+</svg>
