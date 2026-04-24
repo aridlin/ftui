@@ -17,6 +17,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <functional>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -111,6 +112,10 @@ bool input(const char* label, char* buffer, int buffer_size,
 
 bool checkbox(const char* label, bool* value);
 bool slider_float(const char* label, float* value, float min_v, float max_v);
+
+// Horizontal equal-width columns. Calls fn() with layout in row mode; all
+// widgets inside are placed left-to-right, each occupying an equal cell width.
+void row(int cols, std::function<void()> fn);
 
 struct ImageHandle { ID2D1Bitmap* bitmap = nullptr; };
 void         image(ImageHandle* img, float width, float height);
@@ -255,17 +260,35 @@ struct InputState {
     bool  focused          = true;
 };
 
+struct RowContext {
+    bool  active     = false;
+    int   cols       = 0;
+    float cell_w     = 0.0f;
+    float gap        = 0.0f;
+    float start_x    = 0.0f;
+    float start_y    = 0.0f;
+    int   col_index  = 0;
+    float row_height = 0.0f;
+};
+
 struct UIContext {
-    int   hot_id           = 0;
-    int   active_id        = 0;
-    int   focused_input_id = 0;
-    int   frame_index      = 0;
-    Rect  content_region   = {};
-    float cursor_x         = 0;
-    float cursor_y         = 0;
+    int        hot_id           = 0;
+    int        active_id        = 0;
+    int        focused_input_id = 0;
+    int        frame_index      = 0;
+    Rect       content_region   = {};
+    float      cursor_x         = 0;
+    float      cursor_y         = 0;
+    RowContext  row_ctx;
     // Tab-stop lists: built during a frame, used next frame for Tab navigation
     std::vector<int> tab_stops;
     std::vector<int> tab_stops_prev;
+};
+
+struct CmdState {
+    bool active  = false;
+    char buf[16] = {};
+    int  len     = 0;
 };
 
 // ---- Globals -----------------------------------------------
@@ -281,11 +304,17 @@ static LARGE_INTEGER g_last_time;
 static float         g_fps           = 0.0f;
 static int           g_fps_frames    = 0;
 static float         g_fps_accum     = 0.0f;
-static bool          g_ctrl_q_quit   = true;
+static bool          g_shortcuts_enabled = true;
+static CmdState      g_cmd;
+static float         g_scroll_y          = 0.0f;
+static float         g_content_height    = 0.0f; // total content height from previous frame
+static bool          g_sb_dragging       = false;
+static float         g_sb_drag_mouse_y   = 0.0f;
+static float         g_sb_drag_scroll0   = 0.0f;
 
 } // namespace internal
 
-void set_quit_on_ctrl_q(bool enabled) { internal::g_ctrl_q_quit = enabled; }
+void set_quit_on_ctrl_q(bool enabled) { internal::g_shortcuts_enabled = enabled; }
 
 // ============================================================
 // Themes
@@ -485,6 +514,14 @@ static float text_line_height() { return g_style.font_size + 6.0f; }
 // ---- Layout ------------------------------------------------
 
 static Rect next_rect(float height) {
+    if (g_ctx.row_ctx.active) {
+        auto& rc = g_ctx.row_ctx;
+        float x = rc.start_x + rc.col_index * (rc.cell_w + rc.gap);
+        Rect r = {x, rc.start_y, rc.cell_w, height};
+        rc.col_index++;
+        if (height > rc.row_height) rc.row_height = height;
+        return r;
+    }
     Rect r = {g_ctx.cursor_x, g_ctx.cursor_y, g_ctx.content_region.w, height};
     g_ctx.cursor_y += height + g_style.item_spacing;
     return r;
@@ -711,6 +748,26 @@ static void release_render_target() {
     if (g_renderer.target)           { g_renderer.target->Release();           g_renderer.target = nullptr; }
 }
 
+// ---- Command mode ------------------------------------------
+
+static void execute_command() {
+    if      (strcmp(g_cmd.buf, "q")  == 0) PostQuitMessage(0);
+    else if (strcmp(g_cmd.buf, "td") == 0) g_style = default_dark_style();
+    else if (strcmp(g_cmd.buf, "tc") == 0) g_style = catppuccin_mocha_style();
+    else if (strcmp(g_cmd.buf, "tn") == 0) g_style = nord_style();
+    else if (strcmp(g_cmd.buf, "tg") == 0) g_style = gruvbox_dark_style();
+    else if (strcmp(g_cmd.buf, "to") == 0) g_style = one_dark_style();
+    g_cmd.active = false;
+    g_cmd.len    = 0;
+    g_cmd.buf[0] = '\0';
+}
+
+static void cmd_clear() {
+    g_cmd.active = false;
+    g_cmd.len    = 0;
+    g_cmd.buf[0] = '\0';
+}
+
 // ---- WndProc -----------------------------------------------
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -755,6 +812,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_input.mouse_pressed = true;
         g_input.mouse_x = GET_X_LPARAM(lp) / g_renderer.dpi_scale;
         g_input.mouse_y = GET_Y_LPARAM(lp) / g_renderer.dpi_scale;
+        if (g_cmd.active) cmd_clear();
         return 0;
 
     case WM_LBUTTONUP:
@@ -767,10 +825,27 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CHAR: {
         wchar_t wc = (wchar_t)wp;
+        if (g_cmd.active) {
+            if (wc == L'\b') {
+                if (g_cmd.len > 0) g_cmd.buf[--g_cmd.len] = '\0';
+            } else if (wc == L'\r' || wc == L'\n') {
+                execute_command();
+            } else if (wc == 27) { // ESC (some systems send it via WM_CHAR)
+                cmd_clear();
+            } else if (wc >= 32 && g_cmd.len < 15) {
+                g_cmd.buf[g_cmd.len++] = (char)wc;
+                g_cmd.buf[g_cmd.len]   = '\0';
+            }
+            return 0;
+        }
         if (wc == L'\b') {
             g_input.key_backspace = true;
         } else if (wc == L'\r' || wc == L'\n') {
             g_input.key_enter = true;
+        } else if (wc == L':' && g_ctx.focused_input_id == 0 && g_shortcuts_enabled) {
+            g_cmd.active = true;
+            g_cmd.len    = 0;
+            g_cmd.buf[0] = '\0';
         } else if (wc >= 32) {
             char buf[8] = {};
             int n = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, buf, sizeof(buf)-1, nullptr, nullptr);
@@ -783,15 +858,27 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_KEYDOWN:
+        if (g_cmd.active) {
+            if (wp == VK_ESCAPE) cmd_clear();
+            // VK_BACK and VK_RETURN are handled in WM_CHAR
+            return 0;
+        }
         if (wp == VK_BACK)   g_input.key_backspace = true;
         if (wp == VK_RETURN) g_input.key_enter     = true;
         if (wp == VK_TAB) {
             if (GetKeyState(VK_SHIFT) & 0x8000) g_input.key_shift_tab = true;
             else                                 g_input.key_tab       = true;
         }
-        if (wp == 'Q' && (GetKeyState(VK_CONTROL) & 0x8000) && g_ctrl_q_quit)
+        if (wp == 'Q' && (GetKeyState(VK_CONTROL) & 0x8000) && g_shortcuts_enabled)
             PostQuitMessage(0);
         return 0;
+
+    case WM_MOUSEWHEEL: {
+        short delta = (short)HIWORD(wp);
+        g_scroll_y -= (float)delta / WHEEL_DELTA * 80.0f;
+        if (g_scroll_y < 0.0f) g_scroll_y = 0.0f;
+        return 0;
+    }
 
     case WM_SETFOCUS:
         g_input.focused = true;
@@ -879,6 +966,27 @@ bool create_window(const Config& cfg) {
     if (!create_render_target()) return false;  // also sets dpi_scale + logical width/height
     if (!create_text_format())   return false;
 
+    // GetDpiForSystem() used above may differ from the actual per-monitor DPI that
+    // create_render_target() just read via GetDpiForWindow().  When they differ the
+    // window has the wrong physical client size and widgets beyond the clipped region
+    // are invisible until the user manually resizes.  Correct it now, before show.
+    if (g_platform.width != cfg.width || g_platform.height != cfg.height) {
+        RECT rc2 = {0, 0,
+            (LONG)(cfg.width  * g_renderer.dpi_scale + 0.5f),
+            (LONG)(cfg.height * g_renderer.dpi_scale + 0.5f)};
+        if (adjust_dpi) adjust_dpi(&rc2, style, FALSE, 0, (UINT)(g_renderer.dpi_scale * 96.0f + 0.5f));
+        else            AdjustWindowRect(&rc2, style, FALSE);
+        int nw = rc2.right - rc2.left, nh = rc2.bottom - rc2.top;
+        int nx = x, ny = y;
+        if (cfg.center_window) {
+            nx = (GetSystemMetrics(SM_CXSCREEN) - nw) / 2;
+            ny = (GetSystemMetrics(SM_CYSCREEN) - nh) / 2;
+        }
+        SetWindowPos(g_platform.hwnd, nullptr, nx, ny, nw, nh,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        // WM_SIZE fired by SetWindowPos will call target->Resize and fix g_platform.width/height
+    }
+
     // Apply icon — use the one from Config, or generate the FTUI logo geometry
     {
         HICON icon = cfg.icon ? cfg.icon : make_ftui_icon(256);
@@ -940,7 +1048,15 @@ void begin() {
         (float)g_platform.width  - 2.0f * pad,
         (float)g_platform.height - 2.0f * pad};
     g_ctx.cursor_x = g_ctx.content_region.x;
-    g_ctx.cursor_y = g_ctx.content_region.y;
+
+    const float kScrollW = 14.0f;
+    float visible_h = g_ctx.content_region.h;
+    bool need_sb = g_content_height > visible_h + 1.0f;
+    float max_scroll = need_sb ? g_content_height - visible_h : 0.0f;
+    if (!need_sb) g_scroll_y = 0.0f;
+    g_scroll_y = g_scroll_y < 0.0f ? 0.0f : (g_scroll_y > max_scroll ? max_scroll : g_scroll_y);
+    if (need_sb) g_ctx.content_region.w -= kScrollW + g_style.window_padding;
+    g_ctx.cursor_y = g_ctx.content_region.y - g_scroll_y;
 
     // FPS tracking
     LARGE_INTEGER now;
@@ -959,11 +1075,67 @@ void begin() {
     g_renderer.target->BeginDraw();
     g_renderer.drawing = true;
     clear_bg(g_style.background);
+
+    // Clip to visible content area so widgets scrolled out of view don't bleed
+    D2D1_RECT_F clip_r = {0.0f, g_ctx.content_region.y,
+                          (float)g_platform.width,
+                          g_ctx.content_region.y + visible_h};
+    g_renderer.target->PushAxisAlignedClip(clip_r, D2D1_ANTIALIAS_MODE_ALIASED);
 }
 
 void end() {
     using namespace internal;
     if (!g_renderer.drawing) return;
+
+    // Pop the content clip pushed in begin()
+    g_renderer.target->PopAxisAlignedClip();
+
+    // Compute and store total content height for next frame
+    float new_content_h = g_ctx.cursor_y + g_scroll_y - g_ctx.content_region.y;
+    if (new_content_h < 0.0f) new_content_h = 0.0f;
+
+    // Scrollbar (uses g_content_height from prev frame, consistent with begin())
+    {
+        const float kScrollW = 14.0f;
+        float visible_h = g_ctx.content_region.h;
+        bool need_sb = g_content_height > visible_h + 1.0f;
+        if (need_sb) {
+            float max_scroll = g_content_height - visible_h;
+            float track_x    = g_ctx.content_region.x + g_ctx.content_region.w + g_style.window_padding;
+            Rect  track      = {track_x, g_ctx.content_region.y, kScrollW, visible_h};
+            float thumb_h    = fmaxf(20.0f, (visible_h / g_content_height) * visible_h);
+            float thumb_t    = max_scroll > 0.0f ? g_scroll_y / max_scroll : 0.0f;
+            float thumb_y    = g_ctx.content_region.y + thumb_t * (visible_h - thumb_h);
+            Rect  thumb      = {track_x, thumb_y, kScrollW, thumb_h};
+
+            bool thumb_hov = rect_contains(thumb, g_input.mouse_x, g_input.mouse_y);
+            bool track_hov = rect_contains(track, g_input.mouse_x, g_input.mouse_y);
+
+            if (g_input.mouse_pressed && thumb_hov) {
+                g_sb_dragging     = true;
+                g_sb_drag_mouse_y = g_input.mouse_y;
+                g_sb_drag_scroll0 = g_scroll_y;
+            }
+            if (g_sb_dragging) {
+                if (g_input.mouse_down || g_input.mouse_released) {
+                    float scale = max_scroll / fmaxf(1.0f, visible_h - thumb_h);
+                    g_scroll_y  = g_sb_drag_scroll0 + (g_input.mouse_y - g_sb_drag_mouse_y) * scale;
+                    g_scroll_y  = g_scroll_y < 0.0f ? 0.0f : (g_scroll_y > max_scroll ? max_scroll : g_scroll_y);
+                }
+                if (g_input.mouse_released) g_sb_dragging = false;
+            }
+            if (g_input.mouse_pressed && track_hov && !thumb_hov) {
+                g_scroll_y += (g_input.mouse_y < thumb_y ? -visible_h : visible_h);
+                g_scroll_y  = g_scroll_y < 0.0f ? 0.0f : (g_scroll_y > max_scroll ? max_scroll : g_scroll_y);
+            }
+
+            fill_round_rect(track, 6.0f, g_style.input_bg);
+            fill_round_rect(thumb, 6.0f,
+                g_sb_dragging ? g_style.input_focus :
+                thumb_hov     ? g_style.button_hover : g_style.border);
+        }
+        g_content_height = new_content_h;
+    }
 
     // Debug overlays (drawn last, on top)
     if (g_debug.show_fps) {
@@ -985,6 +1157,17 @@ void end() {
         Rect r = {4, oy, 360, lh};
         fill_rect(r, {0, 0, 0, 0.6f});
         draw_text_utf8(buf, r, g_style.text_dim);
+    }
+
+    // Command mode overlay — bottom-left, shows ":cmd_"
+    if (g_cmd.active) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), ":%s_", g_cmd.buf);
+        float lh = text_line_height();
+        float oy = (float)g_platform.height - g_style.window_padding - lh;
+        Rect  r  = {g_style.window_padding, oy, 200.0f, lh};
+        fill_rect({r.x - 4.0f, r.y - 2.0f, r.w + 8.0f, r.h + 4.0f}, {0.0f, 0.0f, 0.0f, 0.75f});
+        draw_text_utf8(buf, r, g_style.text);
     }
 
     HRESULT hr = g_renderer.target->EndDraw();
@@ -1045,6 +1228,28 @@ void spacing(float px) {
     g_ctx.cursor_y += px;
 }
 
+void row(int cols, std::function<void()> fn) {
+    using namespace internal;
+    if (!g_renderer.drawing || cols <= 0) return;
+
+    float gap    = g_style.item_spacing;
+    float cell_w = (g_ctx.content_region.w - gap * (float)(cols - 1)) / (float)cols;
+
+    g_ctx.row_ctx.active     = true;
+    g_ctx.row_ctx.cols       = cols;
+    g_ctx.row_ctx.cell_w     = cell_w;
+    g_ctx.row_ctx.gap        = gap;
+    g_ctx.row_ctx.start_x    = g_ctx.cursor_x;
+    g_ctx.row_ctx.start_y    = g_ctx.cursor_y;
+    g_ctx.row_ctx.col_index  = 0;
+    g_ctx.row_ctx.row_height = 0.0f;
+
+    fn();
+
+    g_ctx.row_ctx.active  = false;
+    g_ctx.cursor_y       += g_ctx.row_ctx.row_height + g_style.item_spacing;
+}
+
 bool button(const char* label) {
     using namespace internal;
     if (!g_renderer.drawing) return false;
@@ -1098,11 +1303,9 @@ bool input(const char* label, char* buffer, int buffer_size, InputFlags flags, b
 
     float label_h = text_line_height();
     float box_h   = g_style.item_height;
-    float start_y = g_ctx.cursor_y;
-    g_ctx.cursor_y += label_h + 4.0f + box_h + g_style.item_spacing;
-
-    Rect label_r = {g_ctx.cursor_x, start_y,                     g_ctx.content_region.w, label_h};
-    Rect box_r   = {g_ctx.cursor_x, start_y + label_h + 4.0f,   g_ctx.content_region.w, box_h};
+    Rect outer    = next_rect(label_h + 4.0f + box_h);
+    Rect label_r  = {outer.x, outer.y,                  outer.w, label_h};
+    Rect box_r    = {outer.x, outer.y + label_h + 4.0f, outer.w, box_h};
 
     bool hovered = rect_contains(box_r, g_input.mouse_x, g_input.mouse_y);
     if (g_input.mouse_pressed) {
@@ -1250,11 +1453,9 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
 
     float label_h = text_line_height();
     float box_h   = g_style.item_height;
-    float start_y = g_ctx.cursor_y;
-    g_ctx.cursor_y += label_h + 4.0f + box_h + g_style.item_spacing;
-
-    Rect label_r = {g_ctx.cursor_x, start_y,                   g_ctx.content_region.w, label_h};
-    Rect track_r = {g_ctx.cursor_x, start_y + label_h + 4.0f, g_ctx.content_region.w, box_h};
+    Rect outer    = next_rect(label_h + 4.0f + box_h);
+    Rect label_r  = {outer.x, outer.y,                   outer.w, label_h};
+    Rect track_r  = {outer.x, outer.y + label_h + 4.0f,  outer.w, box_h};
 
     bool hovered = rect_contains(track_r, g_input.mouse_x, g_input.mouse_y);
     if (hovered) g_ctx.hot_id = id;

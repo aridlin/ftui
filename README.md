@@ -140,6 +140,20 @@ if (ftui::slider_float("Volume", &volume, 0.0f, 1.0f)) {
 }
 ```
 
+### Row (columns)
+
+Temporarily switches the layout to horizontal, splitting the available width into N equal cells separated by `item_spacing` gaps. Widgets called inside the lambda are placed left-to-right; after `fn()` returns the cursor advances below the tallest cell.
+
+```cpp
+ftui::row(3, [&]() {
+    if (ftui::button("Left"))   { /* ... */ }
+    if (ftui::button("Center")) { /* ... */ }
+    if (ftui::button("Right"))  { /* ... */ }
+});
+```
+
+Any widget type works inside a row. Excess widgets beyond `N` are placed anyway (they overflow to the right).
+
 ### Image
 
 ```cpp
@@ -246,12 +260,37 @@ By default FTUI suppresses the console window via a linker pragma. To keep it (e
 | **Shift+Tab** | Focus previous input field |
 | **Enter** | Signals `enter_pressed` in the focused input |
 | **Backspace** | Deletes last character in focused input |
-| **Ctrl+Q** | Quit (enabled by default, disable with `ftui::set_quit_on_ctrl_q(false)`) |
+| **Ctrl+Q** | Quit |
+| **:** | Enter command mode (only when no input field is focused) |
+| **Escape** | Cancel command mode |
+
+### Command mode
+
+Press `:` when no input is focused to open a command prompt (shown at the bottom-left). Type a command and press **Enter** to execute it. **Escape** or a mouse click cancels.
+
+| Command | Action |
+|---|---|
+| `:q` | Quit |
+| `:td` | Switch to Default Dark theme |
+| `:tc` | Switch to Catppuccin Mocha theme |
+| `:tn` | Switch to Nord theme |
+| `:tg` | Switch to Gruvbox Dark theme |
+| `:to` | Switch to One Dark theme |
+
+All built-in shortcuts (Ctrl+Q and command mode) share a single toggle:
 
 ```cpp
-// Disable Ctrl+Q (e.g. for a shipped app where accidental quit would be bad)
+// Disable all built-in shortcuts (e.g. for a shipped app)
 ftui::set_quit_on_ctrl_q(false);
 ```
+
+---
+
+## Scrolling
+
+FTUI scrolls automatically. When the total content height exceeds the window height a scrollbar appears on the right and content is clipped to the visible area. No setup required.
+
+**Mouse wheel** scrolls 80 px per tick. **Scrollbar thumb** is draggable. Clicking the track above/below the thumb pages by one visible height.
 
 ---
 

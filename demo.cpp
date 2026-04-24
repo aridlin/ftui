@@ -95,9 +95,11 @@ int main() {
 
         ftui::separator();
 
-        if (ftui::button("Toggle layout rects")) ftui::debug().show_layout_rects ^= true;
-        if (ftui::button("Toggle ID overlay"))   { ftui::debug().show_hovered_id ^= true; ftui::debug().show_active_id ^= true; }
-        if (ftui::button("Toggle FPS"))          ftui::debug().show_fps ^= true;
+        ftui::row(3, [&]() {
+            if (ftui::button("Toggle rects")) ftui::debug().show_layout_rects ^= true;
+            if (ftui::button("Toggle IDs"))   { ftui::debug().show_hovered_id ^= true; ftui::debug().show_active_id ^= true; }
+            if (ftui::button("Toggle FPS"))   ftui::debug().show_fps ^= true;
+        });
 
         ftui::separator();
 
