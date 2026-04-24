@@ -1,6 +1,56 @@
 #define FTUI_IMPLEMENTATION
 #include "ftui.hpp"
 
+#include <windows.h>
+#include <dxgi.h>
+
+// Hardware info helpers — called once before opening the child window
+static void hw_get_cpu(char* out, int out_sz) {
+    wchar_t id[256] = {};
+    DWORD sz = sizeof(id);
+    GetEnvironmentVariableW(L"PROCESSOR_IDENTIFIER", id, sz / sizeof(wchar_t));
+    SYSTEM_INFO si = {};
+    GetSystemInfo(&si);
+    char id_utf8[256] = {};
+    WideCharToMultiByte(CP_UTF8, 0, id, -1, id_utf8, sizeof(id_utf8), nullptr, nullptr);
+    snprintf(out, out_sz, "%s  |  %lu logical cores", id_utf8, si.dwNumberOfProcessors);
+}
+
+static void hw_get_gpu(char* out, int out_sz) {
+    typedef HRESULT (WINAPI *PFN_CreateDXGIFactory)(REFIID, void**);
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    if (!dxgi) { snprintf(out, out_sz, "(dxgi unavailable)"); return; }
+    auto fn = (PFN_CreateDXGIFactory)GetProcAddress(dxgi, "CreateDXGIFactory");
+    if (!fn) { FreeLibrary(dxgi); snprintf(out, out_sz, "(CreateDXGIFactory missing)"); return; }
+    IDXGIFactory* factory = nullptr;
+    if (FAILED(fn(__uuidof(IDXGIFactory), (void**)&factory))) {
+        FreeLibrary(dxgi); snprintf(out, out_sz, "(factory failed)"); return;
+    }
+    IDXGIAdapter* adapter = nullptr;
+    if (SUCCEEDED(factory->EnumAdapters(0, &adapter))) {
+        DXGI_ADAPTER_DESC desc = {};
+        adapter->GetDesc(&desc);
+        char name[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
+        float vram_gb = desc.DedicatedVideoMemory / (1024.0f * 1024.0f * 1024.0f);
+        snprintf(out, out_sz, "%s  |  %.1f GB VRAM", name, vram_gb);
+        adapter->Release();
+    } else {
+        snprintf(out, out_sz, "(no adapter found)");
+    }
+    factory->Release();
+    FreeLibrary(dxgi);
+}
+
+static void hw_get_ram(char* out, int out_sz) {
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    float total_gb = ms.ullTotalPhys / (1024.0f * 1024.0f * 1024.0f);
+    float avail_gb = ms.ullAvailPhys / (1024.0f * 1024.0f * 1024.0f);
+    snprintf(out, out_sz, "%.1f GB total  |  %.1f GB available", total_gb, avail_gb);
+}
+
 int main() {
     ftui::Config cfg;
     cfg.title  = L"FTUI Demo";
@@ -91,6 +141,34 @@ int main() {
         if (ftui::button(theme_btn)) {
             theme_idx = (theme_idx + 1) % 5;
             ftui::set_style(theme_fns[theme_idx]());
+        }
+
+        ftui::separator();
+
+        if (ftui::button("Hardware Check")) {
+            static char s_cpu[256], s_gpu[256], s_ram[256];
+            hw_get_cpu(s_cpu, sizeof(s_cpu));
+            hw_get_gpu(s_gpu, sizeof(s_gpu));
+            hw_get_ram(s_ram, sizeof(s_ram));
+
+            static bool show_cpu = false, show_gpu = false, show_ram = false;
+            show_cpu = show_gpu = show_ram = false;
+
+            ftui::Config hw{};
+            hw.title  = L"Hardware Info";
+            hw.width  = 700;
+            hw.height = 300;
+            hw.center_window = true;
+            ftui::open_child_window(hw, [&]() {
+                ftui::text("Hardware Information");
+                ftui::separator();
+                if (ftui::button("CPU")) show_cpu = !show_cpu;
+                if (show_cpu) ftui::text(s_cpu);
+                if (ftui::button("GPU")) show_gpu = !show_gpu;
+                if (show_gpu) ftui::text(s_gpu);
+                if (ftui::button("RAM")) show_ram = !show_ram;
+                if (show_ram) ftui::text(s_ram);
+            });
         }
 
         ftui::separator();

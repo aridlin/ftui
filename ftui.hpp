@@ -135,6 +135,10 @@ std::string open_file_dialog(
     const FileFilter* filters      = nullptr,
     int               filter_count = 0);
 
+// Opens a new window running fn() each frame, blocking until the window is closed.
+// Inherits the current style and debug settings. Safe to nest.
+void open_child_window(const Config& cfg, std::function<void()> fn);
+
 // --- Debug ---
 
 struct DebugState {
@@ -255,6 +259,10 @@ struct InputState {
     bool  key_enter        = false;
     bool  key_tab          = false;
     bool  key_shift_tab    = false;
+    bool  key_left         = false;
+    bool  key_right        = false;
+    bool  key_ctrl_c       = false;
+    bool  key_ctrl_v       = false;
     char  text_input[64]   = {};
     int   text_input_count = 0;
     bool  focused          = true;
@@ -311,6 +319,9 @@ static float         g_content_height    = 0.0f; // total content height from pr
 static bool          g_sb_dragging       = false;
 static float         g_sb_drag_mouse_y   = 0.0f;
 static float         g_sb_drag_scroll0   = 0.0f;
+static int           g_text_cursor_id    = 0;   // widget id that currently owns the text cursor
+static int           g_text_cursor       = 0;   // byte offset of cursor in that widget's buffer
+static int           g_text_sel_anchor   = 0;   // byte offset of selection anchor (= cursor when none)
 
 } // namespace internal
 
@@ -510,6 +521,88 @@ static float measure_text_width(const char* utf8) {
 }
 
 static float text_line_height() { return g_style.font_size + 6.0f; }
+
+// ---- Text / cursor helpers ---------------------------------
+
+static int utf8_advance(const char* s, int pos) {
+    if (!s[pos]) return pos;
+    unsigned char c = (unsigned char)s[pos];
+    return pos + (c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4);
+}
+static int utf8_retreat(const char* s, int pos) {
+    if (pos == 0) return 0;
+    do { --pos; } while (pos > 0 && ((unsigned char)s[pos] & 0xC0) == 0x80);
+    return pos;
+}
+// Count UTF-8 characters from s[0] to s[byte_offset-1]
+static int utf8_char_count(const char* s, int byte_offset) {
+    int n = 0;
+    for (int i = 0; i < byte_offset && s[i]; ) {
+        unsigned char c = (unsigned char)s[i];
+        i += c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        n++;
+    }
+    return n;
+}
+// Measure width of the first byte_len bytes of utf8
+static float measure_text_at(const char* utf8, int byte_len) {
+    if (byte_len <= 0 || !utf8 || !utf8[0]) return 0.0f;
+    std::string sub(utf8, utf8 + byte_len);
+    return measure_text_width(sub.c_str());
+}
+// Hit-test: given pixel X relative to text origin, return UTF-8 byte offset
+static int byte_from_x(const char* utf8, float rel_x) {
+    if (!utf8 || !utf8[0]) return 0;
+    if (rel_x <= 0.0f) return 0;
+    std::wstring w = utf8_to_wide(utf8);
+    IDWriteTextLayout* layout = nullptr;
+    if (FAILED(g_renderer.dwrite_factory->CreateTextLayout(
+            w.c_str(), (UINT32)w.size(), g_renderer.text_format,
+            10000.0f, 1000.0f, &layout)) || !layout)
+        return (int)strlen(utf8);
+    BOOL trailing = FALSE, inside = FALSE;
+    DWRITE_HIT_TEST_METRICS m{};
+    layout->HitTestPoint(rel_x, 0.0f, &trailing, &inside, &m);
+    UINT32 wpos = m.textPosition + (trailing ? 1u : 0u);
+    if (wpos > (UINT32)w.size()) wpos = (UINT32)w.size();
+    layout->Release();
+    // Convert UTF-16 position → UTF-8 byte offset
+    const char* p = utf8;
+    UINT32 wc = 0;
+    while (*p && wc < wpos) {
+        unsigned char c = (unsigned char)*p;
+        int sl = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        wc += (sl == 4) ? 2 : 1;
+        p += sl;
+    }
+    return (int)(p - utf8);
+}
+static void clipboard_set(const char* utf8) {
+    if (!g_platform.hwnd || !utf8) return;
+    std::wstring w = utf8_to_wide(utf8);
+    size_t n = (w.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, n);
+    if (!hg) return;
+    memcpy(GlobalLock(hg), w.c_str(), n);
+    GlobalUnlock(hg);
+    if (OpenClipboard(g_platform.hwnd)) { EmptyClipboard(); SetClipboardData(CF_UNICODETEXT, hg); CloseClipboard(); }
+    else GlobalFree(hg);
+}
+static std::string clipboard_get() {
+    if (!g_platform.hwnd || !OpenClipboard(g_platform.hwnd)) return "";
+    std::string result;
+    HGLOBAL hg = GetClipboardData(CF_UNICODETEXT);
+    if (hg) {
+        wchar_t* w = (wchar_t*)GlobalLock(hg);
+        if (w) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+            if (n > 1) { result.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, w, -1, &result[0], n, nullptr, nullptr); }
+            GlobalUnlock(hg);
+        }
+    }
+    CloseClipboard();
+    return result;
+}
 
 // ---- Layout ------------------------------------------------
 
@@ -771,6 +864,10 @@ static void cmd_clear() {
 // ---- WndProc -----------------------------------------------
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // Ignore messages for windows other than the currently active one (e.g. parent
+    // messages that arrive while a child window's loop is running).
+    if (hwnd != g_platform.hwnd && g_platform.hwnd != nullptr)
+        return DefWindowProcW(hwnd, msg, wp, lp);
     switch (msg) {
     case WM_DESTROY:
         g_platform.running = false;
@@ -860,7 +957,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (g_cmd.active) {
             if (wp == VK_ESCAPE) cmd_clear();
-            // VK_BACK and VK_RETURN are handled in WM_CHAR
             return 0;
         }
         if (wp == VK_BACK)   g_input.key_backspace = true;
@@ -869,8 +965,18 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (GetKeyState(VK_SHIFT) & 0x8000) g_input.key_shift_tab = true;
             else                                 g_input.key_tab       = true;
         }
-        if (wp == 'Q' && (GetKeyState(VK_CONTROL) & 0x8000) && g_shortcuts_enabled)
-            PostQuitMessage(0);
+        if (wp == VK_LEFT)  g_input.key_left  = true;
+        if (wp == VK_RIGHT) g_input.key_right = true;
+        if (GetKeyState(VK_CONTROL) & 0x8000) {
+            if (wp == 'A' && g_ctx.focused_input_id != 0) {
+                g_text_cursor_id  = g_ctx.focused_input_id;
+                g_text_sel_anchor = 0;
+                g_text_cursor     = 0x7FFFFFFF; // clamped to strlen in input()
+            }
+            if (wp == 'C') g_input.key_ctrl_c = true;
+            if (wp == 'V') g_input.key_ctrl_v = true;
+            if (wp == 'Q' && g_shortcuts_enabled) PostQuitMessage(0);
+        }
         return 0;
 
     case WM_MOUSEWHEEL: {
@@ -1013,6 +1119,10 @@ bool pump() {
     g_input.key_enter        = false;
     g_input.key_tab          = false;
     g_input.key_shift_tab    = false;
+    g_input.key_left         = false;
+    g_input.key_right        = false;
+    g_input.key_ctrl_c       = false;
+    g_input.key_ctrl_v       = false;
     g_input.text_input_count = 0;
     memset(g_input.text_input, 0, sizeof(g_input.text_input));
 
@@ -1040,6 +1150,7 @@ void begin() {
             g_ctx.focused_input_id = stops[(idx <= 0 ? (int)stops.size() : idx) - 1];
         else
             g_ctx.focused_input_id = stops[(idx + 1) % (int)stops.size()];
+        g_text_cursor_id = 0; // new field gets cursor reset on its first render
     }
     g_ctx.tab_stops.clear();
 
@@ -1194,6 +1305,162 @@ void shutdown() {
     if (g_renderer.com_inited)     { CoUninitialize(); g_renderer.com_inited = false; }
 }
 
+void open_child_window(const Config& cfg, std::function<void()> fn) {
+    using namespace internal;
+    if (!g_platform.hwnd) return;
+
+    // Save every piece of per-window state
+    struct Snap {
+        PlatformState  platform;
+        RendererState  renderer;
+        InputState     input;
+        UIContext      ctx;
+        Style          style;
+        DebugState     debug;
+        float          scroll_y, content_height;
+        bool           sb_dragging;
+        float          sb_drag_mouse_y, sb_drag_scroll0;
+        CmdState       cmd;
+        float          fps, fps_accum;
+        int            fps_frames;
+        LARGE_INTEGER  last_time;
+        int            text_cursor_id, text_cursor, text_sel_anchor;
+        bool           shortcuts_enabled;
+    } s;
+    s.platform          = g_platform;
+    s.renderer          = g_renderer;
+    s.input             = g_input;
+    s.ctx               = g_ctx;
+    s.style             = g_style;
+    s.debug             = g_debug;
+    s.scroll_y          = g_scroll_y;
+    s.content_height    = g_content_height;
+    s.sb_dragging       = g_sb_dragging;
+    s.sb_drag_mouse_y   = g_sb_drag_mouse_y;
+    s.sb_drag_scroll0   = g_sb_drag_scroll0;
+    s.cmd               = g_cmd;
+    s.fps               = g_fps;
+    s.fps_accum         = g_fps_accum;
+    s.fps_frames        = g_fps_frames;
+    s.last_time         = g_last_time;
+    s.text_cursor_id    = g_text_cursor_id;
+    s.text_cursor       = g_text_cursor;
+    s.text_sel_anchor   = g_text_sel_anchor;
+    s.shortcuts_enabled = g_shortcuts_enabled;
+
+    // Extract shared COM/D2D objects before zeroing renderer
+    auto* d2d   = g_renderer.d2d_factory;
+    auto* dw    = g_renderer.dwrite_factory;
+    auto* wic   = g_renderer.wic_factory;
+    auto  inst  = g_platform.instance;
+    auto  owner = g_platform.hwnd;
+
+    // Reset to fresh child state
+    g_platform              = {};
+    g_platform.instance     = inst;
+    g_renderer              = {};
+    g_renderer.d2d_factory      = d2d;
+    g_renderer.dwrite_factory   = dw;
+    g_renderer.wic_factory      = wic;
+    g_renderer.dpi_scale        = 1.0f;
+    g_renderer.com_inited       = false; // don't CoUninitialize on child
+    g_input                 = {};
+    g_ctx                   = {};
+    g_style                 = s.style;
+    g_debug                 = s.debug;
+    g_scroll_y              = 0.0f;
+    g_content_height        = 0.0f;
+    g_sb_dragging           = false;
+    g_cmd                   = {};
+    g_fps = g_fps_accum     = 0.0f;
+    g_fps_frames            = 0;
+    g_text_cursor_id        = 0;
+    g_text_cursor           = 0;
+    g_text_sel_anchor       = 0;
+    g_shortcuts_enabled     = s.shortcuts_enabled;
+
+    // Build child HWND
+    DWORD wstyle = WS_OVERLAPPEDWINDOW;
+    if (!cfg.resizable) wstyle &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+
+    UINT  sys_dpi  = GetDpiForSystem();
+    float pre_s    = (float)sys_dpi / 96.0f;
+    RECT  rc       = {0, 0, (LONG)(cfg.width * pre_s + 0.5f), (LONG)(cfg.height * pre_s + 0.5f)};
+    using AdjFn    = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    auto  adj      = (AdjFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi");
+    if (adj) adj(&rc, wstyle, FALSE, 0, sys_dpi);
+    else     AdjustWindowRect(&rc, wstyle, FALSE);
+    int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+    int cx = CW_USEDEFAULT, cy = CW_USEDEFAULT;
+    if (cfg.center_window) {
+        cx = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
+        cy = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
+    }
+
+    // owner = parent HWND → child stays above parent, minimises with it
+    g_platform.hwnd = CreateWindowExW(0, L"FTUI_Window", cfg.title, wstyle,
+        cx, cy, cw, ch, owner, nullptr, inst, nullptr);
+
+    if (g_platform.hwnd) {
+        g_platform.width   = cfg.width;
+        g_platform.height  = cfg.height;
+        g_platform.running = true;
+
+        if (create_render_target() && create_text_format()) {
+            // Correct size for actual per-monitor DPI
+            if (g_platform.width != cfg.width || g_platform.height != cfg.height) {
+                UINT adpi = (UINT)(g_renderer.dpi_scale * 96.0f + 0.5f);
+                RECT rc2  = {0, 0, (LONG)(cfg.width  * g_renderer.dpi_scale + 0.5f),
+                                   (LONG)(cfg.height * g_renderer.dpi_scale + 0.5f)};
+                if (adj) adj(&rc2, wstyle, FALSE, 0, adpi);
+                else     AdjustWindowRect(&rc2, wstyle, FALSE);
+                RECT wr; GetWindowRect(g_platform.hwnd, &wr);
+                SetWindowPos(g_platform.hwnd, nullptr, wr.left, wr.top,
+                             rc2.right - rc2.left, rc2.bottom - rc2.top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            QueryPerformanceFrequency(&g_freq);
+            QueryPerformanceCounter(&g_last_time);
+            ShowWindow(g_platform.hwnd, SW_SHOW);
+            UpdateWindow(g_platform.hwnd);
+
+            while (pump()) { begin(); fn(); end(); }
+        }
+
+        // Tear down child-specific resources; do NOT release shared factories
+        release_render_target();
+        if (g_renderer.text_format) { g_renderer.text_format->Release(); g_renderer.text_format = nullptr; }
+        g_renderer.d2d_factory    = nullptr;
+        g_renderer.dwrite_factory = nullptr;
+        g_renderer.wic_factory    = nullptr;
+        if (g_platform.hwnd) { DestroyWindow(g_platform.hwnd); g_platform.hwnd = nullptr; }
+    }
+
+    // Restore parent state
+    g_platform          = s.platform;
+    g_renderer          = s.renderer;
+    g_input             = s.input;
+    g_ctx               = s.ctx;
+    g_style             = s.style;
+    g_debug             = s.debug;
+    g_scroll_y          = s.scroll_y;
+    g_content_height    = s.content_height;
+    g_sb_dragging       = s.sb_dragging;
+    g_sb_drag_mouse_y   = s.sb_drag_mouse_y;
+    g_sb_drag_scroll0   = s.sb_drag_scroll0;
+    g_cmd               = s.cmd;
+    g_fps               = s.fps;
+    g_fps_accum         = s.fps_accum;
+    g_fps_frames        = s.fps_frames;
+    g_last_time         = s.last_time;
+    g_text_cursor_id    = s.text_cursor_id;
+    g_text_cursor       = s.text_cursor;
+    g_text_sel_anchor   = s.text_sel_anchor;
+    g_shortcuts_enabled = s.shortcuts_enabled;
+
+    InvalidateRect(owner, nullptr, FALSE);
+}
+
 // ============================================================
 // Widgets
 // ============================================================
@@ -1298,98 +1565,178 @@ bool input(const char* label, char* buffer, int buffer_size, InputFlags flags, b
     bool is_password = (flags & InputFlags::Password);
     bool is_readonly = (flags & InputFlags::ReadOnly);
 
-    // Register as a tab stop so Tab/Shift+Tab can cycle to/from this field
     g_ctx.tab_stops.push_back(id);
 
     float label_h = text_line_height();
     float box_h   = g_style.item_height;
-    Rect outer    = next_rect(label_h + 4.0f + box_h);
-    Rect label_r  = {outer.x, outer.y,                  outer.w, label_h};
-    Rect box_r    = {outer.x, outer.y + label_h + 4.0f, outer.w, box_h};
+    Rect outer   = next_rect(label_h + 4.0f + box_h);
+    Rect label_r = {outer.x, outer.y,                  outer.w, label_h};
+    Rect box_r   = {outer.x, outer.y + label_h + 4.0f, outer.w, box_h};
+    Rect text_r  = {box_r.x + 10.0f, box_r.y, box_r.w - 20.0f, box_r.h};
+
+    // Build display string
+    int buf_len = (int)strlen(buffer);
+    std::string mask_str;
+    if (is_password && buf_len > 0) {
+        mask_str = std::string(utf8_char_count(buffer, buf_len), '*');
+    }
+    const char* disp = (!mask_str.empty()) ? mask_str.c_str() : buffer;
 
     bool hovered = rect_contains(box_r, g_input.mouse_x, g_input.mouse_y);
+
+    // Mouse: gain/lose focus, position cursor via hit test
     if (g_input.mouse_pressed) {
-        if (hovered)                              g_ctx.focused_input_id = id;
-        else if (g_ctx.focused_input_id == id)    g_ctx.focused_input_id = 0;
+        if (hovered) {
+            bool shift_held = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (g_ctx.focused_input_id == id && g_text_cursor_id == id && shift_held) {
+                g_text_cursor = is_password ? buf_len : byte_from_x(disp, g_input.mouse_x - text_r.x);
+            } else {
+                g_ctx.focused_input_id = id;
+                int cp = is_password ? buf_len : byte_from_x(disp, g_input.mouse_x - text_r.x);
+                g_text_cursor_id  = id;
+                g_text_cursor     = cp;
+                g_text_sel_anchor = cp;
+            }
+        } else if (g_ctx.focused_input_id == id) {
+            g_ctx.focused_input_id = 0;
+        }
     }
 
     bool focused = (g_ctx.focused_input_id == id);
-    bool changed = false;
+
+    // First frame focused: sync cursor to end of buffer
+    if (focused && g_text_cursor_id != id) {
+        g_text_cursor_id  = id;
+        g_text_cursor     = buf_len;
+        g_text_sel_anchor = buf_len;
+    }
+    // Clamp (handles the 0x7FFFFFFF sentinel set by Ctrl+A)
+    if (focused) {
+        if (g_text_cursor     > buf_len) g_text_cursor     = buf_len;
+        if (g_text_sel_anchor > buf_len) g_text_sel_anchor = buf_len;
+    }
 
     if (enter_pressed) *enter_pressed = false;
+    bool changed = false;
 
     if (focused && !is_readonly) {
+        int& cur = g_text_cursor;
+        int& anc = g_text_sel_anchor;
+        bool has_sel = (cur != anc);
+        int  sel_lo  = has_sel ? (cur < anc ? cur : anc) : cur;
+        int  sel_hi  = has_sel ? (cur > anc ? cur : anc) : cur;
+
+        // Ctrl+C
+        if (g_input.key_ctrl_c && has_sel && !is_password) {
+            clipboard_set(std::string(buffer + sel_lo, buffer + sel_hi).c_str());
+        }
+
+        // Ctrl+V (replace selection, insert clipboard)
+        if (g_input.key_ctrl_v && !is_password) {
+            if (has_sel) {
+                memmove(buffer + sel_lo, buffer + sel_hi, buf_len - sel_hi + 1);
+                cur = anc = sel_lo;
+                buf_len = (int)strlen(buffer);
+                has_sel = false;
+                changed = true;
+            }
+            std::string clip = clipboard_get();
+            if (!clip.empty()) {
+                int n = (int)clip.size() < buffer_size - 1 - buf_len
+                      ? (int)clip.size() : buffer_size - 1 - buf_len;
+                if (n > 0) {
+                    memmove(buffer + cur + n, buffer + cur, buf_len - cur + 1);
+                    memcpy(buffer + cur, clip.c_str(), n);
+                    cur += n; anc = cur; buf_len += n;
+                    changed = true;
+                }
+            }
+        }
+
+        // Arrow keys (Shift held = extend selection)
+        if (g_input.key_left) {
+            bool sh = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (!sh && has_sel) { cur = anc = sel_lo; }
+            else { cur = utf8_retreat(buffer, cur); if (!sh) anc = cur; }
+        }
+        if (g_input.key_right) {
+            bool sh = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (!sh && has_sel) { cur = anc = sel_hi; }
+            else { cur = utf8_advance(buffer, cur); if (!sh) anc = cur; }
+        }
+
+        // Refresh selection after arrows
+        has_sel = (cur != anc);
+        sel_lo  = has_sel ? (cur < anc ? cur : anc) : cur;
+        sel_hi  = has_sel ? (cur > anc ? cur : anc) : cur;
+
+        // Backspace
         if (g_input.key_backspace) {
-            int len = (int)strlen(buffer);
-            if (len > 0) {
-                int i = len - 1;
-                while (i > 0 && (buffer[i] & 0xC0) == 0x80) --i;
-                buffer[i] = '\0';
-                changed = true;
+            if (has_sel) {
+                memmove(buffer + sel_lo, buffer + sel_hi, buf_len - sel_hi + 1);
+                cur = anc = sel_lo; changed = true;
+            } else if (cur > 0) {
+                int nc = utf8_retreat(buffer, cur);
+                memmove(buffer + nc, buffer + cur, buf_len - cur + 1);
+                cur = anc = nc; changed = true;
             }
         }
-        if (g_input.key_enter) {
-            if (enter_pressed) *enter_pressed = true;
-        }
+
+        // Enter
+        if (g_input.key_enter && enter_pressed) *enter_pressed = true;
+
+        // Typed chars: replace selection then insert at cursor
         if (g_input.text_input_count > 0) {
-            int len   = (int)strlen(buffer);
-            int space = buffer_size - 1 - len;
-            int n     = g_input.text_input_count < space ? g_input.text_input_count : space;
-            if (n > 0) {
-                memcpy(buffer + len, g_input.text_input, n);
-                buffer[len + n] = '\0';
-                changed = true;
+            if (has_sel) {
+                memmove(buffer + sel_lo, buffer + sel_hi, buf_len - sel_hi + 1);
+                cur = anc = sel_lo;
+                buf_len = (int)strlen(buffer);
             }
+            int n = g_input.text_input_count < buffer_size - 1 - buf_len
+                  ? g_input.text_input_count : buffer_size - 1 - buf_len;
+            if (n > 0) {
+                memmove(buffer + cur + n, buffer + cur, buf_len - cur + 1);
+                memcpy(buffer + cur, g_input.text_input, n);
+                cur += n; anc = cur; changed = true;
+            }
+        }
+
+        // Refresh display string after edits
+        buf_len = (int)strlen(buffer);
+        if (is_password) {
+            mask_str = std::string(utf8_char_count(buffer, buf_len), '*');
+            disp = mask_str.empty() ? buffer : mask_str.c_str();
         }
     }
 
-    // Label
+    // --- Drawing ---
     draw_text_utf8(visible, label_r, g_style.text_dim);
 
-    // Box
     Color border_c = focused ? g_style.input_focus : g_style.border;
     fill_round_rect(box_r, g_style.rounding, g_style.input_bg);
-    stroke_round_rect(box_r, g_style.rounding,
-        focused ? 1.5f : g_style.border_width, border_c);
+    stroke_round_rect(box_r, g_style.rounding, focused ? 1.5f : g_style.border_width, border_c);
 
-    // Text inside box
-    Rect text_r = {box_r.x + 10, box_r.y, box_r.w - 20, box_r.h};
-    if (buffer[0]) {
-        if (is_password) {
-            int chars = 0;
-            for (int i = 0, len = (int)strlen(buffer); i < len; ) {
-                unsigned char c = (unsigned char)buffer[i];
-                i += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
-                chars++;
-            }
-            std::string dots(chars, '\xe2'); // use bullet-ish: just dots for simplicity
-            std::string mask(chars, '*');
-            draw_text_utf8(mask.c_str(), text_r, g_style.text);
-        } else {
-            draw_text_utf8(buffer, text_r, g_style.text);
-        }
+    // Selection highlight
+    if (focused && g_text_cursor_id == id && g_text_cursor != g_text_sel_anchor && disp[0]) {
+        int lo = g_text_cursor < g_text_sel_anchor ? g_text_cursor : g_text_sel_anchor;
+        int hi = g_text_cursor < g_text_sel_anchor ? g_text_sel_anchor : g_text_cursor;
+        int dlo = is_password ? utf8_char_count(buffer, lo) : lo;
+        int dhi = is_password ? utf8_char_count(buffer, hi) : hi;
+        float x0 = text_r.x + measure_text_at(disp, dlo);
+        float x1 = text_r.x + measure_text_at(disp, dhi);
+        fill_round_rect({x0, box_r.y + 4.0f, x1 - x0, box_r.h - 8.0f}, 2.0f,
+            {g_style.input_focus.r, g_style.input_focus.g, g_style.input_focus.b, 0.3f});
     }
 
-    // Blinking caret
-    if (focused) {
-        bool caret_on = ((g_ctx.frame_index / 30) & 1) == 0;
-        if (caret_on) {
-            const char* disp_buf = buffer;
-            std::string mask;
-            if (is_password) {
-                int chars = 0;
-                for (int i = 0, len = (int)strlen(buffer); i < len; ) {
-                    unsigned char c = (unsigned char)buffer[i];
-                    i += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
-                    chars++;
-                }
-                mask = std::string(chars, '*');
-                disp_buf = mask.c_str();
-            }
-            float tw = measure_text_width(disp_buf);
-            float cx = text_r.x + tw + 1.0f;
-            draw_line(cx, box_r.y + 6.0f, cx, box_r.y + box_r.h - 6.0f, 1.5f, g_style.text);
-        }
+    // Text
+    if (disp[0]) draw_text_utf8(disp, text_r, g_style.text);
+
+    // Blinking cursor
+    if (focused && ((g_ctx.frame_index / 30) & 1) == 0) {
+        int cb = (g_text_cursor_id == id) ? g_text_cursor : buf_len;
+        int db = is_password ? utf8_char_count(buffer, cb) : cb;
+        float cx = text_r.x + measure_text_at(disp, db) + 1.0f;
+        draw_line(cx, box_r.y + 6.0f, cx, box_r.y + box_r.h - 6.0f, 1.5f, g_style.text);
     }
 
     if (g_debug.show_layout_rects) {
