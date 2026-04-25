@@ -11,6 +11,13 @@
 // Optional defines before FTUI_IMPLEMENTATION:
 //   FTUI_KEEP_CONSOLE    — keep console window on Windows
 //   FTUI_LINUX_FONT "x"  — override default "sans-serif" on Linux
+//   FTUI_DISABLE_EFFECTS — strip the Windows effects layer entirely
+
+// Global startup theme. Change this line to another built-in preset if you
+// want a different default across all new FTUI windows.
+#ifndef FTUI_DEFAULT_STYLE
+#define FTUI_DEFAULT_STYLE ftui::nord_style
+#endif
 
 #pragma once
 #include <cstring>
@@ -53,6 +60,7 @@ struct Config {
     bool        resizable     = true;
     bool        center_window = true;
     void*       icon          = nullptr;    // HICON on Windows; ignored on Linux
+    bool        enable_effects = true;      // Windows-only visual effects layer
 };
 
 bool create_window(const Config& cfg = {});
@@ -125,6 +133,12 @@ DebugState& debug();
 
 #ifdef FTUI_IMPLEMENTATION
 
+#if defined(_WIN32) && !defined(FTUI_DISABLE_EFFECTS)
+#define FTUI_WINDOWS_EFFECTS 1
+#else
+#define FTUI_WINDOWS_EFFECTS 0
+#endif
+
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
@@ -160,6 +174,10 @@ namespace ftui {
 namespace internal {
 
 // ---- Shared utilities -----------------------------------------------
+
+static Style startup_style() {
+    return FTUI_DEFAULT_STYLE();
+}
 
 static int hash_str(const char* s) {
     unsigned h = 2166136261u;
@@ -204,6 +222,7 @@ static int utf8_char_count(const char* s, int byte_offset) {
 struct InputState {
     float mouse_x = 0, mouse_y = 0;
     bool  mouse_down = false, mouse_pressed = false, mouse_released = false;
+    float wheel_y = 0;
     bool  key_backspace = false, key_enter = false;
     bool  key_tab = false, key_shift_tab = false;
     bool  key_left = false, key_right = false;
@@ -231,6 +250,32 @@ struct UIContext {
 
 struct CmdState { bool active = false; char buf[16] = {}; int len = 0; };
 
+struct MotionSlot {
+    int   key = 0;
+    float hover = 0;
+    float active = 0;
+    float focus = 0;
+};
+
+struct TabFxSlot {
+    int   key = 0;
+    int   selected = 0;
+    int   previous = 0;
+    int   dir = 1;
+    bool  initialized = false;
+    float switch_t = 1.0f;
+    float underline_x = 0;
+    float underline_w = 0;
+};
+
+struct FrameContentFx {
+    bool  active = false;
+    int   owner = 0;
+    float start_y = 0;
+    float progress = 1.0f;
+    int   dir = 1;
+};
+
 // ---- Shared globals -------------------------------------------------
 
 static InputState g_input;
@@ -241,13 +286,24 @@ static float      g_fps = 0, g_fps_accum = 0;
 static int        g_fps_frames = 0;
 static bool       g_shortcuts_enabled = true;
 static CmdState   g_cmd;
+static float      g_dt = 1.0f / 60.0f;
+static bool       g_effects_enabled = false;
 static float      g_scroll_y = 0, g_content_height = 0;
+static float      g_scroll_target_y = 0;
 static bool       g_sb_dragging = false;
 static float      g_sb_drag_mouse_y = 0, g_sb_drag_scroll0 = 0;
 static int        g_text_cursor_id = 0, g_text_cursor = 0, g_text_sel_anchor = 0;
 static int        g_ta_cursor_id = 0, g_ta_cursor = 0, g_ta_sel_anchor = 0;
 static float      g_ta_scroll_y = 0;
+static float      g_ta_scroll_target_y = 0;
 static bool       g_drawing = false;
+static MotionSlot g_motion_slots[256];
+static TabFxSlot  g_tab_fx_slots[32];
+static int        g_tab_content_owner = 0;
+static FrameContentFx g_frame_content_fx;
+static float      g_draw_fx_off_x = 0;
+static float      g_draw_fx_off_y = 0;
+static float      g_draw_fx_opacity = 1.0f;
 
 // ---- Forward declarations of platform-specific functions -----------
 // (defined in the platform blocks below; used by shared widget code)
@@ -267,9 +323,149 @@ static std::string clipboard_get();
 static void        push_clip(Rect r);
 static void        pop_clip();
 
+#if FTUI_WINDOWS_EFFECTS
+static void        draw_previous_frame_overlay(Rect clip_r, float dx, float opacity);
+static void        release_frame_snapshot();
+static void        capture_frame_snapshot();
+#endif
+
 // ---- Shared implementations (call platform fns above) ---------------
 
 static float text_line_height() { return g_style.font_size + 6.0f; }
+
+static float clamp01(float v) {
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+static float lerpf(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+static Color lerp_color(Color a, Color b, float t) {
+    t = clamp01(t);
+    return {
+        lerpf(a.r, b.r, t),
+        lerpf(a.g, b.g, t),
+        lerpf(a.b, b.b, t),
+        lerpf(a.a, b.a, t),
+    };
+}
+
+static Color with_alpha(Color c, float a) {
+    c.a = a;
+    return c;
+}
+
+static Rect offset_rect(Rect r, float dx, float dy) {
+    r.x += dx; r.y += dy; return r;
+}
+
+static float ease_smooth(float t) {
+    t = clamp01(t);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static float step_anim(float value, float target, float dt, float sharpness) {
+    if (dt <= 0.0f) return target;
+    float a = 1.0f - expf(-sharpness * dt);
+    float out = value + (target - value) * a;
+    if (fabsf(out - target) < 0.001f) return target;
+    return out;
+}
+
+static bool effects_enabled() {
+#if FTUI_WINDOWS_EFFECTS
+    return g_effects_enabled;
+#else
+    return false;
+#endif
+}
+
+static void reset_draw_fx() {
+    g_draw_fx_off_x = 0;
+    g_draw_fx_off_y = 0;
+    g_draw_fx_opacity = 1.0f;
+}
+
+static void reset_effect_state(bool enable_effects) {
+    g_effects_enabled = enable_effects;
+    g_dt = 1.0f / 60.0f;
+    g_scroll_target_y = g_scroll_y;
+    g_ta_scroll_target_y = g_ta_scroll_y;
+    memset(g_motion_slots, 0, sizeof(g_motion_slots));
+    memset(g_tab_fx_slots, 0, sizeof(g_tab_fx_slots));
+    g_tab_content_owner = 0;
+    g_frame_content_fx = {};
+    reset_draw_fx();
+}
+
+static MotionSlot& motion_slot_for(int key) {
+    unsigned idx = (unsigned)key & 255u;
+    for (int n = 0; n < 256; ++n) {
+        MotionSlot& slot = g_motion_slots[(idx + (unsigned)n) & 255u];
+        if (slot.key == key || slot.key == 0) {
+            if (slot.key == 0) slot.key = key;
+            return slot;
+        }
+    }
+    MotionSlot& slot = g_motion_slots[idx];
+    slot = {};
+    slot.key = key;
+    return slot;
+}
+
+static TabFxSlot& tab_fx_slot_for(int key) {
+    unsigned idx = (unsigned)key & 31u;
+    for (int n = 0; n < 32; ++n) {
+        TabFxSlot& slot = g_tab_fx_slots[(idx + (unsigned)n) & 31u];
+        if (slot.key == key || slot.key == 0) {
+            if (slot.key == 0) slot.key = key;
+            return slot;
+        }
+    }
+    TabFxSlot& slot = g_tab_fx_slots[idx];
+    slot = {};
+    slot.key = key;
+    return slot;
+}
+
+static void update_motion_slot(MotionSlot& slot, bool hover_on, bool active_on, bool focus_on) {
+    if (!effects_enabled()) {
+        slot.hover = hover_on ? 1.0f : 0.0f;
+        slot.active = active_on ? 1.0f : 0.0f;
+        slot.focus = focus_on ? 1.0f : 0.0f;
+        return;
+    }
+    slot.hover = step_anim(slot.hover, hover_on ? 1.0f : 0.0f, g_dt, 16.0f);
+    slot.active = step_anim(slot.active, active_on ? 1.0f : 0.0f, g_dt, 22.0f);
+    slot.focus = step_anim(slot.focus, focus_on ? 1.0f : 0.0f, g_dt, 14.0f);
+}
+
+static void draw_widget_chrome(Rect r, float rounding, Color fill, Color border,
+                               float hover_p, float active_p, float focus_p) {
+    if (!effects_enabled()) {
+        fill_round_rect(r, rounding, fill);
+        stroke_round_rect(r, rounding, g_style.border_width, border);
+        return;
+    }
+
+    float glow = clamp01(hover_p * 0.45f + active_p * 0.65f + focus_p * 0.80f);
+    Color shadow = {0.0f, 0.0f, 0.0f, 0.07f + glow * 0.08f};
+    Color shell = lerp_color(fill, g_style.panel, 0.12f);
+    shell = lerp_color(shell, g_style.input_focus, hover_p * 0.03f + focus_p * 0.05f);
+    shell.a = clamp01(0.94f + hover_p * 0.02f + focus_p * 0.02f);
+    Color inner = {1.0f, 1.0f, 1.0f, 0.025f + hover_p * 0.015f + focus_p * 0.020f};
+    Color rim = lerp_color(border, g_style.input_focus, clamp01(active_p * 0.35f + focus_p * 0.55f));
+    rim.a = clamp01(0.50f + glow * 0.18f);
+
+    fill_round_rect(offset_rect(r, 0.0f, 1.0f), rounding + 0.5f, shadow);
+    fill_round_rect(r, rounding, shell);
+    if (r.w > 2.0f && r.h > 2.0f) {
+        stroke_round_rect({r.x + 1.0f, r.y + 1.0f, r.w - 2.0f, r.h - 2.0f},
+                          fmaxf(1.0f, rounding - 1.0f), 1.0f, inner);
+    }
+    stroke_round_rect(r, rounding, 1.0f + focus_p * 0.7f, rim);
+}
 
 static float measure_text_at(const char* utf8, int byte_len) {
     if (byte_len <= 0 || !utf8 || !utf8[0]) return 0.0f;
@@ -400,6 +596,9 @@ struct RendererState {
 static PlatformState  g_platform;
 static RendererState  g_renderer;
 static LARGE_INTEGER  g_freq, g_last_time;
+static ID2D1Bitmap*   g_prev_frame_bitmap = nullptr;
+static std::vector<BYTE> g_prev_frame_pixels;
+static UINT           g_prev_frame_w = 0, g_prev_frame_h = 0;
 
 static void dbg(const char* fmt, ...) {
     char buf[512]; va_list a; va_start(a, fmt); vsnprintf(buf, sizeof(buf), fmt, a); va_end(a);
@@ -407,28 +606,44 @@ static void dbg(const char* fmt, ...) {
 }
 
 static D2D1_COLOR_F tod(Color c) { return {c.r, c.g, c.b, c.a}; }
-static void set_brush(Color c)   { g_renderer.brush->SetColor(tod(c)); }
+static Color apply_draw_color(Color c) {
+    c.a *= g_draw_fx_opacity;
+    return c;
+}
+static Rect apply_draw_rect(Rect r) {
+    r.x += g_draw_fx_off_x;
+    r.y += g_draw_fx_off_y;
+    return r;
+}
+static void set_brush(Color c)   { g_renderer.brush->SetColor(tod(apply_draw_color(c))); }
 static void clear_bg(Color c)    { g_renderer.target->Clear(tod(c)); }
 
 static void fill_round_rect(Rect r, float rad, Color c) {
+    r = apply_draw_rect(r);
     set_brush(c);
     D2D1_RECT_F rc = {r.x, r.y, r.x+r.w, r.y+r.h};
     g_renderer.target->FillRoundedRectangle(D2D1::RoundedRect(rc, rad, rad), g_renderer.brush);
 }
 static void stroke_round_rect(Rect r, float rad, float thick, Color c) {
+    r = apply_draw_rect(r);
     set_brush(c);
     D2D1_RECT_F rc = {r.x, r.y, r.x+r.w, r.y+r.h};
     g_renderer.target->DrawRoundedRectangle(D2D1::RoundedRect(rc, rad, rad), g_renderer.brush, thick);
 }
 static void fill_rect(Rect r, Color c) {
+    r = apply_draw_rect(r);
     set_brush(c);
     D2D1_RECT_F rc = {r.x, r.y, r.x+r.w, r.y+r.h};
     g_renderer.target->FillRectangle(rc, g_renderer.brush);
 }
 static void draw_line(float x0, float y0, float x1, float y1, float thick, Color c) {
-    set_brush(c); g_renderer.target->DrawLine({x0,y0}, {x1,y1}, g_renderer.brush, thick);
+    set_brush(c);
+    g_renderer.target->DrawLine({x0 + g_draw_fx_off_x, y0 + g_draw_fx_off_y},
+                                {x1 + g_draw_fx_off_x, y1 + g_draw_fx_off_y},
+                                g_renderer.brush, thick);
 }
 static void push_clip(Rect r) {
+    r = apply_draw_rect(r);
     D2D1_RECT_F rc = {r.x, r.y, r.x+r.w, r.y+r.h};
     g_renderer.target->PushAxisAlignedClip(rc, D2D1_ANTIALIAS_MODE_ALIASED);
 }
@@ -437,6 +652,7 @@ static void pop_clip() { g_renderer.target->PopAxisAlignedClip(); }
 static void draw_text_utf8(const char* utf8, Rect r, Color c) {
     std::wstring w = utf8_to_wide(utf8);
     if (w.empty()) return;
+    r = apply_draw_rect(r);
     set_brush(c);
     D2D1_RECT_F rc = {r.x, r.y, r.x+r.w, r.y+r.h};
     DWRITE_TRIMMING trim = {DWRITE_TRIMMING_GRANULARITY_NONE,0,0};
@@ -478,8 +694,9 @@ static int byte_from_x(const char* utf8, float rel_x) {
 static void draw_image_handle(ImageHandle* img, Rect r) {
     auto* bmp = img ? static_cast<ID2D1Bitmap*>(img->_impl) : nullptr;
     if (!bmp) return;
+    r = apply_draw_rect(r);
     D2D1_RECT_F dst = {r.x, r.y, r.x+r.w, r.y+r.h};
-    g_renderer.target->DrawBitmap(bmp, dst);
+    g_renderer.target->DrawBitmap(bmp, dst, g_draw_fx_opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 }
 
 static void clipboard_set(const char* utf8) {
@@ -503,6 +720,84 @@ static std::string clipboard_get() {
                  GlobalUnlock(hg); }
     }
     CloseClipboard(); return result;
+}
+
+static void release_frame_snapshot() {
+    if (g_prev_frame_bitmap) { g_prev_frame_bitmap->Release(); g_prev_frame_bitmap = nullptr; }
+    g_prev_frame_pixels.clear();
+    g_prev_frame_w = g_prev_frame_h = 0;
+}
+
+static void draw_previous_frame_overlay(Rect clip_r, float dx, float opacity) {
+    if (!g_prev_frame_bitmap || opacity <= 0.001f) return;
+    D2D1_RECT_F clip = {clip_r.x, clip_r.y, clip_r.x + clip_r.w, clip_r.y + clip_r.h};
+    D2D1_RECT_F dst = {dx, 0.0f, dx + (float)g_prev_frame_w, (float)g_prev_frame_h};
+    g_renderer.target->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+    g_renderer.target->DrawBitmap(g_prev_frame_bitmap, dst, opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    g_renderer.target->PopAxisAlignedClip();
+}
+
+static void capture_frame_snapshot() {
+    if (!effects_enabled() || !g_platform.hwnd || !g_renderer.target || g_tab_content_owner != 0) return;
+
+    RECT rc{};
+    GetClientRect(g_platform.hwnd, &rc);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) { release_frame_snapshot(); return; }
+
+    UINT stride = (UINT)w * 4u;
+    size_t bytes = (size_t)stride * (size_t)h;
+    if (g_prev_frame_pixels.size() != bytes) g_prev_frame_pixels.resize(bytes);
+
+    HDC src_dc = GetDC(g_platform.hwnd);
+    if (!src_dc) return;
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(src_dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HDC mem_dc = CreateCompatibleDC(src_dc);
+    if (!dib || !mem_dc || !bits) {
+        if (mem_dc) DeleteDC(mem_dc);
+        if (dib) DeleteObject(dib);
+        ReleaseDC(g_platform.hwnd, src_dc);
+        return;
+    }
+
+    HGDIOBJ old = SelectObject(mem_dc, dib);
+    BitBlt(mem_dc, 0, 0, w, h, src_dc, 0, 0, SRCCOPY);
+    memcpy(g_prev_frame_pixels.data(), bits, bytes);
+
+    SelectObject(mem_dc, old);
+    DeleteDC(mem_dc);
+    DeleteObject(dib);
+    ReleaseDC(g_platform.hwnd, src_dc);
+
+    UINT dpi = GetDpiForWindow(g_platform.hwnd); if (!dpi) dpi = 96;
+    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+        (float)dpi, (float)dpi);
+
+    if (!g_prev_frame_bitmap || g_prev_frame_w != (UINT)w || g_prev_frame_h != (UINT)h) {
+        if (g_prev_frame_bitmap) { g_prev_frame_bitmap->Release(); g_prev_frame_bitmap = nullptr; }
+        if (FAILED(g_renderer.target->CreateBitmap(D2D1::SizeU((UINT32)w, (UINT32)h),
+                                                   g_prev_frame_pixels.data(), stride,
+                                                   props, &g_prev_frame_bitmap))) {
+            g_prev_frame_w = g_prev_frame_h = 0;
+            return;
+        }
+        g_prev_frame_w = (UINT)w;
+        g_prev_frame_h = (UINT)h;
+    } else {
+        g_prev_frame_bitmap->CopyFromMemory(nullptr, g_prev_frame_pixels.data(), stride);
+    }
 }
 
 static bool init_d2d() {
@@ -574,6 +869,7 @@ static void release_render_target() {
     if (g_renderer.rendering_params){g_renderer.rendering_params->Release();g_renderer.rendering_params=nullptr;}
     if (g_renderer.brush){g_renderer.brush->Release();g_renderer.brush=nullptr;}
     if (g_renderer.target){g_renderer.target->Release();g_renderer.target=nullptr;}
+    release_frame_snapshot();
 }
 
 static void execute_command() {
@@ -655,8 +951,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_input.ctrl_held=(GetKeyState(VK_CONTROL)&0x8000)!=0; return 0;
     case WM_MOUSEWHEEL: {
         short delta=(short)HIWORD(wp);
-        g_scroll_y -= (float)delta/WHEEL_DELTA*80.f;
-        if(g_scroll_y<0)g_scroll_y=0; return 0; }
+        if (effects_enabled()) {
+            g_input.wheel_y += (float)delta / WHEEL_DELTA * 80.0f;
+        } else {
+            g_scroll_y -= (float)delta/WHEEL_DELTA*80.f;
+            g_scroll_target_y = g_scroll_y;
+            if(g_scroll_y<0)g_scroll_y=0;
+        }
+        return 0; }
     case WM_SETFOCUS:   g_input.focused=true;  return 0;
     case WM_KILLFOCUS:  g_input.focused=false;  g_ctx.focused_input_id=0; return 0;
     case WM_ERASEBKGND: return 1;
@@ -671,7 +973,10 @@ bool create_window(const Config& cfg) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_renderer.com_inited = (hr==S_OK||hr==S_FALSE);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    g_style = default_dark_style();
+    g_style = startup_style();
+    g_scroll_y = g_scroll_target_y = 0;
+    g_ta_scroll_y = g_ta_scroll_target_y = 0;
+    reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
     g_platform.instance = GetModuleHandleW(nullptr);
 
     WNDCLASSEXW wc={sizeof(wc)}; wc.style=CS_HREDRAW|CS_VREDRAW; wc.lpfnWndProc=wndproc;
@@ -714,6 +1019,7 @@ bool create_window(const Config& cfg) {
 bool pump() {
     using namespace internal;
     g_input.mouse_pressed=g_input.mouse_released=false;
+    g_input.wheel_y = 0;
     g_input.key_backspace=g_input.key_enter=g_input.key_tab=g_input.key_shift_tab=false;
     g_input.key_left=g_input.key_right=g_input.key_up=g_input.key_down=false;
     g_input.key_ctrl_c=g_input.key_ctrl_v=false;
@@ -729,6 +1035,8 @@ bool pump() {
 void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
+    g_frame_content_fx = {};
+    reset_draw_fx();
     if((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()){
         auto& stops=g_ctx.tab_stops_prev;
         int cur=g_ctx.focused_input_id,idx=-1;
@@ -744,13 +1052,21 @@ void begin() {
     float vh=g_ctx.content_region.h;
     bool nsb=g_content_height>vh+1;
     float ms=nsb?g_content_height-vh:0;
-    if(!nsb)g_scroll_y=0; g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    g_dt=(float)(now.QuadPart-g_last_time.QuadPart)/(float)g_freq.QuadPart;
+    g_last_time=now; g_fps_accum+=g_dt; g_fps_frames++;
+    if(g_fps_accum>=0.5f){g_fps=(float)g_fps_frames/g_fps_accum;g_fps_frames=0;g_fps_accum=0;}
+
+    if(!nsb) { g_scroll_y=0; g_scroll_target_y=0; }
+    if (effects_enabled()) {
+        g_scroll_target_y=g_scroll_target_y<0?0:(g_scroll_target_y>ms?ms:g_scroll_target_y);
+        g_scroll_y = step_anim(g_scroll_y, g_scroll_target_y, g_dt, 16.0f);
+    } else {
+        g_scroll_target_y = g_scroll_y;
+    }
+    g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
     if(nsb)g_ctx.content_region.w-=kSW+pad;
     g_ctx.cursor_y=g_ctx.content_region.y-g_scroll_y;
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    float dt=(float)(now.QuadPart-g_last_time.QuadPart)/(float)g_freq.QuadPart;
-    g_last_time=now; g_fps_accum+=dt; g_fps_frames++;
-    if(g_fps_accum>=0.5f){g_fps=(float)g_fps_frames/g_fps_accum;g_fps_frames=0;g_fps_accum=0;}
     if(!g_renderer.target) return;
     g_renderer.target->BeginDraw(); g_drawing=true;
     clear_bg(g_style.background);
@@ -762,6 +1078,11 @@ void end() {
     using namespace internal;
     if(!g_drawing) return;
     g_renderer.target->PopAxisAlignedClip();
+
+    if (g_frame_content_fx.active) {
+        reset_draw_fx();
+    }
+
     float new_ch=g_ctx.cursor_y+g_scroll_y-g_ctx.content_region.y;
     if(new_ch<0)new_ch=0;
     {
@@ -769,6 +1090,11 @@ void end() {
         bool nsb=g_content_height>vh+1;
         if(nsb){
             float ms=g_content_height-vh;
+            if (effects_enabled() && g_input.wheel_y != 0.0f) {
+                g_scroll_target_y -= g_input.wheel_y;
+                g_input.wheel_y = 0.0f;
+            }
+            g_scroll_target_y=g_scroll_target_y<0?0:(g_scroll_target_y>ms?ms:g_scroll_target_y);
             float tx=g_ctx.content_region.x+g_ctx.content_region.w+g_style.window_padding;
             Rect track={tx,g_ctx.content_region.y,kSW,vh};
             float th=fmaxf(20,(vh/g_content_height)*vh);
@@ -779,12 +1105,35 @@ void end() {
             bool trhov=rect_contains(track,g_input.mouse_x,g_input.mouse_y);
             if(g_input.mouse_pressed&&thov){g_sb_dragging=true;g_sb_drag_mouse_y=g_input.mouse_y;g_sb_drag_scroll0=g_scroll_y;}
             if(g_sb_dragging){
-                if(g_input.mouse_down||g_input.mouse_released){float sc=ms/fmaxf(1,vh-th);g_scroll_y=g_sb_drag_scroll0+(g_input.mouse_y-g_sb_drag_mouse_y)*sc;g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);}
+                if(g_input.mouse_down||g_input.mouse_released){
+                    float sc=ms/fmaxf(1,vh-th);
+                    g_scroll_y=g_sb_drag_scroll0+(g_input.mouse_y-g_sb_drag_mouse_y)*sc;
+                    g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
+                    g_scroll_target_y = g_scroll_y;
+                }
                 if(g_input.mouse_released)g_sb_dragging=false;
             }
-            if(g_input.mouse_pressed&&trhov&&!thov){g_scroll_y+=(g_input.mouse_y<ty2?-vh:vh);g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);}
-            fill_round_rect(track,6,g_style.input_bg);
-            fill_round_rect(thumb,6,g_sb_dragging?g_style.input_focus:thov?g_style.button_hover:g_style.border);
+            if(g_input.mouse_pressed&&trhov&&!thov){
+                if (effects_enabled()) {
+                    g_scroll_target_y += (g_input.mouse_y<ty2?-vh:vh);
+                    g_scroll_target_y=g_scroll_target_y<0?0:(g_scroll_target_y>ms?ms:g_scroll_target_y);
+                } else {
+                    g_scroll_y+=(g_input.mouse_y<ty2?-vh:vh);
+                    g_scroll_target_y = g_scroll_y;
+                    g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
+                }
+            }
+            float thumb_hover = thov ? 1.0f : 0.0f;
+            draw_widget_chrome(track, 6, g_style.input_bg, g_style.border, 0.0f, 0.0f, 0.0f);
+            draw_widget_chrome(thumb, 6,
+                               g_sb_dragging ? g_style.button_active : g_style.button_hover,
+                               g_sb_dragging ? g_style.input_focus : g_style.border,
+                               thumb_hover, g_sb_dragging ? 1.0f : 0.0f, 0.0f);
+        } else {
+            if (effects_enabled() && g_input.wheel_y != 0.0f) {
+                g_scroll_target_y = 0;
+                g_input.wheel_y = 0.0f;
+            }
         }
         g_content_height=new_ch;
     }
@@ -804,6 +1153,7 @@ void end() {
     }
     HRESULT hr=g_renderer.target->EndDraw(); g_drawing=false;
     if(hr==D2DERR_RECREATE_TARGET){release_render_target();create_render_target();}
+    else if (SUCCEEDED(hr)) capture_frame_snapshot();
     g_ctx.tab_stops_prev=g_ctx.tab_stops; g_ctx.frame_index++;
 }
 
@@ -823,17 +1173,35 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     if(!g_platform.hwnd) return;
     struct Snap {
         PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; DebugState dbg;
-        float sc,ch,sbmy,sbms0; bool sbd;
+        float sc,sct,ch,sbmy,sbms0; bool sbd;
         CmdState cmd; float fps,fpsa; int fpsf;
         LARGE_INTEGER lt;
-        int tci,tc,tsa,taci,tac,taas; float tasc;
+        int tci,tc,tsa,taci,tac,taas; float tasc,tasct,dt;
+        bool effects;
+        MotionSlot motion[256];
+        TabFxSlot tab_fx[32];
+        int tab_owner;
+        FrameContentFx frame_fx;
+        float draw_off_x,draw_off_y,draw_opacity;
+        ID2D1Bitmap* prev_frame_bitmap;
+        std::vector<BYTE> prev_frame_pixels;
+        UINT prev_frame_w, prev_frame_h;
         bool shortcuts,drawing;
     } s;
     s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
-    s.sc=g_scroll_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
+    s.sc=g_scroll_y;s.sct=g_scroll_target_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
     s.cmd=g_cmd;s.fps=g_fps;s.fpsa=g_fps_accum;s.fpsf=g_fps_frames;s.lt=g_last_time;
     s.tci=g_text_cursor_id;s.tc=g_text_cursor;s.tsa=g_text_sel_anchor;
-    s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;
+    s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;s.tasct=g_ta_scroll_target_y;s.dt=g_dt;
+    s.effects=g_effects_enabled;
+    memcpy(s.motion, g_motion_slots, sizeof(g_motion_slots));
+    memcpy(s.tab_fx, g_tab_fx_slots, sizeof(g_tab_fx_slots));
+    s.tab_owner=g_tab_content_owner;
+    s.frame_fx=g_frame_content_fx;
+    s.draw_off_x=g_draw_fx_off_x;s.draw_off_y=g_draw_fx_off_y;s.draw_opacity=g_draw_fx_opacity;
+    s.prev_frame_bitmap=g_prev_frame_bitmap;
+    s.prev_frame_pixels=std::move(g_prev_frame_pixels);
+    s.prev_frame_w=g_prev_frame_w;s.prev_frame_h=g_prev_frame_h;
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;
 
     auto* d2d = g_renderer.d2d_factory;
@@ -849,6 +1217,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_fps=g_fps_accum=0; g_fps_frames=0;
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
+    g_prev_frame_bitmap=nullptr; g_prev_frame_pixels.clear(); g_prev_frame_w=0; g_prev_frame_h=0;
+    reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false;
 
     DWORD ws=WS_OVERLAPPEDWINDOW; if(!cfg.resizable)ws&=~(WS_THICKFRAME|WS_MAXIMIZEBOX);
@@ -874,10 +1244,19 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         if(g_platform.hwnd){DestroyWindow(g_platform.hwnd);g_platform.hwnd=nullptr;}
     }
     g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_debug=s.dbg;
-    g_scroll_y=s.sc;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
+    g_scroll_y=s.sc;g_scroll_target_y=s.sct;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
     g_cmd=s.cmd;g_fps=s.fps;g_fps_accum=s.fpsa;g_fps_frames=s.fpsf;g_last_time=s.lt;
     g_text_cursor_id=s.tci;g_text_cursor=s.tc;g_text_sel_anchor=s.tsa;
-    g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;
+    g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;g_ta_scroll_target_y=s.tasct;g_dt=s.dt;
+    g_effects_enabled=s.effects;
+    memcpy(g_motion_slots, s.motion, sizeof(g_motion_slots));
+    memcpy(g_tab_fx_slots, s.tab_fx, sizeof(g_tab_fx_slots));
+    g_tab_content_owner=s.tab_owner;
+    g_frame_content_fx=s.frame_fx;
+    g_draw_fx_off_x=s.draw_off_x;g_draw_fx_off_y=s.draw_off_y;g_draw_fx_opacity=s.draw_opacity;
+    g_prev_frame_bitmap=s.prev_frame_bitmap;
+    g_prev_frame_pixels=std::move(s.prev_frame_pixels);
+    g_prev_frame_w=s.prev_frame_w;g_prev_frame_h=s.prev_frame_h;
     g_shortcuts_enabled=s.shortcuts;g_drawing=s.drawing;
     InvalidateRect(owner,nullptr,FALSE);
 }
@@ -1303,7 +1682,10 @@ bool create_window(const Config& cfg) {
     if (g_xim) g_xic=XCreateIC(g_xim,XNInputStyle,(XIMPreeditNothing|XIMStatusNothing),XNClientWindow,g_platform.window,XNFocusWindow,g_platform.window,(void*)nullptr);
     XMapWindow(dpy,g_platform.window); XFlush(dpy);
     g_platform.width=cfg.width; g_platform.height=cfg.height; g_platform.running=true;
-    g_style=default_dark_style();
+    g_style=startup_style();
+    g_scroll_y = g_scroll_target_y = 0;
+    g_ta_scroll_y = g_ta_scroll_target_y = 0;
+    reset_effect_state(false);
     if (!init_cairo()) return false;
     clock_gettime(CLOCK_MONOTONIC,&g_last_time);
     return true;
@@ -1312,6 +1694,7 @@ bool create_window(const Config& cfg) {
 bool pump() {
     using namespace internal;
     g_input.mouse_pressed=g_input.mouse_released=false;
+    g_input.wheel_y = 0;
     g_input.key_backspace=g_input.key_enter=g_input.key_tab=g_input.key_shift_tab=false;
     g_input.key_left=g_input.key_right=g_input.key_up=g_input.key_down=false;
     g_input.key_ctrl_c=g_input.key_ctrl_v=false;
@@ -1326,6 +1709,8 @@ bool pump() {
 void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
+    g_frame_content_fx = {};
+    reset_draw_fx();
     if ((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()) {
         auto& stops=g_ctx.tab_stops_prev;
         int cur=g_ctx.focused_input_id,idx=-1;
@@ -1340,13 +1725,14 @@ void begin() {
     const float kSW=14; float vh=g_ctx.content_region.h;
     bool nsb=g_content_height>vh+1;
     float ms=nsb?g_content_height-vh:0;
-    if(!nsb)g_scroll_y=0; g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    g_dt=(now.tv_sec-g_last_time.tv_sec)+(now.tv_nsec-g_last_time.tv_nsec)*1e-9f;
+    g_last_time=now; g_fps_accum+=g_dt; g_fps_frames++;
+    if(g_fps_accum>=0.5f){g_fps=(float)g_fps_frames/g_fps_accum;g_fps_frames=0;g_fps_accum=0;}
+    if(!nsb){g_scroll_y=0; g_scroll_target_y=0;} else g_scroll_target_y = g_scroll_y;
+    g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
     if(nsb)g_ctx.content_region.w-=kSW+pad;
     g_ctx.cursor_y=g_ctx.content_region.y-g_scroll_y;
-    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
-    float dt=(now.tv_sec-g_last_time.tv_sec)+(now.tv_nsec-g_last_time.tv_nsec)*1e-9f;
-    g_last_time=now; g_fps_accum+=dt; g_fps_frames++;
-    if(g_fps_accum>=0.5f){g_fps=(float)g_fps_frames/g_fps_accum;g_fps_frames=0;g_fps_accum=0;}
     if(!g_renderer.cr) return;
     apply_font();
     // clear
@@ -1421,18 +1807,30 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     if(!g_platform.display) return;
     struct Snap {
         PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; DebugState dbg;
-        float sc,ch,sbmy,sbms0; bool sbd;
+        float sc,sct,ch,sbmy,sbms0; bool sbd;
         CmdState cmd; float fps,fpsa; int fpsf;
         struct timespec lt;
-        int tci,tc,tsa,taci,tac,taas; float tasc;
+        int tci,tc,tsa,taci,tac,taas; float tasc,tasct,dt;
+        bool effects;
+        MotionSlot motion[256];
+        TabFxSlot tab_fx[32];
+        int tab_owner;
+        FrameContentFx frame_fx;
+        float draw_off_x,draw_off_y,draw_opacity;
         bool shortcuts,drawing;
         XIM xim; XIC xic; std::string cb;
     } s;
     s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
-    s.sc=g_scroll_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
+    s.sc=g_scroll_y;s.sct=g_scroll_target_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
     s.cmd=g_cmd;s.fps=g_fps;s.fpsa=g_fps_accum;s.fpsf=g_fps_frames;s.lt=g_last_time;
     s.tci=g_text_cursor_id;s.tc=g_text_cursor;s.tsa=g_text_sel_anchor;
-    s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;
+    s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;s.tasct=g_ta_scroll_target_y;s.dt=g_dt;
+    s.effects=g_effects_enabled;
+    memcpy(s.motion, g_motion_slots, sizeof(g_motion_slots));
+    memcpy(s.tab_fx, g_tab_fx_slots, sizeof(g_tab_fx_slots));
+    s.tab_owner=g_tab_content_owner;
+    s.frame_fx=g_frame_content_fx;
+    s.draw_off_x=g_draw_fx_off_x;s.draw_off_y=g_draw_fx_off_y;s.draw_opacity=g_draw_fx_opacity;
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;s.xim=g_xim;s.xic=g_xic;s.cb=g_clipboard_buf;
     Display* dpy=g_platform.display; Window parent=g_platform.window;
     g_platform={}; g_platform.display=dpy;
@@ -1441,11 +1839,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_fps=g_fps_accum=0; g_fps_frames=0;
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
+    reset_effect_state(false);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false; g_clipboard_buf=s.cb;
     g_xim=nullptr; g_xic=nullptr;
-    int sc=DefaultScreen(dpy); int cx=0,cy=0;
-    if(cfg.center_window){cx=(DisplayWidth(dpy,sc)-cfg.width)/2;cy=(DisplayHeight(dpy,sc)-cfg.height)/2;}
-    g_platform.window=XCreateSimpleWindow(dpy,RootWindow(dpy,sc),cx,cy,cfg.width,cfg.height,0,BlackPixel(dpy,sc),BlackPixel(dpy,sc));
+    int screen=DefaultScreen(dpy); int cx=0,cy=0;
+    if(cfg.center_window){cx=(DisplayWidth(dpy,screen)-cfg.width)/2;cy=(DisplayHeight(dpy,screen)-cfg.height)/2;}
+    g_platform.window=XCreateSimpleWindow(dpy,RootWindow(dpy,screen),cx,cy,cfg.width,cfg.height,0,BlackPixel(dpy,screen),BlackPixel(dpy,screen));
     g_platform.wm_delete=XInternAtom(dpy,"WM_DELETE_WINDOW",False);
     XSetWMProtocols(dpy,g_platform.window,&g_platform.wm_delete,1);
     XSetTransientForHint(dpy,g_platform.window,parent);
@@ -1465,10 +1864,16 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     if(g_xim){XCloseIM(g_xim);g_xim=nullptr;}
     if(g_platform.window){XDestroyWindow(dpy,g_platform.window);g_platform.window=0;} XFlush(dpy);
     g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_debug=s.dbg;
-    g_scroll_y=s.sc;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
+    g_scroll_y=s.sc;g_scroll_target_y=s.sct;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
     g_cmd=s.cmd;g_fps=s.fps;g_fps_accum=s.fpsa;g_fps_frames=s.fpsf;g_last_time=s.lt;
     g_text_cursor_id=s.tci;g_text_cursor=s.tc;g_text_sel_anchor=s.tsa;
-    g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;
+    g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;g_ta_scroll_target_y=s.tasct;g_dt=s.dt;
+    g_effects_enabled=s.effects;
+    memcpy(g_motion_slots, s.motion, sizeof(g_motion_slots));
+    memcpy(g_tab_fx_slots, s.tab_fx, sizeof(g_tab_fx_slots));
+    g_tab_content_owner=s.tab_owner;
+    g_frame_content_fx=s.frame_fx;
+    g_draw_fx_off_x=s.draw_off_x;g_draw_fx_off_y=s.draw_off_y;g_draw_fx_opacity=s.draw_opacity;
     g_shortcuts_enabled=s.shortcuts;g_drawing=s.drawing;g_xim=s.xim;g_xic=s.xic;g_clipboard_buf=s.cb;
     // trigger repaint of parent
     XExposeEvent xe={}; xe.type=Expose; xe.window=g_platform.window; xe.count=0;
@@ -1562,12 +1967,17 @@ bool button(const char* label) {
     }
     if (hov) g_ctx.hot_id = id;
 
-    Color bg = (g_ctx.active_id == id) ? g_style.button_active
-             : (hov)                   ? g_style.button_hover
-                                       : g_style.button;
-    fill_round_rect(r, g_style.rounding, bg);
-    stroke_round_rect(r, g_style.rounding, g_style.border_width, g_style.border);
-    draw_text_utf8_centered(vis, r, g_style.text);
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, g_ctx.active_id == id, false);
+
+    Color bg = lerp_color(g_style.button, g_style.panel, 0.30f);
+    bg = lerp_color(bg, g_style.button_hover, 0.20f + motion.hover * 0.35f);
+    bg = lerp_color(bg, g_style.input_focus, 0.06f + motion.hover * 0.05f + motion.active * 0.14f);
+    bg = lerp_color(bg, g_style.button_active, motion.active * 0.35f);
+    Color border = lerp_color(g_style.border, g_style.input_focus, 0.12f + motion.hover * 0.14f + motion.active * 0.22f);
+    draw_widget_chrome(r, g_style.rounding, bg, border, motion.hover, motion.active, 0.0f);
+    Rect text_r = offset_rect(r, 0.0f, motion.active * 1.0f);
+    draw_text_utf8_centered(vis, text_r, lerp_color(g_style.text_dim, g_style.text, 0.72f + motion.hover * 0.20f + motion.active * 0.08f));
 
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,1,0,0.4f});
     return clicked;
@@ -1725,10 +2135,13 @@ bool input(const char* label, char* buffer, int buffer_size,
         }
     }
 
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, hov && g_input.mouse_down, focused);
+
     // Draw
-    Color border_col = focused ? g_style.input_focus : g_style.border;
-    fill_round_rect(r, g_style.rounding, g_style.input_bg);
-    stroke_round_rect(r, g_style.rounding, focused ? 2.0f : g_style.border_width, border_col);
+    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
+    Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
+    draw_widget_chrome(r, g_style.rounding, panel_col, border_col, motion.hover, motion.active, motion.focus);
 
     float pad = 8.0f;
     Rect inner = {r.x + pad, r.y, r.w - pad * 2 - 80.0f, r.h};
@@ -1777,7 +2190,7 @@ bool input(const char* label, char* buffer, int buffer_size,
 
     // Label
     Rect lbl_r = {r.x + r.w - 78.0f, r.y, 76.0f, r.h};
-    draw_text_utf8(vis, lbl_r, g_style.text_dim);
+    draw_text_utf8(vis, lbl_r, lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f));
 
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,0,1,0.4f});
     return changed;
@@ -1810,6 +2223,7 @@ bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
             g_ta_cursor = (int)strlen(buffer);
             g_ta_sel_anchor = g_ta_cursor;
             g_ta_scroll_y = 0;
+            g_ta_scroll_target_y = 0;
         }
         int len = (int)strlen(buffer);
         if (g_ta_cursor > len) g_ta_cursor = len;
@@ -2002,19 +2416,22 @@ bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
         for (int i = 0; i < g_ta_cursor; i++) if (buffer[i] == '\n') cur_line++;
         float cursor_y_in_widget = cur_line * lh;
         float visible_h = widget_h - 8.0f;
-        if (cursor_y_in_widget - g_ta_scroll_y < 0)          g_ta_scroll_y = cursor_y_in_widget;
-        if (cursor_y_in_widget + lh - g_ta_scroll_y > visible_h) g_ta_scroll_y = cursor_y_in_widget + lh - visible_h;
-        if (g_ta_scroll_y < 0) g_ta_scroll_y = 0;
+        if (cursor_y_in_widget - g_ta_scroll_target_y < 0)          g_ta_scroll_target_y = cursor_y_in_widget;
+        if (cursor_y_in_widget + lh - g_ta_scroll_target_y > visible_h) g_ta_scroll_target_y = cursor_y_in_widget + lh - visible_h;
+        if (g_ta_scroll_target_y < 0) g_ta_scroll_target_y = 0;
     }
 
-    // Mouse-wheel scroll when hovered
-    // (scroll_y adjustments are done per-frame in pump(); re-use g_scroll_y delta isn't applicable here,
-    //  so platforms must set g_ta_scroll_y directly or we rely on the pump-level handling)
+    if (effects_enabled() && hov && g_input.wheel_y != 0.0f) {
+        g_ta_scroll_target_y -= g_input.wheel_y;
+        g_input.wheel_y = 0.0f;
+    }
 
     // --- Drawing ---
-    Color border_col = focused ? g_style.input_focus : g_style.border;
-    fill_round_rect(r, g_style.rounding, g_style.input_bg);
-    stroke_round_rect(r, g_style.rounding, focused ? 2.0f : g_style.border_width, border_col);
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, hov && g_input.mouse_down, focused);
+    Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
+    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
+    draw_widget_chrome(r, g_style.rounding, panel_col, border_col, motion.hover, motion.active, motion.focus);
 
     Rect clip_r = {r.x + 2, r.y + 2, r.w - 4, r.h - 4};
     push_clip(clip_r);
@@ -2025,6 +2442,12 @@ bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
     // Count total lines
     int total_lines = 1;
     for (int i = 0; i < len; i++) if (buffer[i] == '\n') total_lines++;
+    float total_h = total_lines * lh;
+    float ta_visible_h = widget_h - 8.0f;
+    float ta_max_scroll = total_h > ta_visible_h ? (total_h - ta_visible_h) : 0.0f;
+    g_ta_scroll_target_y = g_ta_scroll_target_y < 0 ? 0 : (g_ta_scroll_target_y > ta_max_scroll ? ta_max_scroll : g_ta_scroll_target_y);
+    if (effects_enabled()) g_ta_scroll_y = step_anim(g_ta_scroll_y, g_ta_scroll_target_y, g_dt, 18.0f);
+    else g_ta_scroll_y = g_ta_scroll_target_y;
 
     // Compute selection range
     int sel_lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
@@ -2076,7 +2499,6 @@ bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
     pop_clip();
 
     // Scrollbar
-    float total_h = total_lines * lh;
     if (total_h > r.h - 8) {
         float sb_w = 6.0f, sb_x = r.x + r.w - sb_w - 2;
         float visible_h = r.h - 8;
@@ -2094,7 +2516,7 @@ bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
     if (vis[0]) {
         float lbl_w = 80.0f;
         Rect lbl_r = {r.x + r.w + 4, r.y, lbl_w, g_style.item_height};
-        draw_text_utf8(vis, lbl_r, g_style.text_dim);
+        draw_text_utf8(vis, lbl_r, lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f));
     }
 
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,0,1,0.4f});
@@ -2117,21 +2539,26 @@ bool checkbox(const char* label, bool* value) {
         g_ctx.active_id = 0;
     }
 
-    float box_sz = g_style.item_height - 8;
+    float box_sz = g_style.item_height - 10;
     Rect box = {r.x, r.y + (r.h - box_sz) * 0.5f, box_sz, box_sz};
-    Color bg = hov ? g_style.button_hover : g_style.input_bg;
-    fill_round_rect(box, g_style.rounding * 0.5f, bg);
-    stroke_round_rect(box, g_style.rounding * 0.5f, g_style.border_width, *value ? g_style.input_focus : g_style.border);
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, g_ctx.active_id == id, *value);
+    Color bg = lerp_color(g_style.input_bg, g_style.panel, 0.14f);
+    bg = lerp_color(bg, g_style.button_hover, motion.hover * 0.45f);
+    bg = lerp_color(bg, g_style.input_focus, motion.focus * 0.10f);
+    Color border = lerp_color(g_style.border, g_style.input_focus, motion.focus);
+    draw_widget_chrome(box, fmaxf(2.0f, g_style.rounding * 0.35f), bg, border, motion.hover, motion.active, motion.focus);
 
-    if (*value) {
-        // Checkmark: two lines forming a tick
-        float m = 3.0f;
-        draw_line(box.x+m, box.y+box_sz*0.5f, box.x+box_sz*0.4f, box.y+box_sz-m, 2, g_style.input_focus);
-        draw_line(box.x+box_sz*0.4f, box.y+box_sz-m, box.x+box_sz-m, box.y+m, 2, g_style.input_focus);
+    if (motion.focus > 0.01f) {
+        float inset = 5.0f;
+        Rect mark = {box.x + inset, box.y + inset, box.w - inset * 2.0f, box.h - inset * 2.0f};
+        Color mark_fill = lerp_color(g_style.input_focus, g_style.text, 0.18f);
+        mark_fill.a = 0.24f + motion.focus * 0.62f;
+        fill_rect(mark, mark_fill);
     }
 
     Rect lbl_r = {box.x + box_sz + 8, r.y, r.w - box_sz - 8, r.h};
-    draw_text_utf8(vis, lbl_r, g_style.text);
+    draw_text_utf8(vis, lbl_r, lerp_color(g_style.text_dim, g_style.text, 0.45f + motion.hover * 0.55f));
 
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,0,1,0.4f});
     return clicked;
@@ -2160,24 +2587,28 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
         }
     }
 
-    fill_round_rect(track_r, 3, g_style.input_bg);
-    stroke_round_rect(track_r, 3, g_style.border_width, g_style.border);
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, g_ctx.active_id == id, false);
+
+    Color track_bg = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f);
+    fill_round_rect(track_r, 3, track_bg);
+    stroke_round_rect(track_r, 3, g_style.border_width, lerp_color(g_style.border, g_style.input_focus, motion.active * 0.25f));
 
     float t = (*value - min_v) / (max_v - min_v);
     if (t < 0) t = 0; if (t > 1) t = 1;
     Rect fill_r = {track_r.x, track_r.y, track_r.w * t, track_r.h};
-    if (fill_r.w > 0) fill_round_rect(fill_r, 3, g_style.input_focus);
+    if (fill_r.w > 0) fill_round_rect(fill_r, 3, with_alpha(g_style.input_focus, 0.78f + motion.active * 0.18f));
 
     float knob_sz = 14.0f;
     Rect knob = {track_r.x + track_r.w * t - knob_sz * 0.5f, r.y + r.h * 0.5f - knob_sz * 0.5f, knob_sz, knob_sz};
-    Color knob_col = (g_ctx.active_id == id) ? g_style.button_active : (hov ? g_style.button_hover : g_style.button);
-    fill_round_rect(knob, knob_sz * 0.5f, knob_col);
-    stroke_round_rect(knob, knob_sz * 0.5f, g_style.border_width, g_style.input_focus);
+    Color knob_col = lerp_color(g_style.button, g_style.button_hover, motion.hover);
+    knob_col = lerp_color(knob_col, g_style.button_active, motion.active);
+    draw_widget_chrome(knob, knob_sz * 0.5f, knob_col, g_style.input_focus, motion.hover, motion.active, 0.0f);
 
     char val_str[64];
     snprintf(val_str, sizeof(val_str), "%s  %.2f", vis, *value);
     Rect lbl_r2 = {r.x + r.w - lbl_w + 4, r.y, lbl_w - 4, r.h};
-    draw_text_utf8(val_str, lbl_r2, g_style.text_dim);
+    draw_text_utf8(val_str, lbl_r2, lerp_color(g_style.text_dim, g_style.text, motion.hover * 0.30f));
 
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,1,0,0.4f});
     return changed;
@@ -2197,6 +2628,20 @@ bool tabs(const char* const* labels, int count, int* selected) {
     Rect r = next_rect(tab_h);
     float tab_w = r.w / count;
     bool changed = false;
+    size_t ptr_bits = (size_t)(const void*)selected;
+    int bar_id = (int)(((ptr_bits >> 4) ^ (ptr_bits >> 9) ^ ((size_t)count * 2654435761u)) & 0x7fffffff);
+    if (bar_id == 0) bar_id = count ? count : 1;
+    TabFxSlot& fx = tab_fx_slot_for(bar_id);
+    if (!fx.initialized) {
+        fx.initialized = true;
+        fx.selected = *selected;
+        fx.previous = *selected;
+        fx.switch_t = 1.0f;
+    }
+
+    int current_selected = *selected;
+    Rect selected_rect = {};
+    bool have_selected_rect = false;
 
     for (int i = 0; i < count; i++) {
         char vis[128]; const char* hs;
@@ -2208,21 +2653,71 @@ bool tabs(const char* const* labels, int count, int* selected) {
 
         if (hov && g_input.mouse_pressed) g_ctx.active_id = id;
         if (g_ctx.active_id == id && g_input.mouse_released) {
-            if (hov && *selected != i) { *selected = i; changed = true; }
+            if (hov && current_selected != i) { current_selected = i; changed = true; }
             g_ctx.active_id = 0;
         }
 
-        bool sel = (*selected == i);
-        Color bg = sel ? g_style.panel : (hov ? g_style.button_hover : g_style.button);
-        fill_round_rect(tr, g_style.rounding, bg);
+        bool sel = (current_selected == i);
+        if (sel) { selected_rect = tr; have_selected_rect = true; }
 
-        if (sel) {
-            // Accent line at bottom
-            Rect accent = {tr.x + 4, tr.y + tr.h - 3, tr.w - 8, 3};
-            fill_round_rect(accent, 1.5f, g_style.input_focus);
+        MotionSlot& motion = motion_slot_for(id);
+        update_motion_slot(motion, hov, g_ctx.active_id == id, sel);
+
+        Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover);
+        bg = lerp_color(bg, g_style.panel, motion.focus);
+        bg = lerp_color(bg, g_style.button_active, motion.active * 0.75f);
+        Color border = lerp_color(g_style.border, g_style.input_focus, motion.focus * 0.45f + motion.active * 0.25f);
+        draw_widget_chrome(tr, g_style.rounding, bg, border, motion.hover, motion.active, motion.focus);
+        draw_text_utf8_centered(vis, tr, lerp_color(g_style.text_dim, g_style.text, clamp01(motion.hover * 0.45f + motion.focus)));
+    }
+
+    *selected = current_selected;
+
+    if (current_selected != fx.selected) {
+        fx.previous = fx.selected;
+        fx.selected = current_selected;
+        fx.dir = fx.selected >= fx.previous ? 1 : -1;
+        fx.switch_t = 0.0f;
+        if (effects_enabled() && (g_tab_content_owner == 0 || g_tab_content_owner == bar_id)) g_tab_content_owner = bar_id;
+    }
+
+    if (effects_enabled()) {
+        if (fx.switch_t < 1.0f) {
+            fx.switch_t += g_dt / 0.18f;
+            if (fx.switch_t > 1.0f) fx.switch_t = 1.0f;
         }
-        stroke_round_rect(tr, g_style.rounding, g_style.border_width, g_style.border);
-        draw_text_utf8_centered(vis, tr, sel ? g_style.text : g_style.text_dim);
+    } else {
+        fx.switch_t = 1.0f;
+    }
+
+    if (have_selected_rect) {
+        float target_x = selected_rect.x + 4.0f;
+        float target_w = fmaxf(18.0f, selected_rect.w - 8.0f);
+        if (fx.underline_w <= 0.0f) {
+            fx.underline_x = target_x;
+            fx.underline_w = target_w;
+        } else if (effects_enabled()) {
+            fx.underline_x = step_anim(fx.underline_x, target_x, g_dt, 20.0f);
+            fx.underline_w = step_anim(fx.underline_w, target_w, g_dt, 20.0f);
+        } else {
+            fx.underline_x = target_x;
+            fx.underline_w = target_w;
+        }
+        Rect accent = {fx.underline_x, r.y + r.h - 3, fx.underline_w, 3};
+        fill_round_rect(accent, 1.5f, with_alpha(g_style.input_focus, 0.78f));
+    }
+
+    if (effects_enabled() && g_tab_content_owner == bar_id && fx.switch_t < 1.0f && !g_frame_content_fx.active) {
+        float p = ease_smooth(fx.switch_t);
+        g_frame_content_fx.active = true;
+        g_frame_content_fx.owner = bar_id;
+        g_frame_content_fx.start_y = g_ctx.cursor_y;
+        g_frame_content_fx.progress = fx.switch_t;
+        g_frame_content_fx.dir = fx.dir;
+        g_draw_fx_off_x = (float)fx.dir * (1.0f - p) * 18.0f;
+        g_draw_fx_opacity = 1.0f;
+    } else if (g_tab_content_owner == bar_id && fx.switch_t >= 1.0f) {
+        g_tab_content_owner = 0;
     }
 
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.5f,0,1,0.4f});
@@ -2249,5 +2744,3 @@ void row(int cols, std::function<void()> fn) {
 } // namespace ftui
 
 #endif // FTUI_IMPLEMENTATION
-
-

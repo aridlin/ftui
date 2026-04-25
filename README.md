@@ -1,13 +1,38 @@
 # FTUI
 
-Tiny immediate-mode GUI for Windows. Single header, no CMake, no dependencies beyond the Win32 SDK.[^linux]
+FTUI is a tiny immediate-mode GUI for C++.
+
+It ships as a single header, uses the native platform stack directly, and is built for "drop one file into a project and start drawing UI" workflows.
+
+- Windows backend: Win32 + Direct2D + DirectWrite
+- Linux backend: X11 + Cairo
+- Distribution model: single header, no CMake required, no external runtime dependencies beyond platform SDKs/libs
+
+## Why FTUI
+
+- Single-header library: copy `ftui.hpp` into a project and include it
+- Immediate-mode API: just call widgets each frame in layout order
+- No coordinate soup: widgets flow top-to-bottom automatically
+- Built-in themes: default dark, Catppuccin Mocha, Nord, Gruvbox Dark, One Dark
+- Default runtime theme: controlled by `FTUI_DEFAULT_STYLE` near the top of `ftui.hpp`
+- Windows polish path: smooth scrolling, tab slide transitions, hover/press motion, optional effects toggle
+- Linux support included: same API, simpler visual path
+
+## Quick start
+
+In exactly one `.cpp` file:
 
 ```cpp
 #define FTUI_IMPLEMENTATION
 #include "ftui.hpp"
 
 int main() {
-    if (!ftui::create_window()) return 1;
+    ftui::Config cfg;
+    cfg.title = "My App";
+    cfg.width = 960;
+    cfg.height = 640;
+
+    if (!ftui::create_window(cfg)) return 1;
 
     char name[64] = "";
 
@@ -16,132 +41,131 @@ int main() {
 
         ftui::text("Hello");
         ftui::input("Name", name, sizeof(name));
-        if (ftui::button("Go")) { /* ... */ }
+
+        if (ftui::button("Go")) {
+            // handle click
+        }
 
         ftui::end();
     }
 
     ftui::shutdown();
+    return 0;
 }
 ```
 
----
+Every other translation unit should include the header without `FTUI_IMPLEMENTATION`.
 
-## Compile
+## Build
+
+Windows with `clang++`:
 
 ```bash
 clang++ main.cpp -o app.exe -std=c++17 -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -lwindowscodecs
 ```
 
-With MSVC the `#pragma comment(lib, ...)` lines inside the header handle linking automatically.
+Windows with MSVC:
 
----
+- The header already contains the `#pragma comment(lib, ...)` lines for the required Windows libs.
 
-## Distribution
+Linux:
 
-Copy `ftui.hpp` into your project. In exactly one `.cpp` file:
-
-```cpp
-#define FTUI_IMPLEMENTATION
-#include "ftui.hpp"
+```bash
+g++ main.cpp -o app -DFTUI_IMPLEMENTATION $(pkg-config --cflags --libs cairo x11) -std=c++17
 ```
 
-All other files just `#include "ftui.hpp"` without the define.
+If you use `open_file_dialog()` on Linux, install `zenity`.
 
----
-
-## Lifecycle
+## Core lifecycle
 
 ```cpp
 ftui::Config cfg;
-cfg.title         = "My App";
-cfg.width         = 960;
-cfg.height        = 640;
-cfg.resizable     = true;
-cfg.center_window = true;
-cfg.icon          = nullptr; // HICON, or nullptr for the built-in FTUI logo
+cfg.title          = "FTUI App";
+cfg.width          = 960;
+cfg.height         = 640;
+cfg.resizable      = true;
+cfg.center_window  = true;
+cfg.icon           = nullptr; // HICON on Windows, ignored on Linux
+cfg.enable_effects = true;    // Windows-only effects layer
 
-ftui::create_window(cfg);   // create platform window + renderer resources
-ftui::pump();               // process messages, returns false when closed
-ftui::begin();              // start frame - resets layout cursor, clears background
-ftui::end();                // finish frame - present to screen
-ftui::shutdown();           // release all resources
+if (!ftui::create_window(cfg)) return 1;
+
+while (ftui::pump()) {
+    ftui::begin();
+
+    // widgets
+
+    ftui::end();
+}
+
+ftui::shutdown();
 ```
 
----
+## Widget examples
 
-## Widgets
-
-All widgets are placed in call order, top to bottom, full content width. No coordinates.
-
-### Text
+### Text, separator, spacing
 
 ```cpp
-ftui::text("Hello, world!");
+ftui::text("Section title");
+ftui::separator();
+ftui::spacing(12.0f);
 ```
 
-### Separator and spacing
+### Buttons
 
 ```cpp
-ftui::separator();    // thin horizontal rule
-ftui::spacing(16.0f); // blank vertical gap (default 8px)
-```
-
-### Button
-
-```cpp
-if (ftui::button("Click me")) {
+if (ftui::button("Sign in")) {
     // fired on mouse-up inside the button
 }
 ```
 
-Supports `##` suffix for disambiguation when two buttons share the same visible label:
+Visible labels can be reused by adding an ID suffix:
 
 ```cpp
-ftui::button("Open##file_open");
-ftui::button("Open##folder_open");
+ftui::button("Open##file");
+ftui::button("Open##folder");
 ```
 
-### Text boxes
+### Single-line text boxes
 
 ```cpp
-char user[128] = "";
-if (ftui::input("Username", user, sizeof(user))) {
-    // contents changed this frame
-}
-
-char pw[128] = "";
-ftui::input("Password", pw, sizeof(pw), ftui::InputFlags::Password);
-ftui::input("Read only", user, sizeof(user), ftui::InputFlags::ReadOnly);
-
+char username[128] = "";
+char password[128] = "";
 bool submitted = false;
-char query[128] = "";
-ftui::input("Search", query, sizeof(query), ftui::InputFlags::Default, &submitted);
-if (ftui::button("Go") || submitted) { /* run search */ }
+
+ftui::input("Username", username, sizeof(username));
+ftui::input("Password", password, sizeof(password), ftui::InputFlags::Password, &submitted);
+
+if (submitted || ftui::button("Login")) {
+    // submit
+}
 ```
 
-For a multi-line text box:
+Read-only input:
 
 ```cpp
-char notes[512] = "";
-ftui::text_area("Notes##notes", notes, sizeof(notes), 6);
+ftui::input("Token", username, sizeof(username), ftui::InputFlags::ReadOnly);
 ```
 
-`Tab` / `Shift+Tab` cycle focus between visible text boxes without touching the mouse. In `text_area()`, `Enter` inserts a newline and `Ctrl+C` / `Ctrl+V` copy and paste selected text.
+### Multi-line text box
+
+```cpp
+char notes[1024] = "";
+ftui::text_area("Notes##main", notes, sizeof(notes), 8);
+```
+
+`text_area()` supports selection, copy/paste, and internal scrolling.
 
 ### Tabs
 
 ```cpp
-static const char* sections[] = { "Login", "Notes", "Settings" };
+static const char* tabs[] = { "Login", "Notes", "Settings" };
 int selected_tab = 0;
 
-if (ftui::tabs(sections, 3, &selected_tab)) {
-    // selected tab changed
-}
+ftui::tabs(tabs, 3, &selected_tab);
 
 if (selected_tab == 0) {
-    ftui::input("Username", user, sizeof(user));
-    ftui::input("Password", pw, sizeof(pw), ftui::InputFlags::Password);
+    ftui::text("Login page");
 } else if (selected_tab == 1) {
     ftui::text_area("Notes##notes", notes, sizeof(notes), 6);
 } else {
@@ -149,182 +173,163 @@ if (selected_tab == 0) {
 }
 ```
 
-Tabs render a horizontal tab bar and update `selected_tab` in place.
-
 ### Checkbox
 
 ```cpp
 bool enabled = false;
-if (ftui::checkbox("Enable feature", &enabled)) {
-    // toggled this frame
-}
+ftui::checkbox("Enable option", &enabled);
 ```
 
 ### Slider
 
 ```cpp
-float volume = 0.5f;
-if (ftui::slider_float("Volume", &volume, 0.0f, 1.0f)) {
-    // value changed this frame
-}
+float blend = 0.5f;
+ftui::slider_float("Blend", &blend, 0.0f, 1.0f);
 ```
 
-### Row (columns)
-
-Temporarily switches the layout to horizontal, splitting the available width into N equal cells separated by `item_spacing` gaps. Widgets called inside the lambda are placed left-to-right; after `fn()` returns the cursor advances below the tallest cell.
+### Row layout
 
 ```cpp
 ftui::row(3, [&]() {
-    if (ftui::button("Left"))   { /* ... */ }
-    if (ftui::button("Center")) { /* ... */ }
-    if (ftui::button("Right"))  { /* ... */ }
+    ftui::button("Left");
+    ftui::button("Center");
+    ftui::button("Right");
 });
 ```
 
-Any widget type works inside a row. Excess widgets beyond `N` are placed anyway (they overflow to the right).
+Rows split the current width into equal cells for the duration of the lambda.
 
-### Image
+### Images
 
 ```cpp
-ftui::ImageHandle* img = ftui::load_image("photo.png"); // PNG, JPEG, BMP, GIF, TIFF
+ftui::ImageHandle* img = ftui::load_image("photo.png");
 
-ftui::image(img, 200.0f, 150.0f); // width, height in logical pixels
+ftui::image(img, 200.0f, 150.0f);
 
 ftui::free_image(img);
 ```
 
-Passing `nullptr` renders a placeholder box. Images are centered horizontally.
+On Windows, image decoding goes through WIC. On Linux, PNG loading uses Cairo image surfaces.
 
 ### File dialog
 
 ```cpp
 static const ftui::FileFilter filters[] = {
-    { "Images", "*.png;*.jpg;*.bmp" },
+    { "Images", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff" },
     { "All Files", "*.*" },
 };
 
 std::string path = ftui::open_file_dialog("Open Image", filters, 2);
 if (!path.empty()) {
-    // path is a UTF-8 absolute file path
+    // UTF-8 absolute path
 }
 ```
 
-The dialog is modal and blocks the frame loop while open. On Linux it uses `zenity` when available.[^linux]
+### Child windows
 
----
+```cpp
+ftui::Config child;
+child.title = "Details";
+child.width = 640;
+child.height = 360;
+
+ftui::open_child_window(child, [&]() {
+    ftui::text("Child window content");
+    ftui::button("Close me manually");
+});
+```
 
 ## Themes
 
-Five built-in themes, all returning a `ftui::Style`:
+Built-in presets:
 
 ```cpp
-ftui::set_style(ftui::default_dark_style());     // FTUI default
-ftui::set_style(ftui::catppuccin_mocha_style()); // Catppuccin Mocha
-ftui::set_style(ftui::nord_style());             // Nord
-ftui::set_style(ftui::gruvbox_dark_style());     // Gruvbox Dark
-ftui::set_style(ftui::one_dark_style());         // One Dark (Atom)
+ftui::set_style(ftui::default_dark_style());
+ftui::set_style(ftui::catppuccin_mocha_style());
+ftui::set_style(ftui::nord_style());
+ftui::set_style(ftui::gruvbox_dark_style());
+ftui::set_style(ftui::one_dark_style());
 ```
 
-Call `set_style()` at any time - it takes effect from the next `begin()`.
+New windows start with whatever `FTUI_DEFAULT_STYLE` is set to near the top of `ftui.hpp`. By default it points to `ftui::nord_style`.
 
-### Custom theme
+Custom theme example:
 
 ```cpp
-ftui::Style s = ftui::default_dark_style(); // start from a preset
-s.input_focus = {0.8f, 0.3f, 0.2f, 1.0f};   // override accent color
-s.rounding    = 4.0f;
+ftui::Style s = ftui::default_dark_style();
+s.input_focus = {0.80f, 0.30f, 0.20f, 1.0f};
+s.rounding = 4.0f;
 ftui::set_style(s);
 ```
 
-`ftui::Style` fields:
+## Windows effects
 
-| Field | Type | Purpose |
-|---|---|---|
-| `background` | `Color` | Window background |
-| `panel` | `Color` | Widget fill (buttons, etc.) |
-| `text` | `Color` | Primary text |
-| `text_dim` | `Color` | Labels, secondary text |
-| `border` | `Color` | Widget borders |
-| `button` / `button_hover` / `button_active` | `Color` | Button states |
-| `input_bg` | `Color` | Input field background |
-| `input_focus` | `Color` | Focused input border / accent |
-| `window_padding` | `float` | Outer padding (px) |
-| `item_spacing` | `float` | Gap between widgets (px) |
-| `item_height` | `float` | Height of interactive controls (px) |
-| `rounding` | `float` | Corner radius (px) |
-| `border_width` | `float` | Stroke width (px) |
-| `font_size` | `float` | Font size in DIPs |
+On Windows, FTUI can enable a lightweight effects layer with:
 
----
+- smooth window scrolling
+- animated hover and press states
+- tab underline motion
+- tab content slide transitions
 
-## Debug overlays
+Runtime opt-out:
 
 ```cpp
-ftui::debug().show_layout_rects = true; // outline every widget rect
-ftui::debug().show_hovered_id   = true; // show hot/active/focused IDs
-ftui::debug().show_active_id    = true;
-ftui::debug().show_fps          = true; // FPS + DPI% in corner
-ftui::debug().log_widget_calls  = true; // log to OutputDebugString (DebugView)
+ftui::Config cfg;
+cfg.enable_effects = false;
 ```
 
----
-
-## Console window
-
-By default FTUI suppresses the console window via a linker pragma. To keep it (for example, during development):
+Compile-time strip:
 
 ```cpp
-#define FTUI_KEEP_CONSOLE
+#define FTUI_DISABLE_EFFECTS
 #define FTUI_IMPLEMENTATION
 #include "ftui.hpp"
 ```
 
----
+Linux keeps the same API but does not use the Windows effects path.
 
-## Keyboard shortcuts
+## Keyboard behavior
 
-| Key | Action |
-|---|---|
-| **Tab** | Focus next text box |
-| **Shift+Tab** | Focus previous text box |
-| **Enter** | Signals `enter_pressed` in the focused single-line input; inserts a newline in `text_area()` |
-| **Backspace** | Deletes the previous character in the focused text box |
-| **Ctrl+Q** | Quit |
-| **:** | Enter command mode (only when no input field is focused) |
-| **Escape** | Cancel command mode |
+- `Tab` / `Shift+Tab`: move focus between text inputs
+- `Enter`: submit single-line input through `enter_pressed`; insert newline in `text_area()`
+- `Backspace`: delete in focused text input
+- `Ctrl+C` / `Ctrl+V`: copy and paste selected text
+- `Ctrl+Q`: quit by default
+- `:`: open command mode when no input is focused
+- `Escape`: cancel command mode
 
-### Command mode
-
-Press `:` when no input is focused to open a command prompt (shown at the bottom-left). Type a command and press **Enter** to execute it. **Escape** or a mouse click cancels.
-
-| Command | Action |
-|---|---|
-| `:q` | Quit |
-| `:td` | Switch to Default Dark theme |
-| `:tc` | Switch to Catppuccin Mocha theme |
-| `:tn` | Switch to Nord theme |
-| `:tg` | Switch to Gruvbox Dark theme |
-| `:to` | Switch to One Dark theme |
-
-All built-in shortcuts (`Ctrl+Q` and command mode) share a single toggle:
+Disable the built-in quit / command shortcuts:
 
 ```cpp
-// Disable all built-in shortcuts (for example, for a shipped app)
 ftui::set_quit_on_ctrl_q(false);
 ```
 
----
+Command mode supports:
 
-## Scrolling
+- `:q`
+- `:td`
+- `:tc`
+- `:tn`
+- `:tg`
+- `:to`
 
-FTUI scrolls automatically. When the total content height exceeds the window height a scrollbar appears on the right and content is clipped to the visible area. No setup required.
+## Notes
 
-`Mouse wheel` scrolls 80 px per tick. The scrollbar thumb is draggable. Clicking the track above or below the thumb pages by one visible height.
+- Layout is sequential and immediate-mode by design.
+- Scrolling is automatic when content exceeds the visible region.
+- The API is intentionally small: no docking, retained widget tree, or layout editor.
+- Linux support exists and is maintained, but the Windows path currently gets the richer visual treatment first.
 
----
+## Demo
 
-## Non-goals for v1
+`demo.cpp` shows:
 
-Scrollable containers, nested layouts, drag-and-drop, markdown, animations, docking, theme editors. FTUI stays small on purpose.
-
-[^linux]: FTUI also has a Linux backend using X11 + Cairo. Build with `g++ main.cpp -o app -std=c++17 $(pkg-config --cflags --libs cairo x11)`. If you use `open_file_dialog()` on Linux, install `zenity`.
+- tabs
+- text boxes and password input
+- multi-line notes
+- checkbox and slider
+- theme switching
+- file dialog usage
+- images
+- child windows
+- debug overlays

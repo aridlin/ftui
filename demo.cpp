@@ -86,6 +86,12 @@ int main() {
         ftui::one_dark_style,
     };
     int theme_idx = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (theme_fns[i] == FTUI_DEFAULT_STYLE) {
+            theme_idx = i;
+            break;
+        }
+    }
     ftui::set_style(theme_fns[theme_idx]());
 
     static const ftui::FileFilter img_filters[] = {
