@@ -19,11 +19,22 @@
 #define FTUI_DEFAULT_STYLE ftui::nord_style
 #endif
 
+#ifndef FTUI_VERSION_MAJOR
+#define FTUI_VERSION_MAJOR 1
+#endif
+#ifndef FTUI_VERSION_MINOR
+#define FTUI_VERSION_MINOR 1
+#endif
+#ifndef FTUI_VERSION_PATCH
+#define FTUI_VERSION_PATCH 0
+#endif
+
 #pragma once
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
 #include <cmath>
+#include <initializer_list>
 #include <string>
 #include <vector>
 #include <functional>
@@ -33,6 +44,8 @@
 // ============================================================
 
 namespace ftui {
+
+enum class Align { Start, Center, End };
 
 struct Color { float r, g, b, a; };
 
@@ -71,14 +84,48 @@ void shutdown();
 void set_quit_on_ctrl_q(bool enabled);
 
 void text(const char* label);
+void text_wrapped(const char* text);
 void separator();
 void spacing(float px = 8.0f);
 
-enum class InputFlags : unsigned { Default = 0, Password = 1 << 0, ReadOnly = 1 << 1 };
+enum class InputFlags : unsigned {
+    Default = 0,
+    Password = 1 << 0,
+    ReadOnly = 1 << 1,
+    CharsDecimal = 1 << 2,
+    CharsHexadecimal = 1 << 3,
+    CharsUppercase = 1 << 4,
+    CharsNoBlank = 1 << 5,
+};
 inline InputFlags operator|(InputFlags a, InputFlags b) {
     return static_cast<InputFlags>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
 }
 inline bool operator&(InputFlags a, InputFlags b) {
+    return (static_cast<unsigned>(a) & static_cast<unsigned>(b)) != 0;
+}
+
+enum class TextAreaFlags : unsigned {
+    Default = 0,
+    ReadOnly = 1 << 0,
+    WordWrap = 1 << 1,
+    AutoScrollBottom = 1 << 2,
+};
+inline TextAreaFlags operator|(TextAreaFlags a, TextAreaFlags b) {
+    return static_cast<TextAreaFlags>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
+inline bool operator&(TextAreaFlags a, TextAreaFlags b) {
+    return (static_cast<unsigned>(a) & static_cast<unsigned>(b)) != 0;
+}
+
+enum class LogViewFlags : unsigned {
+    Default = 0,
+    WordWrap = 1 << 0,
+    AutoScrollBottom = 1 << 1,
+};
+inline LogViewFlags operator|(LogViewFlags a, LogViewFlags b) {
+    return static_cast<LogViewFlags>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
+inline bool operator&(LogViewFlags a, LogViewFlags b) {
     return (static_cast<unsigned>(a) & static_cast<unsigned>(b)) != 0;
 }
 
@@ -87,15 +134,39 @@ bool input(const char* label, char* buffer, int buffer_size,
 
 // Multi-line text input. Enter inserts newline; Tab cycles focus.
 bool text_area(const char* label, char* buffer, int buffer_size, int rows = 5);
+bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows = 5,
+                  TextAreaFlags flags = TextAreaFlags::Default);
+void log_view(const char* label, const char* text, int rows = 8,
+              LogViewFlags flags = LogViewFlags::AutoScrollBottom);
 
 bool checkbox(const char* label, bool* value);
 bool slider_float(const char* label, float* value, float min_v, float max_v);
 bool button(const char* label);
+bool dropdown(const char* label, const char* const* items, int count, int* selected, int popup_rows = 8);
+bool listbox(const char* label, const char* const* items, int count, int* selected, int visible_rows = 6);
+bool radio_group(const char* label, const char* const* items, int count, int* selected, int columns = 1);
+bool collapsing_header(const char* label, bool* open = nullptr);
 
 // Horizontal tab bar. Returns true when selected changes.
 bool tabs(const char* const* labels, int count, int* selected);
 
 void row(int cols, std::function<void()> fn);
+void row(std::initializer_list<float> weights, std::function<void()> fn);
+void scroll_area(const char* label, float height, std::function<void()> fn);
+void set_next_width(float px);
+void set_next_fill();
+void set_next_percent(float pct);
+void set_next_limits(float min_px, float max_px);
+void set_next_align(Align align);
+void open_modal(const char* label);
+bool modal(const char* label, std::function<void()> fn);
+void close_modal();
+void begin_disabled();
+void end_disabled();
+void tooltip(const char* text);
+void request_focus(const char* label);
+float calc_text_width(const char* text);
+float calc_text_height(const char* text, float wrap_width);
 
 // Opaque image handle — platform-specific payload in _impl.
 struct ImageHandle { void* _impl = nullptr; };
@@ -224,6 +295,7 @@ struct InputState {
     bool  mouse_down = false, mouse_pressed = false, mouse_released = false;
     float wheel_y = 0;
     bool  key_backspace = false, key_enter = false;
+    bool  key_space = false, key_escape = false;
     bool  key_tab = false, key_shift_tab = false;
     bool  key_left = false, key_right = false;
     bool  key_up   = false, key_down  = false;
@@ -235,17 +307,26 @@ struct InputState {
 };
 
 struct RowContext {
-    bool  active = false; int cols = 0;
+    bool  active = false;
+    bool  weighted = false;
+    int   cols = 0;
     float cell_w = 0, gap = 0, start_x = 0, start_y = 0;
-    int   col_index = 0; float row_height = 0;
+    float total_w = 0, used_x = 0, total_weight = 0;
+    const float* weights = nullptr;
+    int   col_index = 0;
+    float row_height = 0;
 };
 
 struct UIContext {
-    int  hot_id = 0, active_id = 0, focused_input_id = 0, frame_index = 0;
+    int  hot_id = 0, active_id = 0, focused_input_id = 0, focused_widget_id = 0, frame_index = 0;
     Rect content_region = {};
     float cursor_x = 0, cursor_y = 0;
     RowContext row_ctx;
     std::vector<int> tab_stops, tab_stops_prev;
+    Rect last_item_rect = {};
+    int  last_item_id = 0;
+    bool last_item_hovered = false;
+    bool last_item_focused = false;
 };
 
 struct CmdState { bool active = false; char buf[16] = {}; int len = 0; };
@@ -276,6 +357,41 @@ struct FrameContentFx {
     int   dir = 1;
 };
 
+struct ScrollSlot {
+    int   key = 0;
+    float current = 0;
+    float target = 0;
+    float content = 0;
+    bool  dragging = false;
+    float drag_mouse = 0;
+    float drag_scroll0 = 0;
+};
+
+struct CollapseSlot {
+    int   key = 0;
+    bool  initialized = false;
+    bool  open = false;
+};
+
+struct NextLayoutState {
+    bool  active = false;
+    bool  fill = false;
+    bool  has_width = false;
+    bool  has_percent = false;
+    bool  has_limits = false;
+    float width = 0;
+    float percent = 1.0f;
+    float min = 0;
+    float max = 0;
+    Align align = Align::Start;
+};
+
+struct TooltipState {
+    bool active = false;
+    Rect anchor = {};
+    std::string text;
+};
+
 // ---- Shared globals -------------------------------------------------
 
 static InputState g_input;
@@ -299,11 +415,22 @@ static float      g_ta_scroll_target_y = 0;
 static bool       g_drawing = false;
 static MotionSlot g_motion_slots[256];
 static TabFxSlot  g_tab_fx_slots[32];
+static ScrollSlot g_scroll_slots[128];
+static CollapseSlot g_collapse_slots[64];
 static int        g_tab_content_owner = 0;
 static FrameContentFx g_frame_content_fx;
 static float      g_draw_fx_off_x = 0;
 static float      g_draw_fx_off_y = 0;
 static float      g_draw_fx_opacity = 1.0f;
+static NextLayoutState g_next_layout;
+static TooltipState g_tooltip;
+static int        g_disabled_depth = 0;
+static int        g_focus_request_id = 0;
+static int        g_modal_open_id = 0;
+static int        g_modal_request_id = 0;
+static bool       g_inside_modal = false;
+static bool       g_modal_drawn = false;
+static int        g_dropdown_open_id = 0;
 
 // ---- Forward declarations of platform-specific functions -----------
 // (defined in the platform blocks below; used by shared widget code)
@@ -399,6 +526,81 @@ static void reset_effect_state(bool enable_effects) {
     reset_draw_fx();
 }
 
+static float clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static Color disabled_color(Color c) {
+    Color out = lerp_color(c, g_style.panel, 0.42f);
+    out.a *= 0.70f;
+    return out;
+}
+
+static Color maybe_disabled(Color c) {
+    return g_disabled_depth > 0 ? disabled_color(c) : c;
+}
+
+static void clear_text_focus() {
+    g_ctx.focused_input_id = 0;
+    g_text_cursor_id = 0;
+    g_ta_cursor_id = 0;
+}
+
+static void set_widget_focus(int id, bool text_like = false) {
+    g_ctx.focused_widget_id = id;
+    if (text_like) g_ctx.focused_input_id = id;
+    else clear_text_focus();
+}
+
+static bool is_widget_focused(int id) {
+    return g_ctx.focused_widget_id == id;
+}
+
+static bool widget_interaction_enabled() {
+    return g_disabled_depth == 0 && (!g_modal_open_id || g_inside_modal);
+}
+
+static void register_focusable(int id) {
+    g_ctx.tab_stops.push_back(id);
+}
+
+static void mark_last_item(int id, Rect r, bool hovered, bool focused) {
+    g_ctx.last_item_id = id;
+    g_ctx.last_item_rect = r;
+    g_ctx.last_item_hovered = hovered;
+    g_ctx.last_item_focused = focused;
+}
+
+static ScrollSlot& scroll_slot_for(int key) {
+    unsigned idx = (unsigned)key & 127u;
+    for (int n = 0; n < 128; ++n) {
+        ScrollSlot& slot = g_scroll_slots[(idx + (unsigned)n) & 127u];
+        if (slot.key == key || slot.key == 0) {
+            if (slot.key == 0) slot.key = key;
+            return slot;
+        }
+    }
+    ScrollSlot& slot = g_scroll_slots[idx];
+    slot = {};
+    slot.key = key;
+    return slot;
+}
+
+static CollapseSlot& collapse_slot_for(int key) {
+    unsigned idx = (unsigned)key & 63u;
+    for (int n = 0; n < 64; ++n) {
+        CollapseSlot& slot = g_collapse_slots[(idx + (unsigned)n) & 63u];
+        if (slot.key == key || slot.key == 0) {
+            if (slot.key == 0) slot.key = key;
+            return slot;
+        }
+    }
+    CollapseSlot& slot = g_collapse_slots[idx];
+    slot = {};
+    slot.key = key;
+    return slot;
+}
+
 static MotionSlot& motion_slot_for(int key) {
     unsigned idx = (unsigned)key & 255u;
     for (int n = 0; n < 256; ++n) {
@@ -473,17 +675,164 @@ static float measure_text_at(const char* utf8, int byte_len) {
     return measure_text_width(sub.c_str());
 }
 
+struct TextRange {
+    int start = 0;
+    int end = 0;
+};
+
+static bool wrap_space(char c) {
+    return c == ' ' || c == '\t';
+}
+
+static void compute_wrapped_ranges(const char* text, float max_width, bool word_wrap,
+                                   std::vector<TextRange>& out) {
+    out.clear();
+    if (!text) { out.push_back({0, 0}); return; }
+
+    int len = (int)strlen(text);
+    if (len == 0) { out.push_back({0, 0}); return; }
+
+    int line_start = 0;
+    while (line_start <= len) {
+        if (line_start == len) { out.push_back({len, len}); break; }
+
+        int logical_end = line_start;
+        while (logical_end < len && text[logical_end] != '\n') logical_end++;
+
+        if (!word_wrap || max_width <= 1.0f || measure_text_at(text + line_start, logical_end - line_start) <= max_width) {
+            out.push_back({line_start, logical_end});
+            if (logical_end >= len) break;
+            line_start = logical_end + 1;
+            continue;
+        }
+
+        int seg_start = line_start;
+        while (seg_start < logical_end) {
+            int pos = seg_start;
+            int last_break = -1;
+            int best_end = seg_start;
+            while (pos < logical_end) {
+                int next = utf8_advance(text, pos);
+                float w = measure_text_at(text + seg_start, next - seg_start);
+                if (wrap_space(text[pos])) last_break = pos;
+                if (w > max_width && best_end > seg_start) break;
+                if (w > max_width) {
+                    best_end = last_break >= seg_start ? last_break : pos;
+                    break;
+                }
+                best_end = next;
+                pos = next;
+            }
+            if (best_end <= seg_start) best_end = utf8_advance(text, seg_start);
+            out.push_back({seg_start, best_end});
+            seg_start = best_end;
+            while (seg_start < logical_end && wrap_space(text[seg_start])) seg_start++;
+        }
+
+        if (logical_end >= len) break;
+        line_start = logical_end + 1;
+    }
+
+    if (out.empty()) out.push_back({0, 0});
+}
+
+static void draw_tooltip_overlay() {
+    if (!g_tooltip.active || g_tooltip.text.empty()) return;
+
+    float pad = 8.0f;
+    float max_w = fminf(320.0f, fmaxf(180.0f, g_ctx.content_region.w * 0.45f));
+    std::vector<TextRange> lines;
+    compute_wrapped_ranges(g_tooltip.text.c_str(), max_w - pad * 2.0f, true, lines);
+
+    float lh = text_line_height();
+    float box_h = pad * 2.0f + (float)lines.size() * lh;
+    Rect r = {
+        g_tooltip.anchor.x,
+        g_tooltip.anchor.y + g_tooltip.anchor.h + 8.0f,
+        max_w,
+        box_h
+    };
+
+    float max_x = g_ctx.content_region.x + g_ctx.content_region.w - r.w - 8.0f;
+    float max_y = g_ctx.content_region.y + g_ctx.content_region.h - r.h - 8.0f;
+    if (r.x > max_x) r.x = max_x;
+    if (r.y > max_y) r.y = g_tooltip.anchor.y - r.h - 8.0f;
+    if (r.x < 8.0f) r.x = 8.0f;
+    if (r.y < 8.0f) r.y = 8.0f;
+
+    Color fill = lerp_color(g_style.panel, g_style.background, 0.18f);
+    fill.a = 0.98f;
+    draw_widget_chrome(r, fmaxf(4.0f, g_style.rounding * 0.75f), fill, g_style.border, 0.0f, 0.0f, 0.0f);
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        TextRange tr = lines[i];
+        std::string line(g_tooltip.text.c_str() + tr.start, g_tooltip.text.c_str() + tr.end);
+        Rect lr = {r.x + pad, r.y + pad + (float)i * lh, r.w - pad * 2.0f, lh};
+        draw_text_utf8(line.c_str(), lr, g_style.text);
+    }
+}
+
+static bool filter_ascii_input_char(char c, InputFlags flags, char& out) {
+    out = c;
+    if (flags & InputFlags::CharsUppercase) {
+        if (c >= 'a' && c <= 'z') out = (char)(c - 'a' + 'A');
+    }
+    if (flags & InputFlags::CharsNoBlank) {
+        if (c == ' ' || c == '\t') return false;
+    }
+    if (flags & InputFlags::CharsDecimal) {
+        if (!((out >= '0' && out <= '9') || out == '.' || out == '-' || out == '+')) return false;
+    }
+    if (flags & InputFlags::CharsHexadecimal) {
+        if (!((out >= '0' && out <= '9') || (out >= 'a' && out <= 'f') || (out >= 'A' && out <= 'F'))) return false;
+    }
+    return true;
+}
+
 static Rect next_rect(float height) {
+    float region_x = g_ctx.cursor_x;
+    float region_y = g_ctx.cursor_y;
+    float region_w = g_ctx.content_region.w;
+
     if (g_ctx.row_ctx.active) {
         auto& rc = g_ctx.row_ctx;
-        float x = rc.start_x + rc.col_index * (rc.cell_w + rc.gap);
-        Rect r = {x, rc.start_y, rc.cell_w, height};
+        int row_index = rc.col_index < rc.cols ? rc.col_index : (rc.cols - 1);
+        region_x = rc.start_x + rc.used_x;
+        region_y = rc.start_y;
+        region_w = rc.weighted && rc.weights
+            ? (rc.total_w - rc.gap * (rc.cols - 1)) * (rc.weights[row_index] / rc.total_weight)
+            : rc.cell_w;
+        rc.used_x += region_w + (rc.col_index + 1 < rc.cols ? rc.gap : 0.0f);
         rc.col_index++;
         if (height > rc.row_height) rc.row_height = height;
-        return r;
+    } else {
+        g_ctx.cursor_y += height + g_style.item_spacing;
     }
-    Rect r = {g_ctx.cursor_x, g_ctx.cursor_y, g_ctx.content_region.w, height};
-    g_ctx.cursor_y += height + g_style.item_spacing;
+
+    float width = region_w;
+    if (g_next_layout.active) {
+        if (g_next_layout.has_width) width = g_next_layout.width;
+        else if (g_next_layout.has_percent) width = region_w * g_next_layout.percent;
+        else if (g_next_layout.fill) width = region_w;
+
+        if (g_next_layout.has_limits) {
+            width = clampf(width, g_next_layout.min, g_next_layout.max);
+        }
+        if (width > region_w) width = region_w;
+        if (width < 1.0f) width = 1.0f;
+    }
+
+    float x = region_x;
+    Align align = g_next_layout.active ? g_next_layout.align : Align::Start;
+    if (width < region_w) {
+        if (align == Align::Center) x += (region_w - width) * 0.5f;
+        else if (align == Align::End) x += (region_w - width);
+    }
+
+    Rect r = {x, region_y, width, height};
+    g_next_layout = {};
+
+    if (g_ctx.row_ctx.active) return r;
     return r;
 }
 
@@ -505,6 +854,48 @@ void set_quit_on_ctrl_q(bool e) { internal::g_shortcuts_enabled = e; }
 void set_style(const Style& s)  { internal::g_style = s; }
 const Style& get_style()         { return internal::g_style; }
 DebugState&  debug()             { return internal::g_debug; }
+void set_next_width(float px) {
+    internal::g_next_layout.active = true;
+    internal::g_next_layout.has_width = true;
+    internal::g_next_layout.width = px;
+}
+void set_next_fill() {
+    internal::g_next_layout.active = true;
+    internal::g_next_layout.fill = true;
+}
+void set_next_percent(float pct) {
+    internal::g_next_layout.active = true;
+    internal::g_next_layout.has_percent = true;
+    internal::g_next_layout.percent = pct < 0.0f ? 0.0f : (pct > 1.0f ? 1.0f : pct);
+}
+void set_next_limits(float min_px, float max_px) {
+    internal::g_next_layout.active = true;
+    internal::g_next_layout.has_limits = true;
+    internal::g_next_layout.min = min_px < 0.0f ? 0.0f : min_px;
+    internal::g_next_layout.max = max_px < min_px ? min_px : max_px;
+}
+void set_next_align(Align align) {
+    internal::g_next_layout.active = true;
+    internal::g_next_layout.align = align;
+}
+void begin_disabled() { internal::g_disabled_depth++; }
+void end_disabled() { if (internal::g_disabled_depth > 0) internal::g_disabled_depth--; }
+void request_focus(const char* label) { if (label) internal::g_focus_request_id = internal::hash_str(label); }
+void open_modal(const char* label) { if (label) internal::g_modal_request_id = internal::hash_str(label); }
+void close_modal() { internal::g_modal_open_id = 0; internal::g_modal_request_id = 0; }
+float calc_text_width(const char* text) { return internal::measure_text_width(text ? text : ""); }
+float calc_text_height(const char* text, float wrap_width) {
+    std::vector<internal::TextRange> lines;
+    internal::compute_wrapped_ranges(text ? text : "", wrap_width, true, lines);
+    return (float)lines.size() * internal::text_line_height();
+}
+void tooltip(const char* text) {
+    if (!text || !text[0]) return;
+    if (!internal::g_ctx.last_item_hovered && !internal::g_ctx.last_item_focused) return;
+    internal::g_tooltip.active = true;
+    internal::g_tooltip.anchor = internal::g_ctx.last_item_rect;
+    internal::g_tooltip.text = text;
+}
 
 // ============================================================
 // Themes
@@ -931,6 +1322,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_cmd.active){if(wp==VK_ESCAPE)cmd_clear();return 0;}
         if(wp==VK_BACK)  g_input.key_backspace=true;
         if(wp==VK_RETURN)g_input.key_enter=true;
+        if(wp==VK_SPACE) g_input.key_space=true;
+        if(wp==VK_ESCAPE)g_input.key_escape=true;
         if(wp==VK_TAB){if(g_input.shift_held)g_input.key_shift_tab=true;else g_input.key_tab=true;}
         if(wp==VK_LEFT) g_input.key_left=true;
         if(wp==VK_RIGHT)g_input.key_right=true;
@@ -960,7 +1353,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0; }
     case WM_SETFOCUS:   g_input.focused=true;  return 0;
-    case WM_KILLFOCUS:  g_input.focused=false;  g_ctx.focused_input_id=0; return 0;
+    case WM_KILLFOCUS:  g_input.focused=false;  g_ctx.focused_input_id=0; g_ctx.focused_widget_id=0; return 0;
     case WM_ERASEBKGND: return 1;
     default: return DefWindowProcW(hwnd,msg,wp,lp);
     }
@@ -1020,7 +1413,7 @@ bool pump() {
     using namespace internal;
     g_input.mouse_pressed=g_input.mouse_released=false;
     g_input.wheel_y = 0;
-    g_input.key_backspace=g_input.key_enter=g_input.key_tab=g_input.key_shift_tab=false;
+    g_input.key_backspace=g_input.key_enter=g_input.key_space=g_input.key_escape=g_input.key_tab=g_input.key_shift_tab=false;
     g_input.key_left=g_input.key_right=g_input.key_up=g_input.key_down=false;
     g_input.key_ctrl_c=g_input.key_ctrl_v=false;
     g_input.text_input_count=0; memset(g_input.text_input,0,sizeof(g_input.text_input));
@@ -1036,13 +1429,19 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
+    g_tooltip.active = false;
+    g_modal_drawn = false;
     reset_draw_fx();
     if((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()){
         auto& stops=g_ctx.tab_stops_prev;
-        int cur=g_ctx.focused_input_id,idx=-1;
+        int cur=g_ctx.focused_widget_id,idx=-1;
         for(int i=0;i<(int)stops.size();i++){if(stops[i]==cur){idx=i;break;}}
-        g_ctx.focused_input_id=g_input.key_shift_tab?stops[(idx<=0?(int)stops.size():idx)-1]:stops[(idx+1)%(int)stops.size()];
-        g_text_cursor_id=g_ta_cursor_id=0;
+        int next_id = g_input.key_shift_tab?stops[(idx<=0?(int)stops.size():idx)-1]:stops[(idx+1)%(int)stops.size()];
+        set_widget_focus(next_id, false);
+    }
+    if (g_focus_request_id) {
+        set_widget_focus(g_focus_request_id, false);
+        g_focus_request_id = 0;
     }
     g_ctx.tab_stops.clear();
     float pad=g_style.window_padding;
@@ -1142,7 +1541,7 @@ void end() {
         float lh=text_line_height(); Rect r={4,4,300,lh}; fill_rect(r,{0,0,0,.6f}); draw_text_utf8(buf,r,g_style.text_dim);
     }
     if(g_debug.show_hovered_id||g_debug.show_active_id){
-        char buf[128]; snprintf(buf,sizeof(buf),"hot=%d active=%d focused=%d",g_ctx.hot_id,g_ctx.active_id,g_ctx.focused_input_id);
+        char buf[128]; snprintf(buf,sizeof(buf),"hot=%d active=%d focused=%d",g_ctx.hot_id,g_ctx.active_id,g_ctx.focused_widget_id);
         float lh=text_line_height(),oy=g_debug.show_fps?lh+6:4; Rect r={4,oy,360,lh}; fill_rect(r,{0,0,0,.6f}); draw_text_utf8(buf,r,g_style.text_dim);
     }
     if(g_cmd.active){
@@ -1151,6 +1550,8 @@ void end() {
         Rect r={g_style.window_padding,oy,200,lh};
         fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
     }
+    if (g_modal_open_id && !g_modal_drawn) close_modal();
+    draw_tooltip_overlay();
     HRESULT hr=g_renderer.target->EndDraw(); g_drawing=false;
     if(hr==D2DERR_RECREATE_TARGET){release_render_target();create_render_target();}
     else if (SUCCEEDED(hr)) capture_frame_snapshot();
@@ -1186,6 +1587,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         ID2D1Bitmap* prev_frame_bitmap;
         std::vector<BYTE> prev_frame_pixels;
         UINT prev_frame_w, prev_frame_h;
+        ScrollSlot scroll_slots[128];
+        CollapseSlot collapse_slots[64];
+        NextLayoutState next_layout;
+        TooltipState tooltip;
+        int disabled_depth, focus_request_id, modal_open_id, modal_request_id, dropdown_open_id;
+        bool inside_modal, modal_drawn;
         bool shortcuts,drawing;
     } s;
     s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
@@ -1202,6 +1609,17 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.prev_frame_bitmap=g_prev_frame_bitmap;
     s.prev_frame_pixels=std::move(g_prev_frame_pixels);
     s.prev_frame_w=g_prev_frame_w;s.prev_frame_h=g_prev_frame_h;
+    memcpy(s.scroll_slots, g_scroll_slots, sizeof(g_scroll_slots));
+    memcpy(s.collapse_slots, g_collapse_slots, sizeof(g_collapse_slots));
+    s.next_layout=g_next_layout;
+    s.tooltip=g_tooltip;
+    s.disabled_depth=g_disabled_depth;
+    s.focus_request_id=g_focus_request_id;
+    s.modal_open_id=g_modal_open_id;
+    s.modal_request_id=g_modal_request_id;
+    s.dropdown_open_id=g_dropdown_open_id;
+    s.inside_modal=g_inside_modal;
+    s.modal_drawn=g_modal_drawn;
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;
 
     auto* d2d = g_renderer.d2d_factory;
@@ -1218,6 +1636,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
     g_prev_frame_bitmap=nullptr; g_prev_frame_pixels.clear(); g_prev_frame_w=0; g_prev_frame_h=0;
+    memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
+    memset(g_collapse_slots, 0, sizeof(g_collapse_slots));
+    g_next_layout={}; g_tooltip={}; g_disabled_depth=0; g_focus_request_id=0;
+    g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false;
 
@@ -1257,6 +1679,17 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_prev_frame_bitmap=s.prev_frame_bitmap;
     g_prev_frame_pixels=std::move(s.prev_frame_pixels);
     g_prev_frame_w=s.prev_frame_w;g_prev_frame_h=s.prev_frame_h;
+    memcpy(g_scroll_slots, s.scroll_slots, sizeof(g_scroll_slots));
+    memcpy(g_collapse_slots, s.collapse_slots, sizeof(g_collapse_slots));
+    g_next_layout=s.next_layout;
+    g_tooltip=s.tooltip;
+    g_disabled_depth=s.disabled_depth;
+    g_focus_request_id=s.focus_request_id;
+    g_modal_open_id=s.modal_open_id;
+    g_modal_request_id=s.modal_request_id;
+    g_dropdown_open_id=s.dropdown_open_id;
+    g_inside_modal=s.inside_modal;
+    g_modal_drawn=s.modal_drawn;
     g_shortcuts_enabled=s.shortcuts;g_drawing=s.drawing;
     InvalidateRect(owner,nullptr,FALSE);
 }
@@ -1618,6 +2051,8 @@ static void handle_xevent(XEvent& ev) {
         // navigation keys
         if (ks==XK_BackSpace) g_input.key_backspace=true;
         if (ks==XK_Return||ks==XK_KP_Enter) g_input.key_enter=true;
+        if (ks==XK_space) g_input.key_space=true;
+        if (ks==XK_Escape) g_input.key_escape=true;
         if (ks==XK_Tab) { if(g_input.shift_held)g_input.key_shift_tab=true;else g_input.key_tab=true; }
         if (ks==XK_Left)  g_input.key_left=true;
         if (ks==XK_Right) g_input.key_right=true;
@@ -1651,7 +2086,7 @@ static void handle_xevent(XEvent& ev) {
         }
         break; }
     case FocusIn:  g_input.focused=true; break;
-    case FocusOut: g_input.focused=false; g_ctx.focused_input_id=0; break;
+    case FocusOut: g_input.focused=false; g_ctx.focused_input_id=0; g_ctx.focused_widget_id=0; break;
     case ClientMessage:
         if ((Atom)ev.xclient.data.l[0]==g_platform.wm_delete) g_platform.running=false; break;
     }
@@ -1695,7 +2130,7 @@ bool pump() {
     using namespace internal;
     g_input.mouse_pressed=g_input.mouse_released=false;
     g_input.wheel_y = 0;
-    g_input.key_backspace=g_input.key_enter=g_input.key_tab=g_input.key_shift_tab=false;
+    g_input.key_backspace=g_input.key_enter=g_input.key_space=g_input.key_escape=g_input.key_tab=g_input.key_shift_tab=false;
     g_input.key_left=g_input.key_right=g_input.key_up=g_input.key_down=false;
     g_input.key_ctrl_c=g_input.key_ctrl_v=false;
     g_input.text_input_count=0; memset(g_input.text_input,0,sizeof(g_input.text_input));
@@ -1710,13 +2145,19 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
+    g_tooltip.active = false;
+    g_modal_drawn = false;
     reset_draw_fx();
     if ((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()) {
         auto& stops=g_ctx.tab_stops_prev;
-        int cur=g_ctx.focused_input_id,idx=-1;
+        int cur=g_ctx.focused_widget_id,idx=-1;
         for(int i=0;i<(int)stops.size();i++){if(stops[i]==cur){idx=i;break;}}
-        g_ctx.focused_input_id=g_input.key_shift_tab?stops[(idx<=0?(int)stops.size():idx)-1]:stops[(idx+1)%(int)stops.size()];
-        g_text_cursor_id=g_ta_cursor_id=0;
+        int next_id=g_input.key_shift_tab?stops[(idx<=0?(int)stops.size():idx)-1]:stops[(idx+1)%(int)stops.size()];
+        set_widget_focus(next_id, false);
+    }
+    if (g_focus_request_id) {
+        set_widget_focus(g_focus_request_id, false);
+        g_focus_request_id = 0;
     }
     g_ctx.tab_stops.clear();
     float pad=g_style.window_padding;
@@ -1779,7 +2220,7 @@ void end() {
         float lh=text_line_height(); Rect r={4,4,300,lh}; fill_rect(r,{0,0,0,.6f}); draw_text_utf8(buf,r,g_style.text_dim);
     }
     if(g_debug.show_hovered_id||g_debug.show_active_id){
-        char buf[128]; snprintf(buf,sizeof(buf),"hot=%d active=%d focused=%d",g_ctx.hot_id,g_ctx.active_id,g_ctx.focused_input_id);
+        char buf[128]; snprintf(buf,sizeof(buf),"hot=%d active=%d focused=%d",g_ctx.hot_id,g_ctx.active_id,g_ctx.focused_widget_id);
         float lh=text_line_height(),oy=g_debug.show_fps?lh+6:4; Rect r={4,oy,360,lh}; fill_rect(r,{0,0,0,.6f}); draw_text_utf8(buf,r,g_style.text_dim);
     }
     if(g_cmd.active){
@@ -1788,6 +2229,8 @@ void end() {
         Rect r={g_style.window_padding,oy,200,lh};
         fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
     }
+    if (g_modal_open_id && !g_modal_drawn) close_modal();
+    draw_tooltip_overlay();
     g_drawing=false;
     swap_buffers();
     g_ctx.tab_stops_prev=g_ctx.tab_stops; g_ctx.frame_index++;
@@ -1817,6 +2260,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         int tab_owner;
         FrameContentFx frame_fx;
         float draw_off_x,draw_off_y,draw_opacity;
+        ScrollSlot scroll_slots[128];
+        CollapseSlot collapse_slots[64];
+        NextLayoutState next_layout;
+        TooltipState tooltip;
+        int disabled_depth, focus_request_id, modal_open_id, modal_request_id, dropdown_open_id;
+        bool inside_modal, modal_drawn;
         bool shortcuts,drawing;
         XIM xim; XIC xic; std::string cb;
     } s;
@@ -1831,6 +2280,17 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.tab_owner=g_tab_content_owner;
     s.frame_fx=g_frame_content_fx;
     s.draw_off_x=g_draw_fx_off_x;s.draw_off_y=g_draw_fx_off_y;s.draw_opacity=g_draw_fx_opacity;
+    memcpy(s.scroll_slots, g_scroll_slots, sizeof(g_scroll_slots));
+    memcpy(s.collapse_slots, g_collapse_slots, sizeof(g_collapse_slots));
+    s.next_layout=g_next_layout;
+    s.tooltip=g_tooltip;
+    s.disabled_depth=g_disabled_depth;
+    s.focus_request_id=g_focus_request_id;
+    s.modal_open_id=g_modal_open_id;
+    s.modal_request_id=g_modal_request_id;
+    s.dropdown_open_id=g_dropdown_open_id;
+    s.inside_modal=g_inside_modal;
+    s.modal_drawn=g_modal_drawn;
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;s.xim=g_xim;s.xic=g_xic;s.cb=g_clipboard_buf;
     Display* dpy=g_platform.display; Window parent=g_platform.window;
     g_platform={}; g_platform.display=dpy;
@@ -1839,6 +2299,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_fps=g_fps_accum=0; g_fps_frames=0;
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
+    memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
+    memset(g_collapse_slots, 0, sizeof(g_collapse_slots));
+    g_next_layout={}; g_tooltip={}; g_disabled_depth=0; g_focus_request_id=0;
+    g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     reset_effect_state(false);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false; g_clipboard_buf=s.cb;
     g_xim=nullptr; g_xic=nullptr;
@@ -1874,6 +2338,17 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_tab_content_owner=s.tab_owner;
     g_frame_content_fx=s.frame_fx;
     g_draw_fx_off_x=s.draw_off_x;g_draw_fx_off_y=s.draw_off_y;g_draw_fx_opacity=s.draw_opacity;
+    memcpy(g_scroll_slots, s.scroll_slots, sizeof(g_scroll_slots));
+    memcpy(g_collapse_slots, s.collapse_slots, sizeof(g_collapse_slots));
+    g_next_layout=s.next_layout;
+    g_tooltip=s.tooltip;
+    g_disabled_depth=s.disabled_depth;
+    g_focus_request_id=s.focus_request_id;
+    g_modal_open_id=s.modal_open_id;
+    g_modal_request_id=s.modal_request_id;
+    g_dropdown_open_id=s.dropdown_open_id;
+    g_inside_modal=s.inside_modal;
+    g_modal_drawn=s.modal_drawn;
     g_shortcuts_enabled=s.shortcuts;g_drawing=s.drawing;g_xim=s.xim;g_xic=s.xic;g_clipboard_buf=s.cb;
     // trigger repaint of parent
     XExposeEvent xe={}; xe.type=Expose; xe.window=g_platform.window; xe.count=0;
@@ -1934,7 +2409,24 @@ void text(const char* label) {
     float h = g_style.item_height;
     Rect r = next_rect(h);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,0,0,0.4f});
-    draw_text_utf8(vis, r, g_style.text);
+    draw_text_utf8(vis, r, maybe_disabled(g_style.text));
+    mark_last_item(0, r, rect_contains(r, g_input.mouse_x, g_input.mouse_y), false);
+}
+
+void text_wrapped(const char* text) {
+    if (!g_drawing) return;
+    std::vector<TextRange> lines;
+    compute_wrapped_ranges(text ? text : "", g_ctx.content_region.w, true, lines);
+    float lh = text_line_height();
+    Rect r = next_rect((float)lines.size() * lh);
+    float y = r.y;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string line((text ? text : "") + lines[i].start, (text ? text : "") + lines[i].end);
+        Rect lr = {r.x, y, r.w, lh};
+        draw_text_utf8(line.c_str(), lr, maybe_disabled(g_style.text));
+        y += lh;
+    }
+    mark_last_item(0, r, rect_contains(r, g_input.mouse_x, g_input.mouse_y), false);
 }
 
 void separator() {
@@ -1955,30 +2447,36 @@ bool button(const char* label) {
     char vis[256]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
+    register_focusable(id);
 
     Rect r = next_rect(g_style.item_height);
-    bool hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
     bool clicked = false;
 
-    if (hov && g_input.mouse_pressed) { g_ctx.active_id = id; }
+    if (hov && g_input.mouse_pressed) { g_ctx.active_id = id; set_widget_focus(id, false); }
     if (g_ctx.active_id == id && g_input.mouse_released) {
         if (hov) clicked = true;
         g_ctx.active_id = 0;
     }
     if (hov) g_ctx.hot_id = id;
+    bool focused = is_widget_focused(id);
+    if (focused && enabled && (g_input.key_enter || g_input.key_space)) clicked = true;
 
     MotionSlot& motion = motion_slot_for(id);
-    update_motion_slot(motion, hov, g_ctx.active_id == id, false);
+    update_motion_slot(motion, raw_hov, enabled && g_ctx.active_id == id, focused);
 
     Color bg = lerp_color(g_style.button, g_style.panel, 0.30f);
     bg = lerp_color(bg, g_style.button_hover, 0.20f + motion.hover * 0.35f);
     bg = lerp_color(bg, g_style.input_focus, 0.06f + motion.hover * 0.05f + motion.active * 0.14f);
     bg = lerp_color(bg, g_style.button_active, motion.active * 0.35f);
     Color border = lerp_color(g_style.border, g_style.input_focus, 0.12f + motion.hover * 0.14f + motion.active * 0.22f);
-    draw_widget_chrome(r, g_style.rounding, bg, border, motion.hover, motion.active, 0.0f);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
     Rect text_r = offset_rect(r, 0.0f, motion.active * 1.0f);
-    draw_text_utf8_centered(vis, text_r, lerp_color(g_style.text_dim, g_style.text, 0.72f + motion.hover * 0.20f + motion.active * 0.08f));
+    draw_text_utf8_centered(vis, text_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, 0.72f + motion.hover * 0.20f + motion.active * 0.08f)));
 
+    mark_last_item(id, r, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,1,0,0.4f});
     return clicked;
 }
@@ -1990,15 +2488,16 @@ bool input(const char* label, char* buffer, int buffer_size,
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
 
-    // Register tab stop
-    g_ctx.tab_stops.push_back(id);
+    register_focusable(id);
 
     Rect r = next_rect(g_style.item_height);
-    bool hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
 
     // Click to focus
     if (hov && g_input.mouse_pressed) {
-        g_ctx.focused_input_id = id;
+        set_widget_focus(id, true);
         g_text_cursor_id = id;
         int len = (int)strlen(buffer);
         // Place cursor at click position
@@ -2007,10 +2506,11 @@ bool input(const char* label, char* buffer, int buffer_size,
         g_text_sel_anchor = g_text_cursor;
     }
 
-    bool focused = (g_ctx.focused_input_id == id);
+    bool focused = is_widget_focused(id);
     bool changed = false;
 
     if (focused) {
+        g_ctx.focused_input_id = id;
         if (g_text_cursor_id != id) {
             g_text_cursor_id = id;
             g_text_cursor = (int)strlen(buffer);
@@ -2105,6 +2605,21 @@ bool input(const char* label, char* buffer, int buffer_size,
             for (int i = 0; i < g_input.text_input_count && g_input.text_input[i]; ) {
                 unsigned char c = (unsigned char)g_input.text_input[i];
                 int cs = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+                if ((flags & InputFlags::CharsDecimal) || (flags & InputFlags::CharsHexadecimal) ||
+                    (flags & InputFlags::CharsUppercase) || (flags & InputFlags::CharsNoBlank)) {
+                    if (cs == 1) {
+                        char outc = (char)c;
+                        if (!filter_ascii_input_char((char)c, flags, outc)) { i += cs; continue; }
+                        if (len + 1 < buffer_size - 1) {
+                            memmove(buffer+g_text_cursor+1, buffer+g_text_cursor, len-g_text_cursor+1);
+                            buffer[g_text_cursor] = outc;
+                            g_text_cursor += 1; len += 1;
+                        }
+                        i += cs;
+                        continue;
+                    }
+                    if ((flags & InputFlags::CharsDecimal) || (flags & InputFlags::CharsHexadecimal)) { i += cs; continue; }
+                }
                 if (len + cs < buffer_size - 1) {
                     memmove(buffer+g_text_cursor+cs, buffer+g_text_cursor, len-g_text_cursor+1);
                     memcpy(buffer+g_text_cursor, g_input.text_input+i, cs);
@@ -2120,28 +2635,15 @@ bool input(const char* label, char* buffer, int buffer_size,
         if (g_input.key_enter) {
             if (enter_pressed) *enter_pressed = true;
         }
-
-        // Tab / Shift+Tab
-        if (g_input.key_tab || g_input.key_shift_tab) {
-            auto& ts = g_ctx.tab_stops_prev;
-            if (!ts.empty()) {
-                int pos = 0;
-                for (int i = 0; i < (int)ts.size(); i++) if (ts[i] == id) { pos = i; break; }
-                if (g_input.key_shift_tab) pos = (pos - 1 + (int)ts.size()) % (int)ts.size();
-                else                       pos = (pos + 1) % (int)ts.size();
-                g_ctx.focused_input_id = ts[pos];
-                g_text_cursor_id = 0; // reset so new widget picks up cursor position
-            }
-        }
     }
 
     MotionSlot& motion = motion_slot_for(id);
-    update_motion_slot(motion, hov, hov && g_input.mouse_down, focused);
+    update_motion_slot(motion, raw_hov, enabled && hov && g_input.mouse_down, focused);
 
     // Draw
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
     Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
-    draw_widget_chrome(r, g_style.rounding, panel_col, border_col, motion.hover, motion.active, motion.focus);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
 
     float pad = 8.0f;
     Rect inner = {r.x + pad, r.y, r.w - pad * 2 - 80.0f, r.h};
@@ -2178,118 +2680,147 @@ bool input(const char* label, char* buffer, int buffer_size,
     }
 
     Rect text_r = {inner.x - scroll_x, inner.y, inner.w + scroll_x, inner.h};
-    draw_text_utf8(disp.c_str(), text_r, g_style.text);
+    draw_text_utf8(disp.c_str(), text_r, maybe_disabled(g_style.text));
 
     // Cursor blink
     if (focused && (g_ctx.frame_index / 30) % 2 == 0) {
         float cx = inner.x - scroll_x + measure_text_at(disp.c_str(), g_text_cursor);
-        draw_line(cx, r.y + 5, cx, r.y + r.h - 5, 1.5f, g_style.text);
+        draw_line(cx, r.y + 5, cx, r.y + r.h - 5, 1.5f, maybe_disabled(g_style.text));
     }
 
     pop_clip();
 
     // Label
     Rect lbl_r = {r.x + r.w - 78.0f, r.y, 76.0f, r.h};
-    draw_text_utf8(vis, lbl_r, lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f));
+    draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f)));
 
+    mark_last_item(id, r, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,0,1,0.4f});
     return changed;
 }
 
-bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
+bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, TextAreaFlags flags) {
     if (!g_drawing) return false;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
+    bool ro = (flags & TextAreaFlags::ReadOnly);
+    bool wrap = (flags & TextAreaFlags::WordWrap);
 
-    g_ctx.tab_stops.push_back(id);
+    register_focusable(id);
+    ScrollSlot& tslot = scroll_slot_for(id ^ 0x54A54A);
+    float& ta_scroll_y = tslot.current;
+    float& ta_scroll_target_y = tslot.target;
 
     float lh = text_line_height();
     float widget_h = rows * lh + 8.0f;
     Rect r = next_rect(widget_h);
-    bool hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
 
     if (hov && g_input.mouse_pressed) {
-        g_ctx.focused_input_id = id;
+        set_widget_focus(id, true);
         g_ta_cursor_id = id;
     }
 
-    bool focused = (g_ctx.focused_input_id == id);
+    bool focused = is_widget_focused(id);
     bool changed = false;
 
+    float pad_x = 6.0f, pad_y = 4.0f;
+    float text_w = r.w - pad_x * 2.0f - 8.0f;
+
+    auto rebuild_lines = [&](std::vector<TextRange>& lines) {
+        compute_wrapped_ranges(buffer, text_w, wrap, lines);
+        if (lines.empty()) lines.push_back({0, 0});
+    };
+    auto line_index_for = [&](const std::vector<TextRange>& lines, int pos) {
+        if (lines.empty()) return 0;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (pos >= lines[i].start && pos <= lines[i].end) return (int)i;
+        }
+        return (int)lines.size() - 1;
+    };
+
+    std::vector<TextRange> lines;
+    rebuild_lines(lines);
+
     if (focused) {
+        g_ctx.focused_input_id = id;
+        int len = (int)strlen(buffer);
         if (g_ta_cursor_id != id) {
             g_ta_cursor_id = id;
-            g_ta_cursor = (int)strlen(buffer);
+            g_ta_cursor = len;
             g_ta_sel_anchor = g_ta_cursor;
-            g_ta_scroll_y = 0;
-            g_ta_scroll_target_y = 0;
+            ta_scroll_y = 0;
+            ta_scroll_target_y = 0;
         }
-        int len = (int)strlen(buffer);
         if (g_ta_cursor > len) g_ta_cursor = len;
         if (g_ta_sel_anchor > len) g_ta_sel_anchor = len;
 
-        // Ctrl+A
         if (g_input.ctrl_held && g_input.text_input_count > 0 && g_input.text_input[0] == 1) {
-            g_ta_sel_anchor = 0; g_ta_cursor = len;
+            g_ta_sel_anchor = 0;
+            g_ta_cursor = len;
         }
 
-        // Ctrl+C
         if (g_input.key_ctrl_c && g_ta_sel_anchor != g_ta_cursor) {
             int lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
             int hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
-            std::string sel(buffer+lo, buffer+hi);
+            std::string sel(buffer + lo, buffer + hi);
             clipboard_set(sel.c_str());
         }
 
-        // Ctrl+V
-        if (g_input.key_ctrl_v) {
+        auto delete_selection = [&]() {
+            if (g_ta_cursor == g_ta_sel_anchor) return;
+            int lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
+            int hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
+            memmove(buffer + lo, buffer + hi, len - hi + 1);
+            len -= (hi - lo);
+            g_ta_cursor = g_ta_sel_anchor = lo;
+            changed = true;
+        };
+
+        if (!ro && g_input.key_ctrl_v) {
             std::string cb = clipboard_get();
             if (!cb.empty()) {
-                if (g_ta_cursor != g_ta_sel_anchor) {
-                    int lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
-                    int hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
-                    memmove(buffer+lo, buffer+hi, len-hi+1); len -= (hi-lo); g_ta_cursor = lo;
-                }
+                delete_selection();
                 int ins = (int)cb.size();
                 if (len + ins < buffer_size - 1) {
-                    memmove(buffer+g_ta_cursor+ins, buffer+g_ta_cursor, len-g_ta_cursor+1);
-                    memcpy(buffer+g_ta_cursor, cb.c_str(), ins);
+                    memmove(buffer + g_ta_cursor + ins, buffer + g_ta_cursor, len - g_ta_cursor + 1);
+                    memcpy(buffer + g_ta_cursor, cb.c_str(), ins);
                     g_ta_cursor += ins;
+                    len += ins;
+                    g_ta_sel_anchor = g_ta_cursor;
+                    changed = true;
                 }
-                g_ta_sel_anchor = g_ta_cursor;
-                changed = true;
             }
         }
 
-        // Backspace
-        if (g_input.key_backspace) {
+        if (!ro && g_input.key_backspace) {
             if (g_ta_cursor != g_ta_sel_anchor) {
-                int lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
-                int hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
-                memmove(buffer+lo, buffer+hi, len-hi+1);
-                g_ta_cursor = g_ta_sel_anchor = lo;
-                changed = true;
+                delete_selection();
             } else if (g_ta_cursor > 0) {
                 int prev = utf8_retreat(buffer, g_ta_cursor);
-                memmove(buffer+prev, buffer+g_ta_cursor, len-g_ta_cursor+1);
+                int removed = g_ta_cursor - prev;
+                memmove(buffer + prev, buffer + g_ta_cursor, len - g_ta_cursor + 1);
                 g_ta_cursor = g_ta_sel_anchor = prev;
+                len -= removed;
                 changed = true;
             }
         }
 
-        // Enter: insert newline
-        if (g_input.key_enter) {
+        if (!ro && g_input.key_enter) {
+            delete_selection();
             if (len + 1 < buffer_size - 1) {
-                memmove(buffer+g_ta_cursor+1, buffer+g_ta_cursor, len-g_ta_cursor+1);
+                memmove(buffer + g_ta_cursor + 1, buffer + g_ta_cursor, len - g_ta_cursor + 1);
                 buffer[g_ta_cursor] = '\n';
                 g_ta_cursor++;
                 g_ta_sel_anchor = g_ta_cursor;
+                len += 1;
                 changed = true;
             }
         }
 
-        // Left/Right
         if (g_input.key_left) {
             if (g_input.shift_held) {
                 g_ta_cursor = utf8_retreat(buffer, g_ta_cursor);
@@ -2313,214 +2844,272 @@ bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
             }
         }
 
-        // Up/Down: move to same column on adjacent line
-        if (g_input.key_up || g_input.key_down) {
-            // Find which line cursor is on and its line-start
-            int line_start = 0, line_num = 0;
-            int cur_line_start = 0;
-            for (int i = 0; i < g_ta_cursor; i++) {
-                if (buffer[i] == '\n') { line_num++; line_start = i + 1; }
-            }
-            cur_line_start = line_start;
-            float col_x = measure_text_at(buffer + cur_line_start, g_ta_cursor - cur_line_start);
+        rebuild_lines(lines);
 
-            if (g_input.key_up && line_num > 0) {
-                // Find start of previous line
-                int prev_end = cur_line_start - 1; // the '\n'
-                int prev_start = 0;
-                for (int i = 0; i < prev_end; i++) if (buffer[i] == '\n') prev_start = i + 1;
-                int prev_len = prev_end - prev_start;
-                int new_pos = prev_start + byte_from_x(buffer + prev_start, col_x);
-                if (new_pos > prev_start + prev_len) new_pos = prev_start + prev_len;
+        if (g_input.key_up || g_input.key_down) {
+            int cur_line = line_index_for(lines, g_ta_cursor);
+            int next_line = g_input.key_up ? cur_line - 1 : cur_line + 1;
+            if (next_line >= 0 && next_line < (int)lines.size()) {
+                TextRange cur = lines[cur_line];
+                TextRange dst = lines[next_line];
+                float col_x = measure_text_at(buffer + cur.start, g_ta_cursor - cur.start);
+                int new_pos = dst.start + byte_from_x(buffer + dst.start, col_x);
+                if (new_pos > dst.end) new_pos = dst.end;
                 g_ta_cursor = new_pos;
                 if (!g_input.shift_held) g_ta_sel_anchor = g_ta_cursor;
-            } else if (g_input.key_down) {
-                // Find start of next line
-                int next_start = g_ta_cursor;
-                while (next_start < len && buffer[next_start] != '\n') next_start++;
-                if (next_start < len) {
-                    next_start++; // skip '\n'
-                    int next_end = next_start;
-                    while (next_end < len && buffer[next_end] != '\n') next_end++;
-                    int new_pos = next_start + byte_from_x(buffer + next_start, col_x);
-                    if (new_pos > next_end) new_pos = next_end;
-                    g_ta_cursor = new_pos;
-                    if (!g_input.shift_held) g_ta_sel_anchor = g_ta_cursor;
-                }
             }
         }
 
-        // Click: set cursor
         if (hov && g_input.mouse_pressed) {
-            float inner_x = r.x + 6.0f;
-            float inner_y = r.y + 4.0f - g_ta_scroll_y;
-            int line_idx = (int)((g_input.mouse_y - inner_y) / lh);
+            int line_idx = (int)((g_input.mouse_y - (r.y + pad_y) + ta_scroll_y) / lh);
             if (line_idx < 0) line_idx = 0;
-            // Find the Nth line
-            int cur_line = 0, line_start = 0;
-            int p = 0;
-            while (p <= len) {
-                if (cur_line == line_idx) {
-                    int line_end = p;
-                    while (line_end < len && buffer[line_end] != '\n') line_end++;
-                    int clicked_off = byte_from_x(buffer + line_start, g_input.mouse_x - inner_x);
-                    if (clicked_off > line_end - line_start) clicked_off = line_end - line_start;
-                    g_ta_cursor = line_start + clicked_off;
-                    g_ta_sel_anchor = g_ta_cursor;
-                    break;
-                }
-                if (p == len) break;
-                if (buffer[p] == '\n') { cur_line++; line_start = p + 1; }
-                p++;
-            }
-            if (line_idx > cur_line) { g_ta_cursor = len; g_ta_sel_anchor = len; }
+            if (line_idx >= (int)lines.size()) line_idx = (int)lines.size() - 1;
+            TextRange tr = lines.empty() ? TextRange{} : lines[line_idx];
+            int clicked = tr.start + byte_from_x(buffer + tr.start, g_input.mouse_x - (r.x + pad_x));
+            if (clicked > tr.end) clicked = tr.end;
+            g_ta_cursor = clicked;
+            g_ta_sel_anchor = clicked;
         }
 
-        // Printable input (skip control chars except those handled above)
-        if (g_input.text_input_count > 0) {
-            if (g_ta_cursor != g_ta_sel_anchor) {
-                int lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
-                int hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
-                memmove(buffer+lo, buffer+hi, len-hi+1);
-                len -= (hi-lo); g_ta_cursor = g_ta_sel_anchor = lo;
-            }
+        if (!ro && g_input.text_input_count > 0) {
+            delete_selection();
             for (int i = 0; i < g_input.text_input_count && g_input.text_input[i]; ) {
                 unsigned char c = (unsigned char)g_input.text_input[i];
                 int cs = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
                 if (len + cs < buffer_size - 1) {
-                    memmove(buffer+g_ta_cursor+cs, buffer+g_ta_cursor, len-g_ta_cursor+1);
-                    memcpy(buffer+g_ta_cursor, g_input.text_input+i, cs);
-                    g_ta_cursor += cs; len += cs;
+                    memmove(buffer + g_ta_cursor + cs, buffer + g_ta_cursor, len - g_ta_cursor + 1);
+                    memcpy(buffer + g_ta_cursor, g_input.text_input + i, cs);
+                    g_ta_cursor += cs;
+                    len += cs;
+                    changed = true;
                 }
                 i += cs;
             }
             g_ta_sel_anchor = g_ta_cursor;
-            changed = true;
         }
 
-        // Tab: cycle focus
-        if (g_input.key_tab || g_input.key_shift_tab) {
-            auto& ts = g_ctx.tab_stops_prev;
-            if (!ts.empty()) {
-                int pos = 0;
-                for (int i = 0; i < (int)ts.size(); i++) if (ts[i] == id) { pos = i; break; }
-                if (g_input.key_shift_tab) pos = (pos - 1 + (int)ts.size()) % (int)ts.size();
-                else                       pos = (pos + 1) % (int)ts.size();
-                g_ctx.focused_input_id = ts[pos];
-                g_ta_cursor_id = 0;
-            }
-        }
-
-        // Scroll so cursor is visible
-        int cur_line = 0;
-        for (int i = 0; i < g_ta_cursor; i++) if (buffer[i] == '\n') cur_line++;
-        float cursor_y_in_widget = cur_line * lh;
+        rebuild_lines(lines);
         float visible_h = widget_h - 8.0f;
-        if (cursor_y_in_widget - g_ta_scroll_target_y < 0)          g_ta_scroll_target_y = cursor_y_in_widget;
-        if (cursor_y_in_widget + lh - g_ta_scroll_target_y > visible_h) g_ta_scroll_target_y = cursor_y_in_widget + lh - visible_h;
-        if (g_ta_scroll_target_y < 0) g_ta_scroll_target_y = 0;
+        int cur_line = line_index_for(lines, g_ta_cursor);
+        float cursor_y_in_widget = (float)cur_line * lh;
+        if (cursor_y_in_widget - ta_scroll_target_y < 0.0f) ta_scroll_target_y = cursor_y_in_widget;
+        if (cursor_y_in_widget + lh - ta_scroll_target_y > visible_h) ta_scroll_target_y = cursor_y_in_widget + lh - visible_h;
+        if (ta_scroll_target_y < 0.0f) ta_scroll_target_y = 0.0f;
     }
 
-    if (effects_enabled() && hov && g_input.wheel_y != 0.0f) {
-        g_ta_scroll_target_y -= g_input.wheel_y;
+    if (hov && g_input.wheel_y != 0.0f) {
+        ta_scroll_target_y -= g_input.wheel_y;
         g_input.wheel_y = 0.0f;
     }
 
-    // --- Drawing ---
     MotionSlot& motion = motion_slot_for(id);
-    update_motion_slot(motion, hov, hov && g_input.mouse_down, focused);
+    update_motion_slot(motion, raw_hov, enabled && hov && g_input.mouse_down, focused);
     Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
-    draw_widget_chrome(r, g_style.rounding, panel_col, border_col, motion.hover, motion.active, motion.focus);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
 
     Rect clip_r = {r.x + 2, r.y + 2, r.w - 4, r.h - 4};
     push_clip(clip_r);
 
-    float pad_x = 6.0f, pad_y = 4.0f;
-    int len = (int)strlen(buffer);
-
-    // Count total lines
-    int total_lines = 1;
-    for (int i = 0; i < len; i++) if (buffer[i] == '\n') total_lines++;
-    float total_h = total_lines * lh;
+    rebuild_lines(lines);
+    float total_h = (float)lines.size() * lh;
     float ta_visible_h = widget_h - 8.0f;
     float ta_max_scroll = total_h > ta_visible_h ? (total_h - ta_visible_h) : 0.0f;
-    g_ta_scroll_target_y = g_ta_scroll_target_y < 0 ? 0 : (g_ta_scroll_target_y > ta_max_scroll ? ta_max_scroll : g_ta_scroll_target_y);
-    if (effects_enabled()) g_ta_scroll_y = step_anim(g_ta_scroll_y, g_ta_scroll_target_y, g_dt, 18.0f);
-    else g_ta_scroll_y = g_ta_scroll_target_y;
+    if ((flags & TextAreaFlags::AutoScrollBottom) && !focused) ta_scroll_target_y = ta_max_scroll;
+    ta_scroll_target_y = clampf(ta_scroll_target_y, 0.0f, ta_max_scroll);
+    if (effects_enabled()) ta_scroll_y = step_anim(ta_scroll_y, ta_scroll_target_y, g_dt, 18.0f);
+    else ta_scroll_y = ta_scroll_target_y;
+    ta_scroll_y = clampf(ta_scroll_y, 0.0f, ta_max_scroll);
 
-    // Compute selection range
     int sel_lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
     int sel_hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
 
-    // Draw each line
-    int line_start_byte = 0;
-    for (int li = 0; li < total_lines; li++) {
-        int line_end_byte = line_start_byte;
-        while (line_end_byte < len && buffer[line_end_byte] != '\n') line_end_byte++;
+    for (size_t li = 0; li < lines.size(); ++li) {
+        TextRange tr = lines[li];
+        float line_y = r.y + pad_y - ta_scroll_y + (float)li * lh;
+        if (line_y + lh < r.y || line_y > r.y + r.h) continue;
 
-        float line_y = r.y + pad_y - g_ta_scroll_y + li * lh;
-        if (line_y + lh < r.y || line_y > r.y + r.h) {
-            line_start_byte = line_end_byte + 1;
-            continue;
-        }
-
-        // Selection highlight for this line
         if (focused && sel_lo != sel_hi) {
-            int line_sel_lo = sel_lo < line_start_byte ? line_start_byte : sel_lo;
-            int line_sel_hi = sel_hi > line_end_byte   ? line_end_byte   : sel_hi;
+            int line_sel_lo = sel_lo < tr.start ? tr.start : sel_lo;
+            int line_sel_hi = sel_hi > tr.end ? tr.end : sel_hi;
             if (line_sel_lo < line_sel_hi) {
-                float sx = r.x + pad_x + measure_text_at(buffer + line_start_byte, line_sel_lo - line_start_byte);
-                float ex = r.x + pad_x + measure_text_at(buffer + line_start_byte, line_sel_hi - line_start_byte);
+                float sx = r.x + pad_x + measure_text_at(buffer + tr.start, line_sel_lo - tr.start);
+                float ex = r.x + pad_x + measure_text_at(buffer + tr.start, line_sel_hi - tr.start);
                 Rect sel_r = {sx, line_y, ex - sx, lh};
                 Color sc = g_style.input_focus; sc.a = 0.35f;
                 fill_rect(sel_r, sc);
             }
         }
 
-        // Draw line text
-        if (line_end_byte > line_start_byte) {
-            std::string line_str(buffer + line_start_byte, buffer + line_end_byte);
-            Rect lr = {r.x + pad_x, line_y, r.w - pad_x * 2, lh};
-            draw_text_utf8(line_str.c_str(), lr, g_style.text);
+        if (tr.end > tr.start) {
+            std::string line_str(buffer + tr.start, buffer + tr.end);
+            Rect lr = {r.x + pad_x, line_y, text_w, lh};
+            draw_text_utf8(line_str.c_str(), lr, maybe_disabled(g_style.text));
         }
 
-        // Draw cursor on this line
-        if (focused && g_ta_cursor >= line_start_byte && g_ta_cursor <= line_end_byte) {
-            if ((g_ctx.frame_index / 30) % 2 == 0) {
-                float cx = r.x + pad_x + measure_text_at(buffer + line_start_byte, g_ta_cursor - line_start_byte);
-                draw_line(cx, line_y + 2, cx, line_y + lh - 2, 1.5f, g_style.text);
-            }
+        if (focused && g_ta_cursor >= tr.start && g_ta_cursor <= tr.end && (g_ctx.frame_index / 30) % 2 == 0) {
+            float cx = r.x + pad_x + measure_text_at(buffer + tr.start, g_ta_cursor - tr.start);
+            draw_line(cx, line_y + 2, cx, line_y + lh - 2, 1.5f, maybe_disabled(g_style.text));
         }
-
-        line_start_byte = line_end_byte + 1;
     }
 
     pop_clip();
 
-    // Scrollbar
-    if (total_h > r.h - 8) {
+    if (total_h > r.h - 8.0f) {
+        float sb_w = 6.0f, sb_x = r.x + r.w - sb_w - 2.0f;
+        float visible_h = r.h - 8.0f;
+        float thumb_h = (visible_h / total_h) * visible_h;
+        if (thumb_h < 12.0f) thumb_h = 12.0f;
+        float thumb_y = r.y + 4.0f + (ta_scroll_y / (total_h - visible_h)) * (visible_h - thumb_h);
+        Rect track_r = {sb_x, r.y + 4.0f, sb_w, visible_h};
+        Rect thumb_r = {sb_x, thumb_y, sb_w, thumb_h};
+        Color track_c = g_style.border; track_c.a = 0.3f;
+        fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
+    }
+
+    if (vis[0]) {
+        float lbl_w = 80.0f;
+        Rect lbl_r = {r.x + r.w + 4.0f, r.y, lbl_w, g_style.item_height};
+        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f)));
+    }
+
+    mark_last_item(id, r, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,0,1,0.4f});
+    return changed;
+}
+
+bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
+    return text_area_ex(label, buffer, buffer_size, rows, TextAreaFlags::Default);
+}
+
+void log_view(const char* label, const char* text, int rows, LogViewFlags flags) {
+    if (!g_drawing) return;
+    char vis[128]; const char* hs;
+    split_label(label, vis, sizeof(vis), &hs);
+    int id = hash_str(hs);
+    register_focusable(id);
+    ScrollSlot& slot = scroll_slot_for(id ^ 0x6F6A5601);
+
+    float lh = text_line_height();
+    float widget_h = rows * lh + 8.0f;
+    Rect r = next_rect(widget_h);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
+    bool focused = is_widget_focused(id);
+
+    const char* src = text ? text : "";
+    int len = (int)strlen(src);
+
+    if (hov && g_input.mouse_pressed) {
+        set_widget_focus(id, false);
+        focused = true;
+        g_ta_cursor_id = id;
+    }
+    if (focused && g_ta_cursor_id != id) {
+        g_ta_cursor_id = id;
+        g_ta_cursor = len;
+        g_ta_sel_anchor = len;
+    }
+
+    float pad_x = 6.0f, pad_y = 4.0f;
+    float text_w = r.w - pad_x * 2.0f - 8.0f;
+    std::vector<TextRange> lines;
+    compute_wrapped_ranges(src, text_w, (flags & LogViewFlags::WordWrap), lines);
+
+    float visible_h = widget_h - 8.0f;
+    float total_h = (float)lines.size() * lh;
+    float max_scroll = total_h > visible_h ? (total_h - visible_h) : 0.0f;
+    if ((flags & LogViewFlags::AutoScrollBottom) && !focused) slot.target = max_scroll;
+    if (effects_enabled()) slot.current = step_anim(slot.current, slot.target, g_dt, 18.0f);
+    else slot.current = slot.target;
+    slot.current = clampf(slot.current, 0.0f, max_scroll);
+    slot.target = clampf(slot.target, 0.0f, max_scroll);
+
+    if (hov && g_input.wheel_y != 0.0f) {
+        slot.target -= g_input.wheel_y;
+        slot.target = clampf(slot.target, 0.0f, max_scroll);
+        g_input.wheel_y = 0.0f;
+    }
+
+    if (focused) {
+        if (g_input.ctrl_held && g_input.text_input_count > 0 && g_input.text_input[0] == 1) {
+            g_ta_sel_anchor = 0;
+            g_ta_cursor = len;
+        }
+        if (g_input.key_ctrl_c && g_ta_sel_anchor != g_ta_cursor) {
+            int lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
+            int hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
+            std::string sel(src + lo, src + hi);
+            clipboard_set(sel.c_str());
+        }
+        if (hov && g_input.mouse_pressed) {
+            int line_idx = (int)((g_input.mouse_y - (r.y + pad_y) + slot.current) / lh);
+            line_idx = line_idx < 0 ? 0 : (line_idx >= (int)lines.size() ? (int)lines.size() - 1 : line_idx);
+            TextRange tr = lines.empty() ? TextRange{} : lines[line_idx];
+            int clicked = tr.start + byte_from_x(src + tr.start, g_input.mouse_x - (r.x + pad_x));
+            if (clicked > tr.end) clicked = tr.end;
+            g_ta_cursor = clicked;
+            g_ta_sel_anchor = clicked;
+        }
+    }
+
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, raw_hov, false, focused);
+    Color border_col = lerp_color(g_style.border, g_style.input_focus, focused ? 0.7f : 0.0f);
+    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, 0.0f, focused ? 1.0f : 0.0f);
+
+    Rect clip_r = {r.x + 2, r.y + 2, r.w - 4, r.h - 4};
+    push_clip(clip_r);
+
+    int sel_lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
+    int sel_hi = g_ta_sel_anchor > g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        float line_y = r.y + pad_y - slot.current + (float)i * lh;
+        if (line_y + lh < r.y || line_y > r.y + r.h) continue;
+
+        TextRange tr = lines[i];
+        if (focused && sel_lo != sel_hi) {
+            int line_sel_lo = sel_lo < tr.start ? tr.start : sel_lo;
+            int line_sel_hi = sel_hi > tr.end ? tr.end : sel_hi;
+            if (line_sel_lo < line_sel_hi) {
+                float sx = r.x + pad_x + measure_text_at(src + tr.start, line_sel_lo - tr.start);
+                float ex = r.x + pad_x + measure_text_at(src + tr.start, line_sel_hi - tr.start);
+                Rect sel_r = {sx, line_y, ex - sx, lh};
+                Color sc = g_style.input_focus; sc.a = 0.30f;
+                fill_rect(sel_r, sc);
+            }
+        }
+
+        std::string line(src + tr.start, src + tr.end);
+        Rect lr = {r.x + pad_x, line_y, text_w, lh};
+        draw_text_utf8(line.c_str(), lr, maybe_disabled(g_style.text));
+    }
+    pop_clip();
+
+    if (total_h > visible_h) {
         float sb_w = 6.0f, sb_x = r.x + r.w - sb_w - 2;
-        float visible_h = r.h - 8;
         float thumb_h = (visible_h / total_h) * visible_h;
         if (thumb_h < 12) thumb_h = 12;
-        float thumb_y = r.y + 4 + (g_ta_scroll_y / (total_h - visible_h)) * (visible_h - thumb_h);
+        float thumb_y = r.y + 4 + (slot.current / (total_h - visible_h)) * (visible_h - thumb_h);
         Rect track_r = {sb_x, r.y + 4, sb_w, visible_h};
         Rect thumb_r = {sb_x, thumb_y, sb_w, thumb_h};
         Color track_c = g_style.border; track_c.a = 0.3f;
-        fill_round_rect(track_r, sb_w * 0.5f, track_c);
-        fill_round_rect(thumb_r, sb_w * 0.5f, g_style.text_dim);
+        fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
     }
 
-    // Label above/to the right
     if (vis[0]) {
         float lbl_w = 80.0f;
         Rect lbl_r = {r.x + r.w + 4, r.y, lbl_w, g_style.item_height};
-        draw_text_utf8(vis, lbl_r, lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f));
+        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, focused ? 0.4f : 0.0f)));
     }
 
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,0,1,0.4f});
-    return changed;
+    mark_last_item(id, r, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.3f,0.7f,1,0.4f});
 }
 
 bool checkbox(const char* label, bool* value) {
@@ -2528,38 +3117,56 @@ bool checkbox(const char* label, bool* value) {
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
+    register_focusable(id);
 
     Rect r = next_rect(g_style.item_height);
-    bool hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
+    bool focused = is_widget_focused(id);
     bool clicked = false;
 
-    if (hov && g_input.mouse_pressed) g_ctx.active_id = id;
+    if (hov && g_input.mouse_pressed) {
+        set_widget_focus(id, false);
+        g_ctx.active_id = id;
+    }
+    if (focused && enabled && (g_input.key_space || g_input.key_enter)) {
+        *value = !*value;
+        clicked = true;
+    }
     if (g_ctx.active_id == id && g_input.mouse_released) {
-        if (hov) { *value = !*value; clicked = true; }
+        if (hov) {
+            *value = !*value;
+            clicked = true;
+            set_widget_focus(id, false);
+        }
         g_ctx.active_id = 0;
     }
 
-    float box_sz = g_style.item_height - 10;
+    float box_sz = g_style.item_height - 10.0f;
     Rect box = {r.x, r.y + (r.h - box_sz) * 0.5f, box_sz, box_sz};
     MotionSlot& motion = motion_slot_for(id);
-    update_motion_slot(motion, hov, g_ctx.active_id == id, *value);
+    update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || *value);
     Color bg = lerp_color(g_style.input_bg, g_style.panel, 0.14f);
-    bg = lerp_color(bg, g_style.button_hover, motion.hover * 0.45f);
-    bg = lerp_color(bg, g_style.input_focus, motion.focus * 0.10f);
-    Color border = lerp_color(g_style.border, g_style.input_focus, motion.focus);
-    draw_widget_chrome(box, fmaxf(2.0f, g_style.rounding * 0.35f), bg, border, motion.hover, motion.active, motion.focus);
+    bg = lerp_color(bg, g_style.button_hover, motion.hover * 0.28f);
+    bg = lerp_color(bg, g_style.input_focus, *value ? 0.14f : 0.04f);
+    Color border = lerp_color(g_style.border, g_style.input_focus, focused ? 0.85f : (*value ? 0.35f : 0.0f));
+    draw_widget_chrome(box, fmaxf(2.0f, g_style.rounding * 0.35f),
+                       maybe_disabled(bg), maybe_disabled(border),
+                       motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
-    if (motion.focus > 0.01f) {
+    if (*value) {
         float inset = 5.0f;
         Rect mark = {box.x + inset, box.y + inset, box.w - inset * 2.0f, box.h - inset * 2.0f};
-        Color mark_fill = lerp_color(g_style.input_focus, g_style.text, 0.18f);
-        mark_fill.a = 0.24f + motion.focus * 0.62f;
-        fill_rect(mark, mark_fill);
+        Color mark_fill = g_style.input_focus;
+        mark_fill.a = 0.82f;
+        fill_rect(mark, maybe_disabled(mark_fill));
     }
 
-    Rect lbl_r = {box.x + box_sz + 8, r.y, r.w - box_sz - 8, r.h};
-    draw_text_utf8(vis, lbl_r, lerp_color(g_style.text_dim, g_style.text, 0.45f + motion.hover * 0.55f));
+    Rect lbl_r = {box.x + box_sz + 8.0f, r.y, r.w - box_sz - 8.0f, r.h};
+    draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, 0.52f + motion.hover * 0.42f)));
 
+    mark_last_item(id, r, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,0,1,0.4f});
     return clicked;
 }
@@ -2569,47 +3176,74 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
+    register_focusable(id);
 
+    if (max_v < min_v) { float tmp = min_v; min_v = max_v; max_v = tmp; }
     Rect r = next_rect(g_style.item_height);
     float lbl_w = 90.0f;
-    Rect track_r = {r.x, r.y + r.h * 0.5f - 3, r.w - lbl_w, 6};
-    bool hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect track_r = {r.x, r.y + r.h * 0.5f - 3.0f, r.w - lbl_w, 6.0f};
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
+    bool focused = is_widget_focused(id);
     bool changed = false;
 
-    if (hov && g_input.mouse_pressed) g_ctx.active_id = id;
+    if (hov && g_input.mouse_pressed) {
+        set_widget_focus(id, false);
+        g_ctx.active_id = id;
+    }
     if (g_ctx.active_id == id) {
         if (g_input.mouse_released) g_ctx.active_id = 0;
-        else {
+        else if (enabled) {
             float t = (g_input.mouse_x - track_r.x) / track_r.w;
-            if (t < 0) t = 0; if (t > 1) t = 1;
-            *value = min_v + t * (max_v - min_v);
-            changed = true;
+            t = clampf(t, 0.0f, 1.0f);
+            float nv = min_v + t * (max_v - min_v);
+            if (nv != *value) { *value = nv; changed = true; }
+        }
+    }
+
+    if (focused && enabled && max_v > min_v) {
+        float step = (max_v - min_v) / 100.0f;
+        if (step <= 0.0f) step = (max_v - min_v) / 20.0f;
+        if (step <= 0.0f) step = 1.0f;
+        if (g_input.key_left) {
+            float nv = *value - step;
+            if (nv < min_v) nv = min_v;
+            if (nv != *value) { *value = nv; changed = true; }
+        }
+        if (g_input.key_right) {
+            float nv = *value + step;
+            if (nv > max_v) nv = max_v;
+            if (nv != *value) { *value = nv; changed = true; }
         }
     }
 
     MotionSlot& motion = motion_slot_for(id);
-    update_motion_slot(motion, hov, g_ctx.active_id == id, false);
+    update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused);
 
     Color track_bg = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f);
-    fill_round_rect(track_r, 3, track_bg);
-    stroke_round_rect(track_r, 3, g_style.border_width, lerp_color(g_style.border, g_style.input_focus, motion.active * 0.25f));
+    fill_round_rect(track_r, 3.0f, maybe_disabled(track_bg));
+    stroke_round_rect(track_r, 3.0f, g_style.border_width,
+                      maybe_disabled(lerp_color(g_style.border, g_style.input_focus, focused ? 0.65f : motion.active * 0.25f)));
 
-    float t = (*value - min_v) / (max_v - min_v);
-    if (t < 0) t = 0; if (t > 1) t = 1;
+    float t = max_v > min_v ? ((*value - min_v) / (max_v - min_v)) : 0.0f;
+    t = clampf(t, 0.0f, 1.0f);
     Rect fill_r = {track_r.x, track_r.y, track_r.w * t, track_r.h};
-    if (fill_r.w > 0) fill_round_rect(fill_r, 3, with_alpha(g_style.input_focus, 0.78f + motion.active * 0.18f));
+    if (fill_r.w > 0.0f) fill_round_rect(fill_r, 3.0f, maybe_disabled(with_alpha(g_style.input_focus, 0.78f + motion.active * 0.18f)));
 
     float knob_sz = 14.0f;
     Rect knob = {track_r.x + track_r.w * t - knob_sz * 0.5f, r.y + r.h * 0.5f - knob_sz * 0.5f, knob_sz, knob_sz};
     Color knob_col = lerp_color(g_style.button, g_style.button_hover, motion.hover);
     knob_col = lerp_color(knob_col, g_style.button_active, motion.active);
-    draw_widget_chrome(knob, knob_sz * 0.5f, knob_col, g_style.input_focus, motion.hover, motion.active, 0.0f);
+    draw_widget_chrome(knob, knob_sz * 0.5f, maybe_disabled(knob_col), maybe_disabled(g_style.input_focus),
+                       motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
-    char val_str[64];
+    char val_str[96];
     snprintf(val_str, sizeof(val_str), "%s  %.2f", vis, *value);
-    Rect lbl_r2 = {r.x + r.w - lbl_w + 4, r.y, lbl_w - 4, r.h};
-    draw_text_utf8(val_str, lbl_r2, lerp_color(g_style.text_dim, g_style.text, motion.hover * 0.30f));
+    Rect lbl_r2 = {r.x + r.w - lbl_w + 4.0f, r.y, lbl_w - 4.0f, r.h};
+    draw_text_utf8(val_str, lbl_r2, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.hover * 0.30f + (focused ? 0.35f : 0.0f))));
 
+    mark_last_item(id, r, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,1,0,0.4f});
     return changed;
 }
@@ -2619,6 +3253,7 @@ void image(ImageHandle* img, float width, float height) {
     Rect r = next_rect(height);
     if (width < r.w) r.w = width;
     draw_image_handle(img, r);
+    mark_last_item(0, r, false, false);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,1,1,0.4f});
 }
 
@@ -2642,33 +3277,73 @@ bool tabs(const char* const* labels, int count, int* selected) {
     int current_selected = *selected;
     Rect selected_rect = {};
     bool have_selected_rect = false;
+    bool enabled = widget_interaction_enabled();
+    std::vector<int> ids(count);
+    int focused_idx = -1;
+    Rect last_rect = r;
+    int last_id = bar_id;
+    bool last_hov = false;
+    bool last_focus = false;
+
+    for (int i = 0; i < count; ++i) {
+        char vis[128]; const char* hs;
+        split_label(labels[i], vis, sizeof(vis), &hs);
+        ids[i] = hash_str(hs) ^ (i * 31337);
+        register_focusable(ids[i]);
+        if (is_widget_focused(ids[i])) focused_idx = i;
+    }
+
+    if (focused_idx >= 0 && enabled) {
+        int next_idx = focused_idx;
+        if (g_input.key_left) next_idx = focused_idx > 0 ? focused_idx - 1 : 0;
+        if (g_input.key_right) next_idx = focused_idx + 1 < count ? focused_idx + 1 : count - 1;
+        if (next_idx != focused_idx) {
+            current_selected = next_idx;
+            set_widget_focus(ids[next_idx], false);
+            changed = true;
+        } else if ((g_input.key_space || g_input.key_enter) && current_selected != focused_idx) {
+            current_selected = focused_idx;
+            changed = true;
+        }
+    }
 
     for (int i = 0; i < count; i++) {
         char vis[128]; const char* hs;
         split_label(labels[i], vis, sizeof(vis), &hs);
-        int id = hash_str(hs) ^ (i * 31337);
+        int id = ids[i];
 
         Rect tr = {r.x + i * tab_w, r.y, tab_w, tab_h};
-        bool hov = rect_contains(tr, g_input.mouse_x, g_input.mouse_y);
+        bool raw_hov = rect_contains(tr, g_input.mouse_x, g_input.mouse_y);
+        bool hov = raw_hov && enabled;
 
-        if (hov && g_input.mouse_pressed) g_ctx.active_id = id;
+        if (hov && g_input.mouse_pressed) {
+            set_widget_focus(id, false);
+            g_ctx.active_id = id;
+        }
         if (g_ctx.active_id == id && g_input.mouse_released) {
             if (hov && current_selected != i) { current_selected = i; changed = true; }
             g_ctx.active_id = 0;
         }
 
+        bool focused = is_widget_focused(id);
         bool sel = (current_selected == i);
         if (sel) { selected_rect = tr; have_selected_rect = true; }
+        if (raw_hov || focused) {
+            last_rect = tr;
+            last_id = id;
+            last_hov = raw_hov;
+            last_focus = focused;
+        }
 
         MotionSlot& motion = motion_slot_for(id);
-        update_motion_slot(motion, hov, g_ctx.active_id == id, sel);
+        update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || sel);
 
-        Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover);
-        bg = lerp_color(bg, g_style.panel, motion.focus);
-        bg = lerp_color(bg, g_style.button_active, motion.active * 0.75f);
-        Color border = lerp_color(g_style.border, g_style.input_focus, motion.focus * 0.45f + motion.active * 0.25f);
-        draw_widget_chrome(tr, g_style.rounding, bg, border, motion.hover, motion.active, motion.focus);
-        draw_text_utf8_centered(vis, tr, lerp_color(g_style.text_dim, g_style.text, clamp01(motion.hover * 0.45f + motion.focus)));
+        Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover * 0.45f);
+        bg = lerp_color(bg, g_style.panel, focused ? 0.18f : 0.0f);
+        bg = lerp_color(bg, g_style.button_active, sel ? 0.22f : motion.active * 0.75f);
+        Color border = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.55f : 0.0f) + (sel ? 0.18f : 0.0f));
+        draw_widget_chrome(tr, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
+        draw_text_utf8_centered(vis, tr, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, clamp01((sel ? 0.55f : 0.0f) + motion.hover * 0.35f + (focused ? 0.35f : 0.0f)))));
     }
 
     *selected = current_selected;
@@ -2720,8 +3395,550 @@ bool tabs(const char* const* labels, int count, int* selected) {
         g_tab_content_owner = 0;
     }
 
+    mark_last_item(last_id, last_rect, last_hov, last_focus);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.5f,0,1,0.4f});
     return changed;
+}
+
+bool dropdown(const char* label, const char* const* items, int count, int* selected, int popup_rows) {
+    if (!g_drawing) return false;
+    char vis[128]; const char* hs;
+    split_label(label, vis, sizeof(vis), &hs);
+    int id = hash_str(hs);
+    register_focusable(id);
+
+    if (count < 0) count = 0;
+    if (popup_rows <= 0) popup_rows = 8;
+    if (selected && count > 0) {
+        if (*selected < 0) *selected = 0;
+        if (*selected >= count) *selected = count - 1;
+    }
+
+    Rect r = next_rect(g_style.item_height);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
+    bool focused = is_widget_focused(id);
+    bool changed = false;
+    bool open = (g_dropdown_open_id == id);
+    ScrollSlot& slot = scroll_slot_for(id ^ 0x330011);
+
+    if (hov && g_input.mouse_pressed) {
+        set_widget_focus(id, false);
+        g_ctx.active_id = id;
+    }
+    if (g_ctx.active_id == id && g_input.mouse_released) {
+        if (hov) {
+            g_dropdown_open_id = open ? 0 : id;
+            open = !open;
+        }
+        g_ctx.active_id = 0;
+    }
+    if (focused && enabled && (g_input.key_space || g_input.key_enter)) {
+        g_dropdown_open_id = open ? 0 : id;
+        open = !open;
+    }
+    if (open && g_input.key_escape) {
+        g_dropdown_open_id = 0;
+        open = false;
+    }
+
+    float item_h = g_style.item_height - 4.0f;
+    int visible_count = popup_rows < count ? popup_rows : count;
+    float popup_h = visible_count > 0 ? visible_count * item_h + 8.0f : item_h + 8.0f;
+    Rect popup_r = {r.x, r.y + r.h + 4.0f, r.w, popup_h};
+    bool popup_hov = open && rect_contains(popup_r, g_input.mouse_x, g_input.mouse_y);
+
+    if (open && g_input.mouse_pressed && !raw_hov && !popup_hov) {
+        g_dropdown_open_id = 0;
+        open = false;
+    }
+
+    if (open && focused && count > 0) {
+        if (g_input.key_up) {
+            int nv = *selected > 0 ? *selected - 1 : 0;
+            if (nv != *selected) { *selected = nv; changed = true; }
+        }
+        if (g_input.key_down) {
+            int nv = *selected + 1 < count ? *selected + 1 : count - 1;
+            if (nv != *selected) { *selected = nv; changed = true; }
+        }
+    }
+
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov || popup_hov, enabled && g_ctx.active_id == id, focused);
+    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (open ? 0.10f : 0.0f));
+    Color border_col = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.65f : 0.0f) + (open ? 0.20f : 0.0f));
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col),
+                       motion.hover, motion.active, focused ? 1.0f : 0.0f);
+
+    const char* current = (count > 0 && selected) ? items[*selected] : "(empty)";
+    Rect text_r = {r.x + 10.0f, r.y, r.w - 34.0f, r.h};
+    draw_text_utf8(current ? current : "", text_r, maybe_disabled(g_style.text));
+    Rect arrow_r = {r.x + r.w - 24.0f, r.y, 20.0f, r.h};
+    draw_text_utf8_centered(open ? "^" : "v", arrow_r, maybe_disabled(g_style.text_dim));
+
+    if (open) {
+        float max_scroll = count * item_h - (popup_h - 8.0f);
+        if (max_scroll < 0.0f) max_scroll = 0.0f;
+        if (popup_hov && g_input.wheel_y != 0.0f) {
+            slot.target -= g_input.wheel_y;
+            slot.target = clampf(slot.target, 0.0f, max_scroll);
+            g_input.wheel_y = 0.0f;
+        }
+        if (effects_enabled()) slot.current = step_anim(slot.current, slot.target, g_dt, 18.0f);
+        else slot.current = slot.target;
+        slot.current = clampf(slot.current, 0.0f, max_scroll);
+
+        draw_widget_chrome(popup_r, g_style.rounding, maybe_disabled(g_style.panel), maybe_disabled(g_style.border), 0.0f, 0.0f, 0.0f);
+        Rect clip_r = {popup_r.x + 2.0f, popup_r.y + 2.0f, popup_r.w - 4.0f, popup_r.h - 4.0f};
+        push_clip(clip_r);
+        for (int i = 0; i < count; ++i) {
+            Rect ir = {popup_r.x + 4.0f, popup_r.y + 4.0f - slot.current + i * item_h, popup_r.w - 8.0f, item_h};
+            if (ir.y + ir.h < popup_r.y || ir.y > popup_r.y + popup_r.h) continue;
+            bool item_hov = rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
+            if (item_hov && g_input.mouse_pressed && enabled) {
+                if (selected && *selected != i) changed = true;
+                if (selected) *selected = i;
+                g_dropdown_open_id = 0;
+                open = false;
+            }
+            bool item_sel = selected && *selected == i;
+            Color item_bg = item_sel ? with_alpha(g_style.input_focus, 0.22f) :
+                            item_hov ? with_alpha(g_style.button_hover, 0.35f) :
+                                       with_alpha(g_style.panel, 0.0f);
+            if (item_bg.a > 0.0f) fill_round_rect(ir, g_style.rounding * 0.6f, maybe_disabled(item_bg));
+            Rect itr = {ir.x + 8.0f, ir.y, ir.w - 16.0f, ir.h};
+            draw_text_utf8(items[i] ? items[i] : "", itr, maybe_disabled(item_sel ? g_style.text : g_style.text_dim));
+        }
+        pop_clip();
+
+        if (count * item_h > popup_h - 8.0f && max_scroll > 0.0f) {
+            float visible_h = popup_h - 8.0f;
+            float thumb_h = (visible_h / (count * item_h)) * visible_h;
+            if (thumb_h < 12.0f) thumb_h = 12.0f;
+            float thumb_y = popup_r.y + 4.0f + (slot.current / max_scroll) * (visible_h - thumb_h);
+            Rect track_r = {popup_r.x + popup_r.w - 8.0f, popup_r.y + 4.0f, 4.0f, visible_h};
+            Rect thumb_r = {track_r.x, thumb_y, track_r.w, thumb_h};
+            Color track_c = g_style.border; track_c.a = 0.3f;
+            fill_round_rect(track_r, 2.0f, maybe_disabled(track_c));
+            fill_round_rect(thumb_r, 2.0f, maybe_disabled(g_style.text_dim));
+        }
+    }
+
+    if (vis[0]) {
+        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, r.h};
+        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, focused ? 0.35f : 0.0f)));
+    }
+
+    mark_last_item(id, open ? popup_r : r, raw_hov || popup_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.2f,0.8f,0.8f,0.4f});
+    return changed;
+}
+
+bool listbox(const char* label, const char* const* items, int count, int* selected, int visible_rows) {
+    if (!g_drawing) return false;
+    char vis[128]; const char* hs;
+    split_label(label, vis, sizeof(vis), &hs);
+    int id = hash_str(hs);
+    register_focusable(id);
+
+    if (count < 0) count = 0;
+    if (visible_rows <= 0) visible_rows = 6;
+    if (selected && count > 0) {
+        if (*selected < 0) *selected = 0;
+        if (*selected >= count) *selected = count - 1;
+    }
+
+    float item_h = g_style.item_height - 4.0f;
+    Rect r = next_rect(visible_rows * item_h + 8.0f);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
+    bool focused = is_widget_focused(id);
+    bool changed = false;
+    ScrollSlot& slot = scroll_slot_for(id ^ 0x774411);
+
+    if (hov && g_input.mouse_pressed) set_widget_focus(id, false);
+    if (focused && enabled && selected && count > 0) {
+        if (g_input.key_up) {
+            int nv = *selected > 0 ? *selected - 1 : 0;
+            if (nv != *selected) { *selected = nv; changed = true; }
+        }
+        if (g_input.key_down) {
+            int nv = *selected + 1 < count ? *selected + 1 : count - 1;
+            if (nv != *selected) { *selected = nv; changed = true; }
+        }
+    }
+
+    float visible_h = r.h - 8.0f;
+    float total_h = count * item_h;
+    float max_scroll = total_h > visible_h ? (total_h - visible_h) : 0.0f;
+    if (selected && count > 0) {
+        float item_top = *selected * item_h;
+        float item_bot = item_top + item_h;
+        if (item_top < slot.target) slot.target = item_top;
+        if (item_bot > slot.target + visible_h) slot.target = item_bot - visible_h;
+    }
+    slot.target = clampf(slot.target, 0.0f, max_scroll);
+    if (hov && g_input.wheel_y != 0.0f) {
+        slot.target -= g_input.wheel_y;
+        slot.target = clampf(slot.target, 0.0f, max_scroll);
+        g_input.wheel_y = 0.0f;
+    }
+    if (effects_enabled()) slot.current = step_anim(slot.current, slot.target, g_dt, 18.0f);
+    else slot.current = slot.target;
+    slot.current = clampf(slot.current, 0.0f, max_scroll);
+
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, false, focused);
+    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
+    Color border_col = lerp_color(g_style.border, g_style.input_focus, focused ? 0.7f : 0.0f);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col),
+                       motion.hover, 0.0f, focused ? 1.0f : 0.0f);
+
+    Rect clip_r = {r.x + 2.0f, r.y + 2.0f, r.w - 4.0f, r.h - 4.0f};
+    push_clip(clip_r);
+    for (int i = 0; i < count; ++i) {
+        Rect ir = {r.x + 4.0f, r.y + 4.0f - slot.current + i * item_h, r.w - 12.0f, item_h};
+        if (ir.y + ir.h < r.y || ir.y > r.y + r.h) continue;
+        bool item_hov = rect_contains(ir, g_input.mouse_x, g_input.mouse_y) && enabled;
+        if (item_hov && g_input.mouse_pressed) {
+            set_widget_focus(id, false);
+            if (selected && *selected != i) changed = true;
+            if (selected) *selected = i;
+        }
+        bool item_sel = selected && *selected == i;
+        Color item_bg = item_sel ? with_alpha(g_style.input_focus, 0.22f) :
+                        item_hov ? with_alpha(g_style.button_hover, 0.30f) :
+                                   with_alpha(g_style.panel, 0.0f);
+        if (item_bg.a > 0.0f) fill_round_rect(ir, g_style.rounding * 0.6f, maybe_disabled(item_bg));
+        Rect item_text_r = {ir.x + 8.0f, ir.y, ir.w - 16.0f, ir.h};
+        draw_text_utf8(items[i] ? items[i] : "", item_text_r, maybe_disabled(item_sel ? g_style.text : g_style.text_dim));
+    }
+    if (count == 0) {
+        Rect empty_r = {r.x + 8.0f, r.y, r.w - 16.0f, r.h};
+        draw_text_utf8("(empty)", empty_r, maybe_disabled(g_style.text_dim));
+    }
+    pop_clip();
+
+    if (total_h > visible_h) {
+        float sb_w = 6.0f, sb_x = r.x + r.w - sb_w - 2.0f;
+        float thumb_h = (visible_h / total_h) * visible_h;
+        if (thumb_h < 12.0f) thumb_h = 12.0f;
+        float thumb_y = r.y + 4.0f + (slot.current / (total_h - visible_h)) * (visible_h - thumb_h);
+        Rect track_r = {sb_x, r.y + 4.0f, sb_w, visible_h};
+        Rect thumb_r = {sb_x, thumb_y, sb_w, thumb_h};
+        Color track_c = g_style.border; track_c.a = 0.3f;
+        fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
+    }
+
+    if (vis[0]) {
+        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, g_style.item_height};
+        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, focused ? 0.35f : 0.0f)));
+    }
+
+    mark_last_item(id, r, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.0f,0.9f,0.5f,0.4f});
+    return changed;
+}
+
+bool radio_group(const char* label, const char* const* items, int count, int* selected, int columns) {
+    if (!g_drawing || count <= 0 || !selected) return false;
+    char vis[128]; const char* hs;
+    split_label(label, vis, sizeof(vis), &hs);
+    int base_id = hash_str(hs);
+    if (columns <= 0) columns = 1;
+    if (columns > count) columns = count;
+    if (*selected < 0) *selected = 0;
+    if (*selected >= count) *selected = count - 1;
+
+    int rows = (count + columns - 1) / columns;
+    float gap = g_style.item_spacing;
+    float item_h = g_style.item_height;
+    Rect r = next_rect(rows * item_h + gap * (rows - 1));
+    float cell_w = (r.w - gap * (columns - 1)) / columns;
+    bool enabled = widget_interaction_enabled();
+    bool changed = false;
+    std::vector<int> ids(count);
+    int focused_idx = -1;
+    Rect last_rect = r;
+    int last_id = base_id;
+    bool last_hov = false;
+    bool last_focus = false;
+
+    for (int i = 0; i < count; ++i) {
+        ids[i] = base_id ^ (i * 911);
+        register_focusable(ids[i]);
+        if (is_widget_focused(ids[i])) focused_idx = i;
+    }
+
+    if (focused_idx >= 0 && enabled) {
+        int next_idx = focused_idx;
+        if (g_input.key_left && (focused_idx % columns) > 0) next_idx = focused_idx - 1;
+        if (g_input.key_right && (focused_idx % columns) + 1 < columns && focused_idx + 1 < count) next_idx = focused_idx + 1;
+        if (g_input.key_up && focused_idx - columns >= 0) next_idx = focused_idx - columns;
+        if (g_input.key_down && focused_idx + columns < count) next_idx = focused_idx + columns;
+        if (next_idx != focused_idx) {
+            set_widget_focus(ids[next_idx], false);
+            if (*selected != next_idx) { *selected = next_idx; changed = true; }
+        } else if ((g_input.key_space || g_input.key_enter) && *selected != focused_idx) {
+            *selected = focused_idx;
+            changed = true;
+        }
+    }
+
+    for (int i = 0; i < count; ++i) {
+        int row_i = i / columns;
+        int col_i = i % columns;
+        Rect ir = {r.x + col_i * (cell_w + gap), r.y + row_i * (item_h + gap), cell_w, item_h};
+        bool raw_hov = rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
+        bool hov = raw_hov && enabled;
+        bool focused = is_widget_focused(ids[i]);
+        bool sel = (*selected == i);
+
+        if (hov && g_input.mouse_pressed) {
+            set_widget_focus(ids[i], false);
+            g_ctx.active_id = ids[i];
+        }
+        if (g_ctx.active_id == ids[i] && g_input.mouse_released) {
+            if (hov && !sel) { *selected = i; changed = true; }
+            g_ctx.active_id = 0;
+        }
+        if (raw_hov || focused) {
+            last_rect = ir;
+            last_id = ids[i];
+            last_hov = raw_hov;
+            last_focus = focused;
+        }
+
+        MotionSlot& motion = motion_slot_for(ids[i]);
+        update_motion_slot(motion, hov, enabled && g_ctx.active_id == ids[i], focused || sel);
+        Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover * 0.42f);
+        bg = lerp_color(bg, g_style.button_active, sel ? 0.20f : motion.active * 0.65f);
+        Color border = lerp_color(g_style.border, g_style.input_focus, (sel ? 0.28f : 0.0f) + (focused ? 0.55f : 0.0f));
+        draw_widget_chrome(ir, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
+
+        float box_sz = 12.0f;
+        Rect box = {ir.x + 10.0f, ir.y + (ir.h - box_sz) * 0.5f, box_sz, box_sz};
+        stroke_round_rect(box, 3.0f, 1.0f, maybe_disabled(sel ? g_style.input_focus : g_style.border));
+        if (sel) {
+            Rect inner = {box.x + 3.0f, box.y + 3.0f, box.w - 6.0f, box.h - 6.0f};
+            fill_rect(inner, maybe_disabled(g_style.input_focus));
+        }
+
+        Rect tr = {box.x + box.w + 8.0f, ir.y, ir.w - box.w - 18.0f, ir.h};
+        draw_text_utf8(items[i] ? items[i] : "", tr, maybe_disabled(sel ? g_style.text : g_style.text_dim));
+    }
+
+    if (vis[0]) {
+        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, g_style.item_height};
+        draw_text_utf8(vis, lbl_r, maybe_disabled(g_style.text_dim));
+    }
+
+    mark_last_item(last_id, last_rect, last_hov, last_focus);
+    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.7f,0.5f,0.1f,0.4f});
+    return changed;
+}
+
+bool collapsing_header(const char* label, bool* open) {
+    if (!g_drawing) return false;
+    char vis[128]; const char* hs;
+    split_label(label, vis, sizeof(vis), &hs);
+    int id = hash_str(hs);
+    register_focusable(id);
+
+    CollapseSlot& slot = collapse_slot_for(id);
+    if (!slot.initialized) { slot.initialized = true; slot.open = false; }
+    bool state = open ? *open : slot.open;
+
+    Rect r = next_rect(g_style.item_height);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
+    bool focused = is_widget_focused(id);
+
+    if (hov && g_input.mouse_pressed) {
+        set_widget_focus(id, false);
+        g_ctx.active_id = id;
+    }
+    if (focused && enabled && (g_input.key_space || g_input.key_enter)) state = !state;
+    if (g_ctx.active_id == id && g_input.mouse_released) {
+        if (hov) state = !state;
+        g_ctx.active_id = 0;
+    }
+
+    if (open) *open = state;
+    else slot.open = state;
+
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || state);
+    Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover * 0.40f);
+    bg = lerp_color(bg, g_style.panel, state ? 0.10f : 0.0f);
+    Color border = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.55f : 0.0f) + (state ? 0.16f : 0.0f));
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
+
+    Rect arrow_r = {r.x + 10.0f, r.y, 18.0f, r.h};
+    draw_text_utf8_centered(state ? "v" : ">", arrow_r, maybe_disabled(g_style.text_dim));
+    Rect text_r = {r.x + 28.0f, r.y, r.w - 32.0f, r.h};
+    draw_text_utf8(vis, text_r, maybe_disabled(g_style.text));
+
+    mark_last_item(id, r, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.8f,0.4f,0.1f,0.4f});
+    return state;
+}
+
+void scroll_area(const char* label, float height, std::function<void()> fn) {
+    if (!g_drawing || height <= 0.0f || !fn) return;
+    char vis[128]; const char* hs;
+    split_label(label, vis, sizeof(vis), &hs);
+    int id = hash_str(hs);
+    ScrollSlot& slot = scroll_slot_for(id ^ 0x442211);
+
+    Rect r = next_rect(height);
+    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    bool enabled = widget_interaction_enabled();
+    bool hov = raw_hov && enabled;
+
+    bool had_scroll_prev = slot.content > (r.h - 12.0f);
+    float sb_reserve = had_scroll_prev ? 10.0f : 0.0f;
+    Rect inner = {r.x + 6.0f, r.y + 6.0f, r.w - 12.0f - sb_reserve, r.h - 12.0f};
+
+    if (hov && g_input.wheel_y != 0.0f) {
+        slot.target -= g_input.wheel_y;
+        g_input.wheel_y = 0.0f;
+    }
+
+    MotionSlot& motion = motion_slot_for(id);
+    update_motion_slot(motion, hov, false, false);
+    Color panel_col = lerp_color(g_style.panel, g_style.input_bg, motion.hover * 0.12f);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(g_style.border), motion.hover, 0.0f, 0.0f);
+
+    Rect clip_r = {r.x + 2.0f, r.y + 2.0f, r.w - 4.0f, r.h - 4.0f};
+    push_clip(clip_r);
+
+    Rect saved_region = g_ctx.content_region;
+    float saved_cursor_x = g_ctx.cursor_x;
+    float saved_cursor_y = g_ctx.cursor_y;
+    RowContext saved_row = g_ctx.row_ctx;
+
+    g_ctx.content_region = inner;
+    g_ctx.cursor_x = inner.x;
+    g_ctx.cursor_y = inner.y - slot.current;
+    g_ctx.row_ctx = {};
+    fn();
+    slot.content = g_ctx.cursor_y + slot.current - inner.y;
+
+    g_ctx.content_region = saved_region;
+    g_ctx.cursor_x = saved_cursor_x;
+    g_ctx.cursor_y = saved_cursor_y;
+    g_ctx.row_ctx = saved_row;
+    pop_clip();
+
+    float max_scroll = slot.content > inner.h ? (slot.content - inner.h) : 0.0f;
+    slot.target = clampf(slot.target, 0.0f, max_scroll);
+    if (effects_enabled()) slot.current = step_anim(slot.current, slot.target, g_dt, 18.0f);
+    else slot.current = slot.target;
+    slot.current = clampf(slot.current, 0.0f, max_scroll);
+
+    if (slot.content > inner.h) {
+        float sb_w = 6.0f, visible_h = inner.h;
+        float thumb_h = (visible_h / slot.content) * visible_h;
+        if (thumb_h < 12.0f) thumb_h = 12.0f;
+        float thumb_y = inner.y + (slot.current / (slot.content - visible_h)) * (visible_h - thumb_h);
+        Rect track_r = {r.x + r.w - sb_w - 4.0f, inner.y, sb_w, visible_h};
+        Rect thumb_r = {track_r.x, thumb_y, sb_w, thumb_h};
+        bool thumb_hov = rect_contains(thumb_r, g_input.mouse_x, g_input.mouse_y) && enabled;
+        bool track_hov = rect_contains(track_r, g_input.mouse_x, g_input.mouse_y) && enabled;
+        if (g_input.mouse_pressed && thumb_hov) {
+            slot.dragging = true;
+            slot.drag_mouse = g_input.mouse_y;
+            slot.drag_scroll0 = slot.current;
+        }
+        if (slot.dragging) {
+            if (g_input.mouse_down || g_input.mouse_released) {
+                float scale = (slot.content - visible_h) / fmaxf(1.0f, visible_h - thumb_h);
+                slot.current = slot.drag_scroll0 + (g_input.mouse_y - slot.drag_mouse) * scale;
+                slot.current = clampf(slot.current, 0.0f, max_scroll);
+                slot.target = slot.current;
+            }
+            if (g_input.mouse_released) slot.dragging = false;
+        }
+        if (g_input.mouse_pressed && track_hov && !thumb_hov) {
+            slot.target += (g_input.mouse_y < thumb_y ? -visible_h : visible_h);
+            slot.target = clampf(slot.target, 0.0f, max_scroll);
+        }
+        Color track_c = g_style.border; track_c.a = 0.3f;
+        fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(slot.dragging ? g_style.input_focus : g_style.text_dim));
+    }
+
+    if (vis[0]) {
+        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, g_style.item_height};
+        draw_text_utf8(vis, lbl_r, maybe_disabled(g_style.text_dim));
+    }
+
+    mark_last_item(id, r, raw_hov, false);
+    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.3f,1.0f,0.4f,0.4f});
+}
+
+bool modal(const char* label, std::function<void()> fn) {
+    if (!g_drawing || !label || !fn) return false;
+    char vis[128]; const char* hs;
+    split_label(label, vis, sizeof(vis), &hs);
+    int id = hash_str(hs);
+
+    if (g_modal_request_id == id) {
+        g_modal_open_id = id;
+        g_modal_request_id = 0;
+    }
+    if (g_modal_open_id != id) return false;
+    if (g_input.key_escape) {
+        close_modal();
+        return false;
+    }
+
+    g_modal_drawn = true;
+    Rect overlay = {g_ctx.content_region.x, g_ctx.content_region.y, g_ctx.content_region.w, g_ctx.content_region.h};
+    Color veil = {0.02f, 0.03f, 0.05f, 0.58f};
+    fill_rect(overlay, veil);
+
+    float modal_w = fminf(460.0f, fmaxf(280.0f, overlay.w * 0.56f));
+    float modal_h = fminf(320.0f, fmaxf(180.0f, overlay.h * 0.42f));
+    Rect panel = {
+        overlay.x + (overlay.w - modal_w) * 0.5f,
+        overlay.y + (overlay.h - modal_h) * 0.5f,
+        modal_w,
+        modal_h
+    };
+    draw_widget_chrome(panel, fmaxf(g_style.rounding, 10.0f), g_style.panel, g_style.border, 0.0f, 0.0f, 1.0f);
+
+    Rect title_r = {panel.x + 16.0f, panel.y + 10.0f, panel.w - 32.0f, g_style.item_height};
+    draw_text_utf8(vis, title_r, g_style.text);
+
+    Rect saved_region = g_ctx.content_region;
+    float saved_cursor_x = g_ctx.cursor_x;
+    float saved_cursor_y = g_ctx.cursor_y;
+    RowContext saved_row = g_ctx.row_ctx;
+    bool saved_inside_modal = g_inside_modal;
+
+    g_inside_modal = true;
+    g_ctx.content_region = {panel.x + 16.0f, panel.y + g_style.item_height + 16.0f, panel.w - 32.0f, panel.h - g_style.item_height - 26.0f};
+    g_ctx.cursor_x = g_ctx.content_region.x;
+    g_ctx.cursor_y = g_ctx.content_region.y;
+    g_ctx.row_ctx = {};
+    fn();
+
+    g_ctx.content_region = saved_region;
+    g_ctx.cursor_x = saved_cursor_x;
+    g_ctx.cursor_y = saved_cursor_y;
+    g_ctx.row_ctx = saved_row;
+    g_inside_modal = saved_inside_modal;
+
+    mark_last_item(id, panel, rect_contains(panel, g_input.mouse_x, g_input.mouse_y), true);
+    if (g_debug.show_layout_rects) stroke_round_rect(panel, 0, 1, {1.0f,0.4f,0.2f,0.4f});
+    return g_modal_open_id == id;
 }
 
 void row(int cols, std::function<void()> fn) {
@@ -2729,13 +3946,42 @@ void row(int cols, std::function<void()> fn) {
     auto& rc = g_ctx.row_ctx;
     float gap = g_style.item_spacing;
     rc.active   = true;
+    rc.weighted = false;
     rc.cols     = cols;
     rc.gap      = gap;
     rc.cell_w   = (g_ctx.content_region.w - gap * (cols - 1)) / cols;
     rc.start_x  = g_ctx.cursor_x;
     rc.start_y  = g_ctx.cursor_y;
+    rc.total_w  = g_ctx.content_region.w;
+    rc.used_x   = 0;
+    rc.total_weight = (float)cols;
+    rc.weights  = nullptr;
     rc.col_index = 0;
     rc.row_height = 0;
+    fn();
+    rc.active = false;
+    g_ctx.cursor_y += rc.row_height + g_style.item_spacing;
+}
+
+void row(std::initializer_list<float> weights, std::function<void()> fn) {
+    if (!g_drawing || !fn || weights.size() == 0) return;
+    auto& rc = g_ctx.row_ctx;
+    float gap = g_style.item_spacing;
+    rc.active = true;
+    rc.weighted = true;
+    rc.cols = (int)weights.size();
+    rc.gap = gap;
+    rc.cell_w = 0.0f;
+    rc.start_x = g_ctx.cursor_x;
+    rc.start_y = g_ctx.cursor_y;
+    rc.total_w = g_ctx.content_region.w;
+    rc.used_x = 0.0f;
+    rc.total_weight = 0.0f;
+    rc.weights = weights.begin();
+    for (float w : weights) rc.total_weight += w > 0.0f ? w : 0.0f;
+    if (rc.total_weight <= 0.0f) rc.total_weight = (float)rc.cols;
+    rc.col_index = 0;
+    rc.row_height = 0.0f;
     fn();
     rc.active = false;
     g_ctx.cursor_y += rc.row_height + g_style.item_spacing;
