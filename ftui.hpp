@@ -125,6 +125,37 @@ DebugState& debug();
 
 #ifdef FTUI_IMPLEMENTATION
 
+#ifdef _WIN32
+
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#include <windowsx.h>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <shobjidl.h>
+#include <wincodec.h>
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#ifndef FTUI_KEEP_CONSOLE
+#pragma comment(linker, "/subsystem:windows /entry:mainCRTStartup")
+#endif
+
+#elif defined(__linux__)
+
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/keysym.h>
+#include <X11/Xresource.h>
+#include <cairo/cairo.h>
+#include <cairo/cairo-xlib.h>
+#include <time.h>
+#include <unistd.h>
+
+#endif
+
 namespace ftui {
 namespace internal {
 
@@ -339,21 +370,6 @@ Style one_dark_style() {
 // Windows Implementation
 // ============================================================
 #ifdef _WIN32
-
-#define WIN32_LEAN_AND_MEAN
-#define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
-#include <windowsx.h>
-#include <d2d1.h>
-#include <dwrite.h>
-#include <shobjidl.h>
-#include <wincodec.h>
-#pragma comment(lib, "d2d1.lib")
-#pragma comment(lib, "dwrite.lib")
-#pragma comment(lib, "windowscodecs.lib")
-#ifndef FTUI_KEEP_CONSOLE
-#pragma comment(linker, "/subsystem:windows /entry:mainCRTStartup")
-#endif
 
 namespace internal {
 
@@ -820,8 +836,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;
 
-    auto* d2d=g_renderer.d2d_factory,*wic=g_renderer.wic_factory;
-    auto* dw=g_renderer.dwrite_factory; auto inst=g_platform.instance; auto owner=g_platform.hwnd;
+    auto* d2d = g_renderer.d2d_factory;
+    auto* wic = g_renderer.wic_factory;
+    auto* dw = g_renderer.dwrite_factory;
+    auto  inst = g_platform.instance;
+    auto  owner = g_platform.hwnd;
 
     g_platform={}; g_platform.instance=inst;
     g_renderer={}; g_renderer.d2d_factory=d2d; g_renderer.dwrite_factory=(IDWriteFactory*)dw; g_renderer.wic_factory=(IWICImagingFactory*)wic; g_renderer.dpi_scale=1;
@@ -924,16 +943,6 @@ std::string open_file_dialog(const char* title, const FileFilter* filters, int f
 // Linux Implementation (X11 + Cairo)
 // ============================================================
 #elif defined(__linux__)
-
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/Xatom.h>
-#include <X11/keysym.h>
-#include <X11/Xresource.h>
-#include <cairo/cairo.h>
-#include <cairo/cairo-xlib.h>
-#include <time.h>
-#include <unistd.h>
 
 namespace internal {
 
@@ -2240,6 +2249,5 @@ void row(int cols, std::function<void()> fn) {
 } // namespace ftui
 
 #endif // FTUI_IMPLEMENTATION
-
 
 
