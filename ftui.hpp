@@ -16,7 +16,7 @@
 // Global startup theme. Change this line to another built-in preset if you
 // want a different default across all new FTUI windows.
 #ifndef FTUI_DEFAULT_STYLE
-#define FTUI_DEFAULT_STYLE ftui::nord_style
+#define FTUI_DEFAULT_STYLE ftui::one_dark_style
 #endif
 
 #ifndef FTUI_VERSION_MAJOR
@@ -66,6 +66,11 @@ Style one_dark_style();
 void         set_style(const Style& s);
 const Style& get_style();
 
+enum class BuiltinIcon {
+    Symbol,
+    SymbolWithText,
+};
+
 struct Config {
     const char* title         = "FTUI App"; // UTF-8; converted internally on Windows
     int         width         = 960;
@@ -82,6 +87,8 @@ void begin();
 void end();
 void shutdown();
 void set_quit_on_ctrl_q(bool enabled);
+void set_window_icon(void* native_icon);
+void set_window_icon_builtin(BuiltinIcon variant = BuiltinIcon::Symbol);
 
 void text(const char* label);
 void text_wrapped(const char* text);
@@ -371,6 +378,7 @@ struct CollapseSlot {
     int   key = 0;
     bool  initialized = false;
     bool  open = false;
+    float progress = 0;
 };
 
 struct NextLayoutState {
@@ -388,8 +396,21 @@ struct NextLayoutState {
 
 struct TooltipState {
     bool active = false;
+    bool requested = false;
+    bool visible = false;
+    int  request_id = 0;
+    int  hover_id = 0;
     Rect anchor = {};
+    Rect request_anchor = {};
     std::string text;
+    std::string request_text;
+    float hover_time = 0;
+    float opacity = 0;
+    float visible_time = 0;
+    float calm_time = 0;
+    float static_x = 0;
+    float static_y = 0;
+    int   dismiss_streak = 0;
 };
 
 // ---- Shared globals -------------------------------------------------
@@ -442,6 +463,7 @@ static void        fill_round_rect(Rect r, float radius, Color c);
 static void        stroke_round_rect(Rect r, float radius, float thickness, Color c);
 static void        fill_rect(Rect r, Color c);
 static void        draw_line(float x0, float y0, float x1, float y1, float thickness, Color c);
+static void        fill_triangle(Rect r, int dir, Color c);
 static void        draw_text_utf8(const char* utf8, Rect r, Color c);
 static void        draw_text_utf8_centered(const char* utf8, Rect r, Color c);
 static void        draw_image_handle(ImageHandle* img, Rect r);
@@ -449,9 +471,12 @@ static void        clipboard_set(const char* utf8);
 static std::string clipboard_get();
 static void        push_clip(Rect r);
 static void        pop_clip();
+static void        sync_native_window_chrome();
+static void        apply_window_icon_handles(void* icon_big, void* icon_small, bool owned, BuiltinIcon variant);
 
 #if FTUI_WINDOWS_EFFECTS
 static void        draw_previous_frame_overlay(Rect clip_r, float dx, float opacity);
+static void        draw_previous_frame_blur_panel(Rect r, float opacity);
 static void        release_frame_snapshot();
 static void        capture_frame_snapshot();
 #endif
@@ -737,7 +762,7 @@ static void compute_wrapped_ranges(const char* text, float max_width, bool word_
 }
 
 static void draw_tooltip_overlay() {
-    if (!g_tooltip.active || g_tooltip.text.empty()) return;
+    if (g_tooltip.opacity <= 0.01f || g_tooltip.text.empty()) return;
 
     float pad = 8.0f;
     float max_w = fminf(320.0f, fmaxf(180.0f, g_ctx.content_region.w * 0.45f));
@@ -761,15 +786,97 @@ static void draw_tooltip_overlay() {
     if (r.y < 8.0f) r.y = 8.0f;
 
     Color fill = lerp_color(g_style.panel, g_style.background, 0.18f);
-    fill.a = 0.98f;
-    draw_widget_chrome(r, fmaxf(4.0f, g_style.rounding * 0.75f), fill, g_style.border, 0.0f, 0.0f, 0.0f);
+    fill.a = 0.98f * g_tooltip.opacity;
+    Color border = g_style.border; border.a *= g_tooltip.opacity;
+    draw_widget_chrome(r, fmaxf(4.0f, g_style.rounding * 0.75f), fill, border, 0.0f, 0.0f, 0.0f);
 
     for (size_t i = 0; i < lines.size(); ++i) {
         TextRange tr = lines[i];
         std::string line(g_tooltip.text.c_str() + tr.start, g_tooltip.text.c_str() + tr.end);
         Rect lr = {r.x + pad, r.y + pad + (float)i * lh, r.w - pad * 2.0f, lh};
-        draw_text_utf8(line.c_str(), lr, g_style.text);
+        Color text = g_style.text; text.a *= g_tooltip.opacity;
+        draw_text_utf8(line.c_str(), lr, text);
     }
+}
+
+static float widget_label_height(const char* vis) {
+    return (vis && vis[0]) ? (text_line_height() + 6.0f) : 0.0f;
+}
+
+static Rect next_rect(float height);
+
+static Rect next_labeled_rect(const char* vis, float body_h, Rect* body_out) {
+    float label_h = widget_label_height(vis);
+    Rect outer = next_rect(body_h + label_h);
+    if (body_out) *body_out = {outer.x, outer.y + label_h, outer.w, body_h};
+    return outer;
+}
+
+static void draw_widget_label(const char* vis, Rect outer, bool emphasized = false) {
+    if (!vis || !vis[0]) return;
+    float label_h = widget_label_height(vis);
+    Rect lr = {outer.x, outer.y, outer.w, label_h};
+    draw_text_utf8(vis, lr, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, emphasized ? 0.22f : 0.0f)));
+}
+
+static float tooltip_delay_seconds() {
+    if (g_tooltip.dismiss_streak >= 4) return 10.0f;
+    if (g_tooltip.dismiss_streak >= 2) return 5.0f;
+    return 1.0f;
+}
+
+static void begin_tooltip_frame() {
+    g_tooltip.requested = false;
+    g_tooltip.request_id = 0;
+    g_tooltip.request_text.clear();
+}
+
+static void finalize_tooltip_frame() {
+    if (g_tooltip.requested) {
+        if (g_tooltip.hover_id != g_tooltip.request_id) {
+            if (g_tooltip.visible && g_tooltip.visible_time < 0.8f) g_tooltip.dismiss_streak++;
+            g_tooltip.hover_id = g_tooltip.request_id;
+            g_tooltip.hover_time = 0.0f;
+            g_tooltip.visible_time = 0.0f;
+            g_tooltip.calm_time = 0.0f;
+            g_tooltip.static_x = g_input.mouse_x;
+            g_tooltip.static_y = g_input.mouse_y;
+        } else {
+            float dx = g_input.mouse_x - g_tooltip.static_x;
+            float dy = g_input.mouse_y - g_tooltip.static_y;
+            float moved2 = dx * dx + dy * dy;
+            if (moved2 <= 4.0f) {
+                g_tooltip.hover_time += g_dt;
+            } else {
+                if (g_tooltip.visible && g_tooltip.visible_time < 0.8f) g_tooltip.dismiss_streak++;
+                g_tooltip.hover_time = 0.0f;
+                g_tooltip.visible_time = 0.0f;
+                g_tooltip.calm_time = 0.0f;
+                g_tooltip.static_x = g_input.mouse_x;
+                g_tooltip.static_y = g_input.mouse_y;
+            }
+        }
+        g_tooltip.anchor = g_tooltip.request_anchor;
+        g_tooltip.text = g_tooltip.request_text;
+    } else {
+        if (g_tooltip.visible && g_tooltip.visible_time < 0.8f) g_tooltip.dismiss_streak++;
+        g_tooltip.hover_id = 0;
+        g_tooltip.hover_time = 0.0f;
+        g_tooltip.visible_time = 0.0f;
+        g_tooltip.calm_time = 0.0f;
+    }
+
+    g_tooltip.visible = g_tooltip.requested && g_tooltip.hover_time >= tooltip_delay_seconds();
+    if (g_tooltip.visible) {
+        g_tooltip.visible_time += g_dt;
+        g_tooltip.calm_time += g_dt;
+        if (g_tooltip.calm_time >= 1.25f && g_tooltip.dismiss_streak > 0) {
+            g_tooltip.dismiss_streak--;
+            g_tooltip.calm_time = 0.0f;
+        }
+    }
+    g_tooltip.opacity = step_anim(g_tooltip.opacity, g_tooltip.visible ? 1.0f : 0.0f, g_dt, 10.0f);
+    g_tooltip.active = g_tooltip.opacity > 0.01f;
 }
 
 static bool filter_ascii_input_char(char c, InputFlags flags, char& out) {
@@ -851,8 +958,10 @@ static void apply_cmd_theme() {
 // ---- Public helpers (before platform split) -------------------------
 
 void set_quit_on_ctrl_q(bool e) { internal::g_shortcuts_enabled = e; }
-void set_style(const Style& s)  { internal::g_style = s; }
+void set_style(const Style& s)  { internal::g_style = s; internal::sync_native_window_chrome(); }
 const Style& get_style()         { return internal::g_style; }
+void set_window_icon(void* native_icon) { internal::apply_window_icon_handles(native_icon, native_icon, false, BuiltinIcon::Symbol); }
+void set_window_icon_builtin(BuiltinIcon variant) { internal::apply_window_icon_handles(nullptr, nullptr, true, variant); }
 DebugState&  debug()             { return internal::g_debug; }
 void set_next_width(float px) {
     internal::g_next_layout.active = true;
@@ -891,10 +1000,11 @@ float calc_text_height(const char* text, float wrap_width) {
 }
 void tooltip(const char* text) {
     if (!text || !text[0]) return;
-    if (!internal::g_ctx.last_item_hovered && !internal::g_ctx.last_item_focused) return;
-    internal::g_tooltip.active = true;
-    internal::g_tooltip.anchor = internal::g_ctx.last_item_rect;
-    internal::g_tooltip.text = text;
+    if (!internal::g_ctx.last_item_hovered) return;
+    internal::g_tooltip.requested = true;
+    internal::g_tooltip.request_id = internal::g_ctx.last_item_id;
+    internal::g_tooltip.request_anchor = internal::g_ctx.last_item_rect;
+    internal::g_tooltip.request_text = text;
 }
 
 // ============================================================
@@ -972,6 +1082,10 @@ static std::wstring utf8_to_wide(const char* u) {
 struct PlatformState {
     HWND hwnd = nullptr; HINSTANCE instance = nullptr;
     bool running = false; int width = 0, height = 0;
+    HICON icon_big = nullptr;
+    HICON icon_small = nullptr;
+    bool  icon_owned = false;
+    BuiltinIcon icon_variant = BuiltinIcon::Symbol;
 };
 struct RendererState {
     ID2D1Factory*           d2d_factory      = nullptr;
@@ -1026,6 +1140,38 @@ static void fill_rect(Rect r, Color c) {
     set_brush(c);
     D2D1_RECT_F rc = {r.x, r.y, r.x+r.w, r.y+r.h};
     g_renderer.target->FillRectangle(rc, g_renderer.brush);
+}
+static void fill_triangle(Rect r, int dir, Color c) {
+    r = apply_draw_rect(r);
+    ID2D1PathGeometry* tri = nullptr;
+    if (FAILED(g_renderer.d2d_factory->CreatePathGeometry(&tri)) || !tri) return;
+    ID2D1GeometrySink* sink = nullptr;
+    if (FAILED(tri->Open(&sink)) || !sink) { tri->Release(); return; }
+
+    D2D1_POINT_2F pts[3];
+    if (dir == 0) {
+        pts[0] = {r.x + r.w * 0.5f, r.y + r.h};
+        pts[1] = {r.x, r.y};
+        pts[2] = {r.x + r.w, r.y};
+    } else if (dir == 1) {
+        pts[0] = {r.x + r.w * 0.5f, r.y};
+        pts[1] = {r.x, r.y + r.h};
+        pts[2] = {r.x + r.w, r.y + r.h};
+    } else {
+        pts[0] = {r.x + r.w, r.y + r.h * 0.5f};
+        pts[1] = {r.x, r.y};
+        pts[2] = {r.x, r.y + r.h};
+    }
+    sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
+    sink->AddLine(pts[1]);
+    sink->AddLine(pts[2]);
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    sink->Close();
+    sink->Release();
+
+    set_brush(c);
+    g_renderer.target->FillGeometry(tri, g_renderer.brush);
+    tri->Release();
 }
 static void draw_line(float x0, float y0, float x1, float y1, float thick, Color c) {
     set_brush(c);
@@ -1128,8 +1274,37 @@ static void draw_previous_frame_overlay(Rect clip_r, float dx, float opacity) {
     g_renderer.target->PopAxisAlignedClip();
 }
 
+static void draw_previous_frame_blur_panel(Rect r, float opacity) {
+    if (!g_prev_frame_bitmap || opacity <= 0.001f) return;
+    r = apply_draw_rect(r);
+    D2D1_RECT_F dst = {r.x, r.y, r.x + r.w, r.y + r.h};
+    struct BlurSample { float ox, oy, weight; };
+    static const BlurSample samples[] = {
+        { 0.0f,  0.0f, 0.24f},
+        {-2.0f,  0.0f, 0.10f}, { 2.0f,  0.0f, 0.10f},
+        { 0.0f, -2.0f, 0.10f}, { 0.0f,  2.0f, 0.10f},
+        {-1.5f, -1.5f, 0.08f}, { 1.5f, -1.5f, 0.08f},
+        {-1.5f,  1.5f, 0.08f}, { 1.5f,  1.5f, 0.08f},
+        {-3.0f,  0.0f, 0.04f}, { 3.0f,  0.0f, 0.04f},
+        { 0.0f, -3.0f, 0.04f}, { 0.0f,  3.0f, 0.04f}
+    };
+    g_renderer.target->PushAxisAlignedClip(dst, D2D1_ANTIALIAS_MODE_ALIASED);
+    for (const BlurSample& s : samples) {
+        D2D1_RECT_F src = {
+            dst.left + s.ox,
+            dst.top + s.oy,
+            dst.right + s.ox,
+            dst.bottom + s.oy
+        };
+        g_renderer.target->DrawBitmap(g_prev_frame_bitmap, dst, opacity * s.weight,
+                                      D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, src);
+    }
+    g_renderer.target->PopAxisAlignedClip();
+}
+
 static void capture_frame_snapshot() {
-    if (!effects_enabled() || !g_platform.hwnd || !g_renderer.target || g_tab_content_owner != 0) return;
+    if (!effects_enabled() || !g_platform.hwnd || !g_renderer.target ||
+        g_tab_content_owner != 0 || g_dropdown_open_id != 0) return;
 
     RECT rc{};
     GetClientRect(g_platform.hwnd, &rc);
@@ -1223,7 +1398,21 @@ static bool create_text_format() {
     return true;
 }
 
-static HICON make_ftui_icon(int size) {
+static COLORREF to_colorref(Color c) {
+    int r = (int)(clampf(c.r, 0.0f, 1.0f) * 255.0f + 0.5f);
+    int g = (int)(clampf(c.g, 0.0f, 1.0f) * 255.0f + 0.5f);
+    int b = (int)(clampf(c.b, 0.0f, 1.0f) * 255.0f + 0.5f);
+    return RGB(r, g, b);
+}
+
+static void destroy_owned_icons() {
+    if (!g_platform.icon_owned) return;
+    if (g_platform.icon_big) { DestroyIcon(g_platform.icon_big); g_platform.icon_big = nullptr; }
+    if (g_platform.icon_small) { DestroyIcon(g_platform.icon_small); g_platform.icon_small = nullptr; }
+    g_platform.icon_owned = false;
+}
+
+static HICON make_ftui_icon(BuiltinIcon variant, int size) {
     if (!g_renderer.d2d_factory||!g_renderer.dwrite_factory) return nullptr;
     HDC screen_dc=GetDC(nullptr); HDC hdc=CreateCompatibleDC(screen_dc); ReleaseDC(nullptr,screen_dc);
     BITMAPV5HEADER bmi={}; bmi.bV5Size=sizeof(bmi); bmi.bV5Width=size; bmi.bV5Height=-size;
@@ -1238,8 +1427,9 @@ static HICON make_ftui_icon(int size) {
     RECT br={0,0,size,size}; dc_rt->BindDC(hdc,&br);
     ID2D1SolidColorBrush* ibr=nullptr; dc_rt->CreateSolidColorBrush(D2D1::ColorF(1,1,1,1),&ibr);
     float s=(float)size, margin=s*0.1114f, sw=fmaxf(1.f,s/56.f);
-    D2D1_COLOR_F orange={1.f,0.51f,0.f,1.f};
-    dc_rt->BeginDraw(); dc_rt->Clear(D2D1::ColorF(0,0,0,1));
+    D2D1_COLOR_F orange={1.f,130.f/255.f,0.f,1.f};
+    D2D1_COLOR_F black={0.f,0.f,0.f,1.f};
+    dc_rt->BeginDraw(); dc_rt->Clear(D2D1::ColorF(0,0,0,0));
     { ID2D1PathGeometry* tri=nullptr; g_renderer.d2d_factory->CreatePathGeometry(&tri);
       ID2D1GeometrySink* sink=nullptr; tri->Open(&sink);
       sink->BeginFigure({s*.5f,margin},D2D1_FIGURE_BEGIN_FILLED);
@@ -1247,13 +1437,80 @@ static HICON make_ftui_icon(int size) {
       sink->EndFigure(D2D1_FIGURE_END_CLOSED); sink->Close(); sink->Release();
       ibr->SetColor(D2D1::ColorF(1,1,1,1)); dc_rt->FillGeometry(tri,ibr); tri->Release(); }
     ibr->SetColor(orange); dc_rt->DrawLine({margin,margin},{s-margin,s-margin},ibr,sw*1.5f);
-    { D2D1_RECT_F brd={margin,margin,s-margin,s-margin}; dc_rt->DrawRectangle(brd,ibr,sw); }
+    { D2D1_RECT_F brd={margin,margin,s-margin,s-margin};
+      ibr->SetColor(black); dc_rt->DrawRectangle(brd,ibr,sw*1.35f);
+      ibr->SetColor(orange); dc_rt->DrawRectangle(brd,ibr,sw); }
+    if (variant == BuiltinIcon::SymbolWithText) {
+        IDWriteTextFormat* tf = nullptr;
+        IDWriteTextLayout* tl = nullptr;
+        float font_sz = size * 0.26f;
+        if (SUCCEEDED(g_renderer.dwrite_factory->CreateTextFormat(
+                L"Segoe UI Semibold", nullptr,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                font_sz, L"en-us", &tf)) && tf) {
+            tf->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (SUCCEEDED(g_renderer.dwrite_factory->CreateTextLayout(
+                    L"FTUI", 4, tf, s - margin * 2.0f, size * 0.22f, &tl)) && tl) {
+                D2D1_POINT_2F origin = {margin, s * 0.70f};
+                ibr->SetColor(orange);
+                dc_rt->DrawTextLayout(origin, tl, ibr, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                tl->Release();
+            }
+            tf->Release();
+        }
+    }
     dc_rt->EndDraw(); ibr->Release(); dc_rt->Release();
     int ms=((size+31)/32)*4; std::vector<BYTE> mb(ms*size,0);
     HBITMAP hbm_mask=CreateBitmap(size,size,1,1,mb.data());
     ICONINFO ii={TRUE,0,0,hbm_mask,hbm}; HICON icon=CreateIconIndirect(&ii);
     SelectObject(hdc,old); DeleteObject(hbm_mask); DeleteObject(hbm); DeleteDC(hdc);
     return icon;
+}
+
+static void apply_window_icon_handles(void* icon_big, void* icon_small, bool owned, BuiltinIcon variant) {
+    if (owned && !g_renderer.d2d_factory) {
+        g_platform.icon_owned = true;
+        g_platform.icon_variant = variant;
+        g_platform.icon_big = nullptr;
+        g_platform.icon_small = nullptr;
+        return;
+    }
+    if (owned) {
+        destroy_owned_icons();
+        g_platform.icon_big = (HICON)(icon_big ? icon_big : make_ftui_icon(variant, 256));
+        g_platform.icon_small = (HICON)(icon_small ? icon_small : make_ftui_icon(variant, 32));
+        g_platform.icon_owned = true;
+        g_platform.icon_variant = variant;
+    } else {
+        destroy_owned_icons();
+        g_platform.icon_big = (HICON)icon_big;
+        g_platform.icon_small = (HICON)(icon_small ? icon_small : icon_big);
+        g_platform.icon_owned = false;
+    }
+    if (g_platform.hwnd) {
+        SendMessageW(g_platform.hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_platform.icon_big);
+        SendMessageW(g_platform.hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_platform.icon_small);
+    }
+}
+
+static void sync_native_window_chrome() {
+    if (!g_platform.hwnd) return;
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (!dwm) return;
+    using DwmSetWindowAttributeFn = HRESULT (WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    auto fn = (DwmSetWindowAttributeFn)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    if (!fn) { FreeLibrary(dwm); return; }
+
+    BOOL dark = TRUE;
+    COLORREF caption = to_colorref(lerp_color(g_style.panel, g_style.background, 0.15f));
+    COLORREF text = RGB(255, 255, 255);
+    COLORREF border = to_colorref(g_style.border);
+    fn(g_platform.hwnd, 20, &dark, sizeof(dark));
+    fn(g_platform.hwnd, 35, &border, sizeof(border));
+    fn(g_platform.hwnd, 36, &caption, sizeof(caption));
+    fn(g_platform.hwnd, 37, &text, sizeof(text));
+    FreeLibrary(dwm);
 }
 
 static void release_render_target() {
@@ -1400,10 +1657,12 @@ bool create_window(const Config& cfg) {
         if(cfg.center_window){nx=(GetSystemMetrics(SM_CXSCREEN)-nw)/2;ny=(GetSystemMetrics(SM_CYSCREEN)-nh)/2;}
         SetWindowPos(g_platform.hwnd,nullptr,nx,ny,nw,nh,SWP_NOZORDER|SWP_NOACTIVATE);
     }
-    HICON ico=cfg.icon?(HICON)cfg.icon:make_ftui_icon(256);
-    HICON ico_sm=cfg.icon?(HICON)cfg.icon:make_ftui_icon(32);
-    SendMessageW(g_platform.hwnd,WM_SETICON,ICON_BIG,(LPARAM)ico);
-    SendMessageW(g_platform.hwnd,WM_SETICON,ICON_SMALL,(LPARAM)ico_sm);
+    if (cfg.icon) apply_window_icon_handles(cfg.icon, cfg.icon, false, g_platform.icon_variant);
+    else if (!g_platform.icon_owned && (g_platform.icon_big || g_platform.icon_small))
+        apply_window_icon_handles(g_platform.icon_big, g_platform.icon_small, false, g_platform.icon_variant);
+    else
+        apply_window_icon_handles(nullptr, nullptr, true, g_platform.icon_variant);
+    sync_native_window_chrome();
     ShowWindow(g_platform.hwnd,SW_SHOW); UpdateWindow(g_platform.hwnd);
     QueryPerformanceFrequency(&g_freq); QueryPerformanceCounter(&g_last_time);
     return true;
@@ -1429,7 +1688,7 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
-    g_tooltip.active = false;
+    begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
     if((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()){
@@ -1550,6 +1809,7 @@ void end() {
         Rect r={g_style.window_padding,oy,200,lh};
         fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
     }
+    finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
     draw_tooltip_overlay();
     HRESULT hr=g_renderer.target->EndDraw(); g_drawing=false;
@@ -1565,6 +1825,7 @@ void shutdown() {
     if(g_renderer.text_format)   {g_renderer.text_format->Release();   g_renderer.text_format=nullptr;}
     if(g_renderer.dwrite_factory){g_renderer.dwrite_factory->Release();g_renderer.dwrite_factory=nullptr;}
     if(g_renderer.d2d_factory)   {g_renderer.d2d_factory->Release();   g_renderer.d2d_factory=nullptr;}
+    destroy_owned_icons();
     if(g_platform.hwnd)          {DestroyWindow(g_platform.hwnd);      g_platform.hwnd=nullptr;}
     if(g_renderer.com_inited)    {CoUninitialize();g_renderer.com_inited=false;}
 }
@@ -1657,6 +1918,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         g_platform.width=cfg.width; g_platform.height=cfg.height; g_platform.running=true;
         if(create_render_target()&&create_text_format()){
             QueryPerformanceFrequency(&g_freq); QueryPerformanceCounter(&g_last_time);
+            if (cfg.icon) apply_window_icon_handles(cfg.icon, cfg.icon, false, s.p.icon_variant);
+            else if (!s.p.icon_owned && (s.p.icon_big || s.p.icon_small))
+                apply_window_icon_handles(s.p.icon_big, s.p.icon_small, false, s.p.icon_variant);
+            else
+                apply_window_icon_handles(nullptr, nullptr, true, s.p.icon_variant);
+            sync_native_window_chrome();
             ShowWindow(g_platform.hwnd,SW_SHOW); UpdateWindow(g_platform.hwnd);
             while(pump()){begin();fn();end();}
         }
@@ -1665,6 +1932,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         g_renderer.d2d_factory=nullptr; g_renderer.dwrite_factory=nullptr; g_renderer.wic_factory=nullptr;
         if(g_platform.hwnd){DestroyWindow(g_platform.hwnd);g_platform.hwnd=nullptr;}
     }
+    destroy_owned_icons();
     g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_debug=s.dbg;
     g_scroll_y=s.sc;g_scroll_target_y=s.sct;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
     g_cmd=s.cmd;g_fps=s.fps;g_fps_accum=s.fpsa;g_fps_frames=s.fpsf;g_last_time=s.lt;
@@ -1786,6 +2054,8 @@ static void dbg(const char* fmt, ...) {
 }
 
 static void set_color(Color c) { cairo_set_source_rgba(g_renderer.cr,c.r,c.g,c.b,c.a); }
+static void sync_native_window_chrome() {}
+static void apply_window_icon_handles(void*, void*, bool, BuiltinIcon) {}
 
 static void rrect_path(cairo_t* cr, float x, float y, float w, float h, float r) {
     if (r <= 0.0f || w <= 0.0f || h <= 0.0f) { cairo_rectangle(cr,x,y,w,h); return; }
@@ -1808,6 +2078,25 @@ static void stroke_round_rect(Rect r, float rad, float thick, Color c) {
 }
 static void fill_rect(Rect r, Color c) {
     set_color(c); cairo_rectangle(g_renderer.cr,r.x,r.y,r.w,r.h); cairo_fill(g_renderer.cr);
+}
+static void fill_triangle(Rect r, int dir, Color c) {
+    set_color(c);
+    cairo_new_path(g_renderer.cr);
+    if (dir == 0) {
+        cairo_move_to(g_renderer.cr, r.x + r.w * 0.5f, r.y + r.h);
+        cairo_line_to(g_renderer.cr, r.x, r.y);
+        cairo_line_to(g_renderer.cr, r.x + r.w, r.y);
+    } else if (dir == 1) {
+        cairo_move_to(g_renderer.cr, r.x + r.w * 0.5f, r.y);
+        cairo_line_to(g_renderer.cr, r.x, r.y + r.h);
+        cairo_line_to(g_renderer.cr, r.x + r.w, r.y + r.h);
+    } else {
+        cairo_move_to(g_renderer.cr, r.x + r.w, r.y + r.h * 0.5f);
+        cairo_line_to(g_renderer.cr, r.x, r.y);
+        cairo_line_to(g_renderer.cr, r.x, r.y + r.h);
+    }
+    cairo_close_path(g_renderer.cr);
+    cairo_fill(g_renderer.cr);
 }
 static void draw_line(float x0, float y0, float x1, float y1, float thick, Color c) {
     set_color(c); cairo_set_line_width(g_renderer.cr,thick);
@@ -2145,7 +2434,7 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
-    g_tooltip.active = false;
+    begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
     if ((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()) {
@@ -2229,6 +2518,7 @@ void end() {
         Rect r={g_style.window_padding,oy,200,lh};
         fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
     }
+    finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
     draw_tooltip_overlay();
     g_drawing=false;
@@ -2490,8 +2780,8 @@ bool input(const char* label, char* buffer, int buffer_size,
 
     register_focusable(id);
 
-    Rect r = next_rect(g_style.item_height);
-    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect r = {}, outer = next_labeled_rect(vis, g_style.item_height, &r);
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
 
@@ -2646,7 +2936,9 @@ bool input(const char* label, char* buffer, int buffer_size,
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
 
     float pad = 8.0f;
-    Rect inner = {r.x + pad, r.y, r.w - pad * 2 - 80.0f, r.h};
+    float inner_w = r.w - pad * 2.0f - 4.0f;
+    if (inner_w < 4.0f) inner_w = 4.0f;
+    Rect inner = {r.x + pad, r.y, inner_w, r.h};
 
     // Build display string
     int len = (int)strlen(buffer);
@@ -2690,12 +2982,9 @@ bool input(const char* label, char* buffer, int buffer_size,
 
     pop_clip();
 
-    // Label
-    Rect lbl_r = {r.x + r.w - 78.0f, r.y, 76.0f, r.h};
-    draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f)));
-
-    mark_last_item(id, r, raw_hov, focused);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,0,1,0.4f});
+    draw_widget_label(vis, outer, focused);
+    mark_last_item(id, outer, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0,0,1,0.4f});
     return changed;
 }
 
@@ -2714,8 +3003,8 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
 
     float lh = text_line_height();
     float widget_h = rows * lh + 8.0f;
-    Rect r = next_rect(widget_h);
-    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect r = {}, outer = next_labeled_rect(vis, widget_h, &r);
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
 
@@ -2968,14 +3257,10 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
         fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
     }
 
-    if (vis[0]) {
-        float lbl_w = 80.0f;
-        Rect lbl_r = {r.x + r.w + 4.0f, r.y, lbl_w, g_style.item_height};
-        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.focus * 0.4f)));
-    }
+    draw_widget_label(vis, outer, focused);
 
-    mark_last_item(id, r, raw_hov, focused);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,0,1,0.4f});
+    mark_last_item(id, outer, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0,0,1,0.4f});
     return changed;
 }
 
@@ -2993,8 +3278,8 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
 
     float lh = text_line_height();
     float widget_h = rows * lh + 8.0f;
-    Rect r = next_rect(widget_h);
-    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect r = {}, outer = next_labeled_rect(vis, widget_h, &r);
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
     bool focused = is_widget_focused(id);
@@ -3102,14 +3387,10 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
         fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
     }
 
-    if (vis[0]) {
-        float lbl_w = 80.0f;
-        Rect lbl_r = {r.x + r.w + 4, r.y, lbl_w, g_style.item_height};
-        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, focused ? 0.4f : 0.0f)));
-    }
+    draw_widget_label(vis, outer, focused);
 
-    mark_last_item(id, r, raw_hov, focused);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.3f,0.7f,1,0.4f});
+    mark_last_item(id, outer, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.3f,0.7f,1,0.4f});
 }
 
 bool checkbox(const char* label, bool* value) {
@@ -3179,10 +3460,10 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     register_focusable(id);
 
     if (max_v < min_v) { float tmp = min_v; min_v = max_v; max_v = tmp; }
-    Rect r = next_rect(g_style.item_height);
-    float lbl_w = 90.0f;
-    Rect track_r = {r.x, r.y + r.h * 0.5f - 3.0f, r.w - lbl_w, 6.0f};
-    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect r = {}, outer = next_labeled_rect(vis, g_style.item_height, &r);
+    float value_w = 80.0f;
+    Rect track_r = {r.x, r.y + r.h * 0.5f - 3.0f, r.w - value_w, 6.0f};
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
     bool focused = is_widget_focused(id);
@@ -3238,13 +3519,14 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     draw_widget_chrome(knob, knob_sz * 0.5f, maybe_disabled(knob_col), maybe_disabled(g_style.input_focus),
                        motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
-    char val_str[96];
-    snprintf(val_str, sizeof(val_str), "%s  %.2f", vis, *value);
-    Rect lbl_r2 = {r.x + r.w - lbl_w + 4.0f, r.y, lbl_w - 4.0f, r.h};
-    draw_text_utf8(val_str, lbl_r2, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.hover * 0.30f + (focused ? 0.35f : 0.0f))));
+    char val_str[48];
+    snprintf(val_str, sizeof(val_str), "%.2f", *value);
+    Rect val_r = {r.x + r.w - value_w + 8.0f, r.y, value_w - 8.0f, r.h};
+    draw_text_utf8(val_str, val_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.hover * 0.30f + (focused ? 0.35f : 0.0f))));
+    draw_widget_label(vis, outer, focused);
 
-    mark_last_item(id, r, raw_hov, focused);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,1,0,0.4f});
+    mark_last_item(id, outer, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {1,1,0,0.4f});
     return changed;
 }
 
@@ -3414,14 +3696,15 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         if (*selected >= count) *selected = count - 1;
     }
 
-    Rect r = next_rect(g_style.item_height);
-    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect r = {}, outer = next_labeled_rect(vis, g_style.item_height, &r);
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
     bool focused = is_widget_focused(id);
     bool changed = false;
     bool open = (g_dropdown_open_id == id);
     ScrollSlot& slot = scroll_slot_for(id ^ 0x330011);
+    CollapseSlot& popup_fx = collapse_slot_for(id ^ 0x330177);
 
     if (hov && g_input.mouse_pressed) {
         set_widget_focus(id, false);
@@ -3445,14 +3728,13 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
 
     float item_h = g_style.item_height - 4.0f;
     int visible_count = popup_rows < count ? popup_rows : count;
-    float popup_h = visible_count > 0 ? visible_count * item_h + 8.0f : item_h + 8.0f;
-    Rect popup_r = {r.x, r.y + r.h + 4.0f, r.w, popup_h};
-    bool popup_hov = open && rect_contains(popup_r, g_input.mouse_x, g_input.mouse_y);
-
-    if (open && g_input.mouse_pressed && !raw_hov && !popup_hov) {
-        g_dropdown_open_id = 0;
-        open = false;
-    }
+    float full_popup_h = visible_count > 0 ? visible_count * item_h + 8.0f : item_h + 8.0f;
+    float space_below = g_ctx.content_region.y + g_ctx.content_region.h - (r.y + r.h) - 4.0f;
+    float space_above = r.y - g_ctx.content_region.y - 4.0f;
+    bool open_up = full_popup_h > space_below && space_above > space_below;
+    float max_popup_h = open_up ? space_above : space_below;
+    if (max_popup_h < item_h + 8.0f) max_popup_h = item_h + 8.0f;
+    float popup_h = full_popup_h < max_popup_h ? full_popup_h : max_popup_h;
 
     if (open && focused && count > 0) {
         if (g_input.key_up) {
@@ -3465,6 +3747,21 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         }
     }
 
+    if (effects_enabled()) popup_fx.progress = step_anim(popup_fx.progress, open ? 1.0f : 0.0f, g_dt, 18.0f);
+    else popup_fx.progress = open ? 1.0f : 0.0f;
+    float popup_p = ease_smooth(popup_fx.progress);
+    bool popup_visible = open || popup_fx.progress > 0.01f;
+    float popup_anim_h = popup_h * popup_p;
+    Rect popup_r = open_up
+        ? Rect{r.x, r.y - 4.0f - popup_anim_h, r.w, popup_anim_h}
+        : Rect{r.x, r.y + r.h + 4.0f, r.w, popup_anim_h};
+    bool popup_hov = popup_visible && rect_contains(popup_r, g_input.mouse_x, g_input.mouse_y);
+
+    if (open && g_input.mouse_pressed && !raw_hov && !popup_hov) {
+        g_dropdown_open_id = 0;
+        open = false;
+    }
+
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov || popup_hov, enabled && g_ctx.active_id == id, focused);
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (open ? 0.10f : 0.0f));
@@ -3475,13 +3772,13 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
     const char* current = (count > 0 && selected) ? items[*selected] : "(empty)";
     Rect text_r = {r.x + 10.0f, r.y, r.w - 34.0f, r.h};
     draw_text_utf8(current ? current : "", text_r, maybe_disabled(g_style.text));
-    Rect arrow_r = {r.x + r.w - 24.0f, r.y, 20.0f, r.h};
-    draw_text_utf8_centered(open ? "^" : "v", arrow_r, maybe_disabled(g_style.text_dim));
+    Rect arrow_r = {r.x + r.w - 22.0f, r.y + (r.h - 8.0f) * 0.5f, 10.0f, 8.0f};
+    fill_triangle(arrow_r, (open && open_up) ? 1 : 0, maybe_disabled(g_style.text_dim));
 
-    if (open) {
+    if (popup_visible && popup_anim_h > 8.0f) {
         float max_scroll = count * item_h - (popup_h - 8.0f);
         if (max_scroll < 0.0f) max_scroll = 0.0f;
-        if (popup_hov && g_input.wheel_y != 0.0f) {
+        if (open && popup_hov && g_input.wheel_y != 0.0f) {
             slot.target -= g_input.wheel_y;
             slot.target = clampf(slot.target, 0.0f, max_scroll);
             g_input.wheel_y = 0.0f;
@@ -3490,13 +3787,24 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         else slot.current = slot.target;
         slot.current = clampf(slot.current, 0.0f, max_scroll);
 
-        draw_widget_chrome(popup_r, g_style.rounding, maybe_disabled(g_style.panel), maybe_disabled(g_style.border), 0.0f, 0.0f, 0.0f);
+        Color popup_fill = g_style.panel;
+        Color popup_border = g_style.border;
+#if FTUI_WINDOWS_EFFECTS
+        if (effects_enabled()) {
+            draw_previous_frame_blur_panel(popup_r, 0.95f * popup_p);
+            popup_fill = lerp_color(g_style.panel, g_style.background, 0.18f);
+            popup_fill.a = 0.74f;
+            popup_border = lerp_color(g_style.border, g_style.input_focus, 0.14f);
+            popup_border.a = 0.92f;
+        }
+#endif
+        draw_widget_chrome(popup_r, g_style.rounding, maybe_disabled(popup_fill), maybe_disabled(popup_border), 0.0f, 0.0f, 0.0f);
         Rect clip_r = {popup_r.x + 2.0f, popup_r.y + 2.0f, popup_r.w - 4.0f, popup_r.h - 4.0f};
         push_clip(clip_r);
         for (int i = 0; i < count; ++i) {
             Rect ir = {popup_r.x + 4.0f, popup_r.y + 4.0f - slot.current + i * item_h, popup_r.w - 8.0f, item_h};
             if (ir.y + ir.h < popup_r.y || ir.y > popup_r.y + popup_r.h) continue;
-            bool item_hov = rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
+            bool item_hov = open && rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
             if (item_hov && g_input.mouse_pressed && enabled) {
                 if (selected && *selected != i) changed = true;
                 if (selected) *selected = i;
@@ -3518,7 +3826,7 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
             float thumb_h = (visible_h / (count * item_h)) * visible_h;
             if (thumb_h < 12.0f) thumb_h = 12.0f;
             float thumb_y = popup_r.y + 4.0f + (slot.current / max_scroll) * (visible_h - thumb_h);
-            Rect track_r = {popup_r.x + popup_r.w - 8.0f, popup_r.y + 4.0f, 4.0f, visible_h};
+            Rect track_r = {popup_r.x + popup_r.w - 8.0f, popup_r.y + 4.0f, 4.0f, popup_r.h - 8.0f};
             Rect thumb_r = {track_r.x, thumb_y, track_r.w, thumb_h};
             Color track_c = g_style.border; track_c.a = 0.3f;
             fill_round_rect(track_r, 2.0f, maybe_disabled(track_c));
@@ -3526,13 +3834,9 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         }
     }
 
-    if (vis[0]) {
-        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, r.h};
-        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, focused ? 0.35f : 0.0f)));
-    }
-
-    mark_last_item(id, open ? popup_r : r, raw_hov || popup_hov, focused);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.2f,0.8f,0.8f,0.4f});
+    draw_widget_label(vis, outer, focused);
+    mark_last_item(id, outer, raw_hov || popup_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.2f,0.8f,0.8f,0.4f});
     return changed;
 }
 
@@ -3551,8 +3855,8 @@ bool listbox(const char* label, const char* const* items, int count, int* select
     }
 
     float item_h = g_style.item_height - 4.0f;
-    Rect r = next_rect(visible_rows * item_h + 8.0f);
-    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect r = {}, outer = next_labeled_rect(vis, visible_rows * item_h + 8.0f, &r);
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
     bool focused = is_widget_focused(id);
@@ -3634,13 +3938,10 @@ bool listbox(const char* label, const char* const* items, int count, int* select
         fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
     }
 
-    if (vis[0]) {
-        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, g_style.item_height};
-        draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, focused ? 0.35f : 0.0f)));
-    }
+    draw_widget_label(vis, outer, focused);
 
-    mark_last_item(id, r, raw_hov, focused);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.0f,0.9f,0.5f,0.4f});
+    mark_last_item(id, outer, raw_hov, focused);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.0f,0.9f,0.5f,0.4f});
     return changed;
 }
 
@@ -3657,7 +3958,7 @@ bool radio_group(const char* label, const char* const* items, int count, int* se
     int rows = (count + columns - 1) / columns;
     float gap = g_style.item_spacing;
     float item_h = g_style.item_height;
-    Rect r = next_rect(rows * item_h + gap * (rows - 1));
+    Rect r = {}, outer = next_labeled_rect(vis, rows * item_h + gap * (rows - 1), &r);
     float cell_w = (r.w - gap * (columns - 1)) / columns;
     bool enabled = widget_interaction_enabled();
     bool changed = false;
@@ -3732,13 +4033,10 @@ bool radio_group(const char* label, const char* const* items, int count, int* se
         draw_text_utf8(items[i] ? items[i] : "", tr, maybe_disabled(sel ? g_style.text : g_style.text_dim));
     }
 
-    if (vis[0]) {
-        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, g_style.item_height};
-        draw_text_utf8(vis, lbl_r, maybe_disabled(g_style.text_dim));
-    }
+    draw_widget_label(vis, outer, false);
 
-    mark_last_item(last_id, last_rect, last_hov, last_focus);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.7f,0.5f,0.1f,0.4f});
+    mark_last_item(last_id, outer, last_hov, last_focus);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.7f,0.5f,0.1f,0.4f});
     return changed;
 }
 
@@ -3771,6 +4069,8 @@ bool collapsing_header(const char* label, bool* open) {
 
     if (open) *open = state;
     else slot.open = state;
+    if (effects_enabled()) slot.progress = step_anim(slot.progress, state ? 1.0f : 0.0f, g_dt, 18.0f);
+    else slot.progress = state ? 1.0f : 0.0f;
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || state);
@@ -3779,8 +4079,8 @@ bool collapsing_header(const char* label, bool* open) {
     Color border = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.55f : 0.0f) + (state ? 0.16f : 0.0f));
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
-    Rect arrow_r = {r.x + 10.0f, r.y, 18.0f, r.h};
-    draw_text_utf8_centered(state ? "v" : ">", arrow_r, maybe_disabled(g_style.text_dim));
+    Rect arrow_r = {r.x + 10.0f, r.y + (r.h - 10.0f) * 0.5f, 10.0f, 10.0f};
+    fill_triangle(arrow_r, slot.progress > 0.5f ? 0 : 2, maybe_disabled(g_style.text_dim));
     Rect text_r = {r.x + 28.0f, r.y, r.w - 32.0f, r.h};
     draw_text_utf8(vis, text_r, maybe_disabled(g_style.text));
 
@@ -3796,8 +4096,8 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
     int id = hash_str(hs);
     ScrollSlot& slot = scroll_slot_for(id ^ 0x442211);
 
-    Rect r = next_rect(height);
-    bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
+    Rect r = {}, outer = next_labeled_rect(vis, height, &r);
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
 
@@ -3874,13 +4174,10 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
         fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(slot.dragging ? g_style.input_focus : g_style.text_dim));
     }
 
-    if (vis[0]) {
-        Rect lbl_r = {r.x + r.w + 4.0f, r.y, 80.0f, g_style.item_height};
-        draw_text_utf8(vis, lbl_r, maybe_disabled(g_style.text_dim));
-    }
+    draw_widget_label(vis, outer, false);
 
-    mark_last_item(id, r, raw_hov, false);
-    if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.3f,1.0f,0.4f,0.4f});
+    mark_last_item(id, outer, raw_hov, false);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.3f,1.0f,0.4f,0.4f});
 }
 
 bool modal(const char* label, std::function<void()> fn) {

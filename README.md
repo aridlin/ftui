@@ -83,15 +83,13 @@ FTUI 1.x treats the common surface as additive-first.
 - Existing calls like `input()`, `text_area()`, `tabs()`, `row(int, ...)`, and `open_child_window()` remain valid.
 - New capability is added through new helpers, new widgets, and additive flags rather than changing the shape of existing calls.
 
-This repo also includes a small compile-only API lock file at `api_lock.cpp` to help catch accidental signature drift.
-
 ## Themes
 
 New windows start with the style configured near the top of `ftui.hpp`:
 
 ```cpp
 #ifndef FTUI_DEFAULT_STYLE
-#define FTUI_DEFAULT_STYLE ftui::nord_style
+#define FTUI_DEFAULT_STYLE ftui::one_dark_style
 #endif
 ```
 
@@ -103,6 +101,23 @@ ftui::set_style(ftui::catppuccin_mocha_style());
 ftui::set_style(ftui::nord_style());
 ftui::set_style(ftui::gruvbox_dark_style());
 ftui::set_style(ftui::one_dark_style());
+```
+
+## Window chrome and icons
+
+On Windows, the titlebar color follows the active FTUI theme automatically.
+
+Use the built-in icon variants:
+
+```cpp
+ftui::set_window_icon_builtin(ftui::BuiltinIcon::Symbol);
+ftui::set_window_icon_builtin(ftui::BuiltinIcon::SymbolWithText);
+```
+
+Or pass a native icon handle directly on Windows:
+
+```cpp
+ftui::set_window_icon(native_hicon);
 ```
 
 ## Core widgets
@@ -320,8 +335,10 @@ Tooltips:
 
 ```cpp
 ftui::button("Hover me");
-ftui::tooltip("Shown on hover or keyboard focus.");
+ftui::tooltip("Shown after a short steady hover.");
 ```
+
+Tooltips fade in and out, wait for a steady cursor hover, and back off more aggressively if the user repeatedly moves away right after they appear.
 
 Request focus:
 

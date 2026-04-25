@@ -66,6 +66,9 @@ int main() {
     static const char* theme_names[] = {
         "Default Dark", "Catppuccin Mocha", "Nord", "Gruvbox Dark", "One Dark"
     };
+    static const char* icon_names[] = {
+        "Symbol", "Symbol + text"
+    };
     static ftui::Style (*theme_fns[])() = {
         ftui::default_dark_style,
         ftui::catppuccin_mocha_style,
@@ -78,6 +81,7 @@ int main() {
     int profile_sel = 0;
     int shell_sel = 0;
     int theme_idx = 0;
+    int icon_idx = 0;
     for (int i = 0; i < 5; ++i) {
         if (theme_fns[i] == FTUI_DEFAULT_STYLE) {
             theme_idx = i;
@@ -101,7 +105,7 @@ int main() {
         "Operator role promoted to maintainer.",
         "Theme changed at runtime without restart.",
         "Scroll container preserved wheel ownership.",
-        "Tooltip text only appears on hover or focus.",
+        "Tooltip text now waits for a steady hover.",
         "Modal blocked background interaction correctly."
     };
 
@@ -127,14 +131,18 @@ int main() {
 
                 ftui::input("Port", port, sizeof(port), ftui::InputFlags::CharsDecimal);
                 ftui::tooltip("This field uses decimal-only filtering.");
+            });
 
+            ftui::row({2.0f, 1.0f}, [&]() {
                 ftui::input("Password", password, sizeof(password), ftui::InputFlags::Password);
                 ftui::tooltip("Password masking still uses the same input widget.");
 
                 ftui::input("Access code", access_code, sizeof(access_code),
                             ftui::InputFlags::CharsUppercase | ftui::InputFlags::CharsNoBlank);
                 ftui::tooltip("Uppercase plus no-blank filtering is additive.");
+            });
 
+            ftui::row(2, [&]() {
                 if (ftui::button("Sign in")) {
                     click_count++;
                     append_line(logs, sizeof(logs), "[Workspace] Sign in requested.");
@@ -144,7 +152,9 @@ int main() {
                 if (ftui::button("Focus username")) {
                     ftui::request_focus("Username");
                 }
+            });
 
+            ftui::row({1.3f, 1.0f}, [&]() {
                 ftui::listbox("Profile", profile_items, 4, &profile_sel, 4);
                 ftui::tooltip("Listboxes are explicit always-visible pickers.");
 
@@ -265,6 +275,13 @@ int main() {
             append_line(logs, sizeof(logs), "[Settings] Theme changed.");
         }
         ftui::tooltip("Dropdowns are opt-in single-call pickers.");
+
+        if (ftui::dropdown("Window icon", icon_names, 2, &icon_idx, 2)) {
+            ftui::set_window_icon_builtin(icon_idx == 0
+                ? ftui::BuiltinIcon::Symbol
+                : ftui::BuiltinIcon::SymbolWithText);
+            append_line(logs, sizeof(logs), "[Settings] Window icon changed.");
+        }
 
         bool modal_open = ftui::modal("Reset confirmation", [&]() {
             ftui::text_wrapped("This lightweight modal blocks background widgets until you close it. It is still immediate mode: just call ftui::modal() and draw inside it.");
