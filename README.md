@@ -1,6 +1,6 @@
 # FTUI
 
-Tiny immediate-mode GUI for Windows. Single header, no CMake, no dependencies beyond the Win32 SDK.
+Tiny immediate-mode GUI for Windows. Single header, no CMake, no dependencies beyond the Win32 SDK.[^linux]
 
 ```cpp
 #define FTUI_IMPLEMENTATION
@@ -30,7 +30,7 @@ int main() {
 ## Compile
 
 ```bash
-clang++ main.cpp -o app.exe -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -std=c++17
+clang++ main.cpp -o app.exe -std=c++17 -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -lwindowscodecs
 ```
 
 With MSVC the `#pragma comment(lib, ...)` lines inside the header handle linking automatically.
@@ -39,7 +39,7 @@ With MSVC the `#pragma comment(lib, ...)` lines inside the header handle linking
 
 ## Distribution
 
-Copy `ftui.hpp` into your project. In **exactly one** `.cpp` file:
+Copy `ftui.hpp` into your project. In exactly one `.cpp` file:
 
 ```cpp
 #define FTUI_IMPLEMENTATION
@@ -54,17 +54,17 @@ All other files just `#include "ftui.hpp"` without the define.
 
 ```cpp
 ftui::Config cfg;
-cfg.title         = L"My App";
+cfg.title         = "My App";
 cfg.width         = 960;
 cfg.height        = 640;
 cfg.resizable     = true;
 cfg.center_window = true;
 cfg.icon          = nullptr; // HICON, or nullptr for the built-in FTUI logo
 
-ftui::create_window(cfg);   // create Win32 window + Direct2D + DirectWrite + COM
+ftui::create_window(cfg);   // create platform window + renderer resources
 ftui::pump();               // process messages, returns false when closed
-ftui::begin();              // start frame — resets layout cursor, clears background
-ftui::end();                // finish frame — present to screen
+ftui::begin();              // start frame - resets layout cursor, clears background
+ftui::end();                // finish frame - present to screen
 ftui::shutdown();           // release all resources
 ```
 
@@ -83,8 +83,8 @@ ftui::text("Hello, world!");
 ### Separator and spacing
 
 ```cpp
-ftui::separator();          // thin horizontal rule
-ftui::spacing(16.0f);       // blank vertical gap (default 8px)
+ftui::separator();    // thin horizontal rule
+ftui::spacing(16.0f); // blank vertical gap (default 8px)
 ```
 
 ### Button
@@ -102,25 +102,54 @@ ftui::button("Open##file_open");
 ftui::button("Open##folder_open");
 ```
 
-### Text input
+### Text boxes
 
 ```cpp
-char buf[128] = "";
-if (ftui::input("Label", buf, sizeof(buf))) {
+char user[128] = "";
+if (ftui::input("Username", user, sizeof(user))) {
     // contents changed this frame
 }
 
-// With flags
+char pw[128] = "";
 ftui::input("Password", pw, sizeof(pw), ftui::InputFlags::Password);
-ftui::input("Read only", buf, sizeof(buf), ftui::InputFlags::ReadOnly);
+ftui::input("Read only", user, sizeof(user), ftui::InputFlags::ReadOnly);
 
-// Enter to submit
 bool submitted = false;
-ftui::input("Search", query, sizeof(query), ftui::InputFlags::None, &submitted);
+char query[128] = "";
+ftui::input("Search", query, sizeof(query), ftui::InputFlags::Default, &submitted);
 if (ftui::button("Go") || submitted) { /* run search */ }
 ```
 
-**Tab / Shift+Tab** cycle focus between all visible inputs without touching the mouse. Clicking focuses a field. Backspace removes the last character.
+For a multi-line text box:
+
+```cpp
+char notes[512] = "";
+ftui::text_area("Notes##notes", notes, sizeof(notes), 6);
+```
+
+`Tab` / `Shift+Tab` cycle focus between visible text boxes without touching the mouse. In `text_area()`, `Enter` inserts a newline and `Ctrl+C` / `Ctrl+V` copy and paste selected text.
+
+### Tabs
+
+```cpp
+static const char* sections[] = { "Login", "Notes", "Settings" };
+int selected_tab = 0;
+
+if (ftui::tabs(sections, 3, &selected_tab)) {
+    // selected tab changed
+}
+
+if (selected_tab == 0) {
+    ftui::input("Username", user, sizeof(user));
+    ftui::input("Password", pw, sizeof(pw), ftui::InputFlags::Password);
+} else if (selected_tab == 1) {
+    ftui::text_area("Notes##notes", notes, sizeof(notes), 6);
+} else {
+    ftui::text("Settings page");
+}
+```
+
+Tabs render a horizontal tab bar and update `selected_tab` in place.
 
 ### Checkbox
 
@@ -170,17 +199,17 @@ Passing `nullptr` renders a placeholder box. Images are centered horizontally.
 
 ```cpp
 static const ftui::FileFilter filters[] = {
-    { L"Images", L"*.png;*.jpg;*.bmp" },
-    { L"All Files", L"*.*" },
+    { "Images", "*.png;*.jpg;*.bmp" },
+    { "All Files", "*.*" },
 };
 
-std::string path = ftui::open_file_dialog(L"Open Image", filters, 2);
+std::string path = ftui::open_file_dialog("Open Image", filters, 2);
 if (!path.empty()) {
     // path is a UTF-8 absolute file path
 }
 ```
 
-The dialog is modal and blocks the frame loop while open (Windows handles the inner message loop).
+The dialog is modal and blocks the frame loop while open. On Linux it uses `zenity` when available.[^linux]
 
 ---
 
@@ -196,13 +225,13 @@ ftui::set_style(ftui::gruvbox_dark_style());     // Gruvbox Dark
 ftui::set_style(ftui::one_dark_style());         // One Dark (Atom)
 ```
 
-Call `set_style()` at any time — takes effect from the next `begin()`.
+Call `set_style()` at any time - it takes effect from the next `begin()`.
 
 ### Custom theme
 
 ```cpp
 ftui::Style s = ftui::default_dark_style(); // start from a preset
-s.input_focus = {0.8f, 0.3f, 0.2f, 1.0f}; // override accent color
+s.input_focus = {0.8f, 0.3f, 0.2f, 1.0f};   // override accent color
 s.rounding    = 4.0f;
 ftui::set_style(s);
 ```
@@ -242,7 +271,7 @@ ftui::debug().log_widget_calls  = true; // log to OutputDebugString (DebugView)
 
 ## Console window
 
-By default FTUI suppresses the console window via a linker pragma. To keep it (e.g. during development):
+By default FTUI suppresses the console window via a linker pragma. To keep it (for example, during development):
 
 ```cpp
 #define FTUI_KEEP_CONSOLE
@@ -256,10 +285,10 @@ By default FTUI suppresses the console window via a linker pragma. To keep it (e
 
 | Key | Action |
 |---|---|
-| **Tab** | Focus next input field |
-| **Shift+Tab** | Focus previous input field |
-| **Enter** | Signals `enter_pressed` in the focused input |
-| **Backspace** | Deletes last character in focused input |
+| **Tab** | Focus next text box |
+| **Shift+Tab** | Focus previous text box |
+| **Enter** | Signals `enter_pressed` in the focused single-line input; inserts a newline in `text_area()` |
+| **Backspace** | Deletes the previous character in the focused text box |
 | **Ctrl+Q** | Quit |
 | **:** | Enter command mode (only when no input field is focused) |
 | **Escape** | Cancel command mode |
@@ -277,10 +306,10 @@ Press `:` when no input is focused to open a command prompt (shown at the bottom
 | `:tg` | Switch to Gruvbox Dark theme |
 | `:to` | Switch to One Dark theme |
 
-All built-in shortcuts (Ctrl+Q and command mode) share a single toggle:
+All built-in shortcuts (`Ctrl+Q` and command mode) share a single toggle:
 
 ```cpp
-// Disable all built-in shortcuts (e.g. for a shipped app)
+// Disable all built-in shortcuts (for example, for a shipped app)
 ftui::set_quit_on_ctrl_q(false);
 ```
 
@@ -290,10 +319,12 @@ ftui::set_quit_on_ctrl_q(false);
 
 FTUI scrolls automatically. When the total content height exceeds the window height a scrollbar appears on the right and content is clipped to the visible area. No setup required.
 
-**Mouse wheel** scrolls 80 px per tick. **Scrollbar thumb** is draggable. Clicking the track above/below the thumb pages by one visible height.
+`Mouse wheel` scrolls 80 px per tick. The scrollbar thumb is draggable. Clicking the track above or below the thumb pages by one visible height.
 
 ---
 
 ## Non-goals for v1
 
-Selection, clipboard, scrollable containers, nested layouts, drag-and-drop, markdown, animations, docking, themes editor. FTUI stays small on purpose.
+Scrollable containers, nested layouts, drag-and-drop, markdown, animations, docking, theme editors. FTUI stays small on purpose.
+
+[^linux]: FTUI also has a Linux backend using X11 + Cairo. Build with `g++ main.cpp -o app -std=c++17 $(pkg-config --cflags --libs cairo x11)`. If you use `open_file_dialog()` on Linux, install `zenity`.
