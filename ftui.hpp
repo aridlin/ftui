@@ -413,6 +413,19 @@ struct TooltipState {
     int   dismiss_streak = 0;
 };
 
+struct DropdownOverlayState {
+    bool active = false;
+    bool open = false;
+    Rect popup_r = {};
+    int count = 0;
+    int selected_index = -1;
+    float item_h = 0;
+    float scroll = 0;
+    float popup_h = 0;
+    float popup_p = 1.0f;
+    std::vector<std::string> labels;
+};
+
 // ---- Shared globals -------------------------------------------------
 
 static InputState g_input;
@@ -445,6 +458,8 @@ static float      g_draw_fx_off_y = 0;
 static float      g_draw_fx_opacity = 1.0f;
 static NextLayoutState g_next_layout;
 static TooltipState g_tooltip;
+static DropdownOverlayState g_dropdown_overlay;
+static DropdownOverlayState g_dropdown_overlay_prev;
 static int        g_disabled_depth = 0;
 static int        g_focus_request_id = 0;
 static int        g_modal_open_id = 0;
@@ -452,6 +467,7 @@ static int        g_modal_request_id = 0;
 static bool       g_inside_modal = false;
 static bool       g_modal_drawn = false;
 static int        g_dropdown_open_id = 0;
+static bool       g_dropdown_capture_input = false;
 
 // ---- Forward declarations of platform-specific functions -----------
 // (defined in the platform blocks below; used by shared widget code)
@@ -582,7 +598,7 @@ static bool is_widget_focused(int id) {
 }
 
 static bool widget_interaction_enabled() {
-    return g_disabled_depth == 0 && (!g_modal_open_id || g_inside_modal);
+    return g_disabled_depth == 0 && (!g_modal_open_id || g_inside_modal) && !g_dropdown_capture_input;
 }
 
 static void register_focusable(int id) {
@@ -796,6 +812,57 @@ static void draw_tooltip_overlay() {
         Rect lr = {r.x + pad, r.y + pad + (float)i * lh, r.w - pad * 2.0f, lh};
         Color text = g_style.text; text.a *= g_tooltip.opacity;
         draw_text_utf8(line.c_str(), lr, text);
+    }
+}
+
+static void draw_dropdown_overlay() {
+    if (!g_dropdown_overlay.active || g_dropdown_overlay.labels.empty() || g_dropdown_overlay.count <= 0) return;
+
+    const DropdownOverlayState& ov = g_dropdown_overlay;
+    Color popup_fill = g_style.panel;
+    Color popup_border = g_style.border;
+#if FTUI_WINDOWS_EFFECTS
+    if (effects_enabled()) {
+        draw_previous_frame_blur_panel(ov.popup_r, ov.popup_p);
+        popup_fill = lerp_color(g_style.panel, g_style.background, 0.08f);
+        popup_fill.a = 0.92f;
+        popup_border = lerp_color(g_style.border, g_style.input_focus, 0.18f);
+        popup_border.a = 0.98f;
+    }
+#endif
+    draw_widget_chrome(ov.popup_r, g_style.rounding, maybe_disabled(popup_fill), maybe_disabled(popup_border), 0.0f, 0.0f, 0.0f);
+
+    Rect clip_r = {ov.popup_r.x + 2.0f, ov.popup_r.y + 2.0f, ov.popup_r.w - 4.0f, ov.popup_r.h - 4.0f};
+    push_clip(clip_r);
+    for (int i = 0; i < ov.count; ++i) {
+        Rect ir = {ov.popup_r.x + 4.0f, ov.popup_r.y + 4.0f - ov.scroll + i * ov.item_h, ov.popup_r.w - 8.0f, ov.item_h};
+        if (ir.y + ir.h < ov.popup_r.y || ir.y > ov.popup_r.y + ov.popup_r.h) continue;
+        bool item_hov = ov.open && rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
+        bool item_sel = (ov.selected_index == i);
+        Color item_bg = item_sel ? with_alpha(g_style.input_focus, 0.22f) :
+                        item_hov ? with_alpha(g_style.button_hover, 0.35f) :
+                                   with_alpha(g_style.panel, 0.0f);
+        if (item_bg.a > 0.0f) fill_round_rect(ir, g_style.rounding * 0.6f, maybe_disabled(item_bg));
+        Rect itr = {ir.x + 8.0f, ir.y, ir.w - 16.0f, ir.h};
+        draw_text_utf8(ov.labels[i].c_str(), itr, maybe_disabled(item_sel ? g_style.text : g_style.text_dim));
+    }
+    pop_clip();
+
+    float content_h = ov.count * ov.item_h;
+    if (content_h > ov.popup_h - 8.0f) {
+        float max_scroll = content_h - (ov.popup_h - 8.0f);
+        if (max_scroll < 0.0f) max_scroll = 0.0f;
+        if (max_scroll > 0.0f) {
+            float visible_h = ov.popup_h - 8.0f;
+            float thumb_h = (visible_h / content_h) * visible_h;
+            if (thumb_h < 12.0f) thumb_h = 12.0f;
+            float thumb_y = ov.popup_r.y + 4.0f + (ov.scroll / max_scroll) * (visible_h - thumb_h);
+            Rect track_r = {ov.popup_r.x + ov.popup_r.w - 8.0f, ov.popup_r.y + 4.0f, 4.0f, ov.popup_r.h - 8.0f};
+            Rect thumb_r = {track_r.x, thumb_y, track_r.w, thumb_h};
+            Color track_c = g_style.border; track_c.a = 0.3f;
+            fill_round_rect(track_r, 2.0f, maybe_disabled(track_c));
+            fill_round_rect(thumb_r, 2.0f, maybe_disabled(g_style.text_dim));
+        }
     }
 }
 
@@ -1507,9 +1574,9 @@ static void sync_native_window_chrome() {
     COLORREF text = RGB(255, 255, 255);
     COLORREF border = to_colorref(g_style.border);
     fn(g_platform.hwnd, 20, &dark, sizeof(dark));
-    fn(g_platform.hwnd, 35, &border, sizeof(border));
-    fn(g_platform.hwnd, 36, &caption, sizeof(caption));
-    fn(g_platform.hwnd, 37, &text, sizeof(text));
+    fn(g_platform.hwnd, 34, &border, sizeof(border));
+    fn(g_platform.hwnd, 35, &caption, sizeof(caption));
+    fn(g_platform.hwnd, 36, &text, sizeof(text));
     FreeLibrary(dwm);
 }
 
@@ -1688,6 +1755,8 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
+    g_dropdown_capture_input = g_dropdown_overlay_prev.active;
+    g_dropdown_overlay = {};
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
@@ -1809,12 +1878,13 @@ void end() {
         Rect r={g_style.window_padding,oy,200,lh};
         fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
     }
+    draw_dropdown_overlay();
     finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
     draw_tooltip_overlay();
     HRESULT hr=g_renderer.target->EndDraw(); g_drawing=false;
     if(hr==D2DERR_RECREATE_TARGET){release_render_target();create_render_target();}
-    else if (SUCCEEDED(hr)) capture_frame_snapshot();
+    g_dropdown_overlay_prev = g_dropdown_overlay;
     g_ctx.tab_stops_prev=g_ctx.tab_stops; g_ctx.frame_index++;
 }
 
@@ -1852,8 +1922,9 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         CollapseSlot collapse_slots[64];
         NextLayoutState next_layout;
         TooltipState tooltip;
+        DropdownOverlayState dropdown_overlay, dropdown_overlay_prev;
         int disabled_depth, focus_request_id, modal_open_id, modal_request_id, dropdown_open_id;
-        bool inside_modal, modal_drawn;
+        bool inside_modal, modal_drawn, dropdown_capture_input;
         bool shortcuts,drawing;
     } s;
     s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
@@ -1874,6 +1945,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     memcpy(s.collapse_slots, g_collapse_slots, sizeof(g_collapse_slots));
     s.next_layout=g_next_layout;
     s.tooltip=g_tooltip;
+    s.dropdown_overlay=g_dropdown_overlay;
+    s.dropdown_overlay_prev=g_dropdown_overlay_prev;
     s.disabled_depth=g_disabled_depth;
     s.focus_request_id=g_focus_request_id;
     s.modal_open_id=g_modal_open_id;
@@ -1881,6 +1954,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.dropdown_open_id=g_dropdown_open_id;
     s.inside_modal=g_inside_modal;
     s.modal_drawn=g_modal_drawn;
+    s.dropdown_capture_input=g_dropdown_capture_input;
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;
 
     auto* d2d = g_renderer.d2d_factory;
@@ -1899,8 +1973,9 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_prev_frame_bitmap=nullptr; g_prev_frame_pixels.clear(); g_prev_frame_w=0; g_prev_frame_h=0;
     memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
     memset(g_collapse_slots, 0, sizeof(g_collapse_slots));
-    g_next_layout={}; g_tooltip={}; g_disabled_depth=0; g_focus_request_id=0;
+    g_next_layout={}; g_tooltip={}; g_dropdown_overlay={}; g_dropdown_overlay_prev={}; g_disabled_depth=0; g_focus_request_id=0;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
+    g_dropdown_capture_input=false;
     reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false;
 
@@ -1951,6 +2026,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     memcpy(g_collapse_slots, s.collapse_slots, sizeof(g_collapse_slots));
     g_next_layout=s.next_layout;
     g_tooltip=s.tooltip;
+    g_dropdown_overlay=s.dropdown_overlay;
+    g_dropdown_overlay_prev=s.dropdown_overlay_prev;
     g_disabled_depth=s.disabled_depth;
     g_focus_request_id=s.focus_request_id;
     g_modal_open_id=s.modal_open_id;
@@ -1958,6 +2035,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_dropdown_open_id=s.dropdown_open_id;
     g_inside_modal=s.inside_modal;
     g_modal_drawn=s.modal_drawn;
+    g_dropdown_capture_input=s.dropdown_capture_input;
     g_shortcuts_enabled=s.shortcuts;g_drawing=s.drawing;
     InvalidateRect(owner,nullptr,FALSE);
 }
@@ -2434,6 +2512,8 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
+    g_dropdown_capture_input = g_dropdown_overlay_prev.active;
+    g_dropdown_overlay = {};
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
@@ -2518,11 +2598,13 @@ void end() {
         Rect r={g_style.window_padding,oy,200,lh};
         fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
     }
+    draw_dropdown_overlay();
     finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
     draw_tooltip_overlay();
     g_drawing=false;
     swap_buffers();
+    g_dropdown_overlay_prev = g_dropdown_overlay;
     g_ctx.tab_stops_prev=g_ctx.tab_stops; g_ctx.frame_index++;
 }
 
@@ -2554,8 +2636,9 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         CollapseSlot collapse_slots[64];
         NextLayoutState next_layout;
         TooltipState tooltip;
+        DropdownOverlayState dropdown_overlay, dropdown_overlay_prev;
         int disabled_depth, focus_request_id, modal_open_id, modal_request_id, dropdown_open_id;
-        bool inside_modal, modal_drawn;
+        bool inside_modal, modal_drawn, dropdown_capture_input;
         bool shortcuts,drawing;
         XIM xim; XIC xic; std::string cb;
     } s;
@@ -2574,6 +2657,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     memcpy(s.collapse_slots, g_collapse_slots, sizeof(g_collapse_slots));
     s.next_layout=g_next_layout;
     s.tooltip=g_tooltip;
+    s.dropdown_overlay=g_dropdown_overlay;
+    s.dropdown_overlay_prev=g_dropdown_overlay_prev;
     s.disabled_depth=g_disabled_depth;
     s.focus_request_id=g_focus_request_id;
     s.modal_open_id=g_modal_open_id;
@@ -2581,6 +2666,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.dropdown_open_id=g_dropdown_open_id;
     s.inside_modal=g_inside_modal;
     s.modal_drawn=g_modal_drawn;
+    s.dropdown_capture_input=g_dropdown_capture_input;
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;s.xim=g_xim;s.xic=g_xic;s.cb=g_clipboard_buf;
     Display* dpy=g_platform.display; Window parent=g_platform.window;
     g_platform={}; g_platform.display=dpy;
@@ -2591,8 +2677,9 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
     memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
     memset(g_collapse_slots, 0, sizeof(g_collapse_slots));
-    g_next_layout={}; g_tooltip={}; g_disabled_depth=0; g_focus_request_id=0;
+    g_next_layout={}; g_tooltip={}; g_dropdown_overlay={}; g_dropdown_overlay_prev={}; g_disabled_depth=0; g_focus_request_id=0;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
+    g_dropdown_capture_input=false;
     reset_effect_state(false);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false; g_clipboard_buf=s.cb;
     g_xim=nullptr; g_xic=nullptr;
@@ -2632,6 +2719,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     memcpy(g_collapse_slots, s.collapse_slots, sizeof(g_collapse_slots));
     g_next_layout=s.next_layout;
     g_tooltip=s.tooltip;
+    g_dropdown_overlay=s.dropdown_overlay;
+    g_dropdown_overlay_prev=s.dropdown_overlay_prev;
     g_disabled_depth=s.disabled_depth;
     g_focus_request_id=s.focus_request_id;
     g_modal_open_id=s.modal_open_id;
@@ -2639,6 +2728,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_dropdown_open_id=s.dropdown_open_id;
     g_inside_modal=s.inside_modal;
     g_modal_drawn=s.modal_drawn;
+    g_dropdown_capture_input=s.dropdown_capture_input;
     g_shortcuts_enabled=s.shortcuts;g_drawing=s.drawing;g_xim=s.xim;g_xic=s.xic;g_clipboard_buf=s.cb;
     // trigger repaint of parent
     XExposeEvent xe={}; xe.type=Expose; xe.window=g_platform.window; xe.count=0;
@@ -3631,6 +3721,9 @@ bool tabs(const char* const* labels, int count, int* selected) {
     *selected = current_selected;
 
     if (current_selected != fx.selected) {
+#if FTUI_WINDOWS_EFFECTS
+        if (effects_enabled()) capture_frame_snapshot();
+#endif
         fx.previous = fx.selected;
         fx.selected = current_selected;
         fx.dir = fx.selected >= fx.previous ? 1 : -1;
@@ -3697,12 +3790,13 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
     }
 
     Rect r = {}, outer = next_labeled_rect(vis, g_style.item_height, &r);
+    bool open = (g_dropdown_open_id == id);
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
-    bool enabled = widget_interaction_enabled();
+    bool base_enabled = (g_disabled_depth == 0) && (!g_modal_open_id || g_inside_modal);
+    bool enabled = base_enabled && (!g_dropdown_capture_input || open);
     bool hov = raw_hov && enabled;
     bool focused = is_widget_focused(id);
     bool changed = false;
-    bool open = (g_dropdown_open_id == id);
     ScrollSlot& slot = scroll_slot_for(id ^ 0x330011);
     CollapseSlot& popup_fx = collapse_slot_for(id ^ 0x330177);
 
@@ -3712,12 +3806,20 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
     }
     if (g_ctx.active_id == id && g_input.mouse_released) {
         if (hov) {
+            bool was_open = open;
+#if FTUI_WINDOWS_EFFECTS
+            if (effects_enabled() && !was_open) capture_frame_snapshot();
+#endif
             g_dropdown_open_id = open ? 0 : id;
             open = !open;
         }
         g_ctx.active_id = 0;
     }
     if (focused && enabled && (g_input.key_space || g_input.key_enter)) {
+        bool was_open = open;
+#if FTUI_WINDOWS_EFFECTS
+        if (effects_enabled() && !was_open) capture_frame_snapshot();
+#endif
         g_dropdown_open_id = open ? 0 : id;
         open = !open;
     }
@@ -3756,10 +3858,15 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         ? Rect{r.x, r.y - 4.0f - popup_anim_h, r.w, popup_anim_h}
         : Rect{r.x, r.y + r.h + 4.0f, r.w, popup_anim_h};
     bool popup_hov = popup_visible && rect_contains(popup_r, g_input.mouse_x, g_input.mouse_y);
+    bool consume_mouse = false;
 
     if (open && g_input.mouse_pressed && !raw_hov && !popup_hov) {
         g_dropdown_open_id = 0;
         open = false;
+        consume_mouse = true;
+        g_ctx.active_id = 0;
+    } else if (open && popup_hov && g_input.mouse_pressed) {
+        g_ctx.active_id = 0;
     }
 
     MotionSlot& motion = motion_slot_for(id);
@@ -3787,20 +3894,6 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         else slot.current = slot.target;
         slot.current = clampf(slot.current, 0.0f, max_scroll);
 
-        Color popup_fill = g_style.panel;
-        Color popup_border = g_style.border;
-#if FTUI_WINDOWS_EFFECTS
-        if (effects_enabled()) {
-            draw_previous_frame_blur_panel(popup_r, 0.95f * popup_p);
-            popup_fill = lerp_color(g_style.panel, g_style.background, 0.18f);
-            popup_fill.a = 0.74f;
-            popup_border = lerp_color(g_style.border, g_style.input_focus, 0.14f);
-            popup_border.a = 0.92f;
-        }
-#endif
-        draw_widget_chrome(popup_r, g_style.rounding, maybe_disabled(popup_fill), maybe_disabled(popup_border), 0.0f, 0.0f, 0.0f);
-        Rect clip_r = {popup_r.x + 2.0f, popup_r.y + 2.0f, popup_r.w - 4.0f, popup_r.h - 4.0f};
-        push_clip(clip_r);
         for (int i = 0; i < count; ++i) {
             Rect ir = {popup_r.x + 4.0f, popup_r.y + 4.0f - slot.current + i * item_h, popup_r.w - 8.0f, item_h};
             if (ir.y + ir.h < popup_r.y || ir.y > popup_r.y + popup_r.h) continue;
@@ -3810,28 +3903,33 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
                 if (selected) *selected = i;
                 g_dropdown_open_id = 0;
                 open = false;
+                consume_mouse = true;
+                g_ctx.active_id = 0;
             }
-            bool item_sel = selected && *selected == i;
-            Color item_bg = item_sel ? with_alpha(g_style.input_focus, 0.22f) :
-                            item_hov ? with_alpha(g_style.button_hover, 0.35f) :
-                                       with_alpha(g_style.panel, 0.0f);
-            if (item_bg.a > 0.0f) fill_round_rect(ir, g_style.rounding * 0.6f, maybe_disabled(item_bg));
-            Rect itr = {ir.x + 8.0f, ir.y, ir.w - 16.0f, ir.h};
-            draw_text_utf8(items[i] ? items[i] : "", itr, maybe_disabled(item_sel ? g_style.text : g_style.text_dim));
         }
-        pop_clip();
+        g_dropdown_overlay.active = true;
+        g_dropdown_overlay.open = open;
+        g_dropdown_overlay.popup_r = popup_r;
+        g_dropdown_overlay.count = count;
+        g_dropdown_overlay.selected_index = selected ? *selected : -1;
+        g_dropdown_overlay.item_h = item_h;
+        g_dropdown_overlay.scroll = slot.current;
+        g_dropdown_overlay.popup_h = popup_h;
+        g_dropdown_overlay.popup_p = popup_p;
+        g_dropdown_overlay.labels.clear();
+        g_dropdown_overlay.labels.reserve((size_t)count);
+        for (int i = 0; i < count; ++i) {
+            g_dropdown_overlay.labels.emplace_back(items && items[i] ? items[i] : "");
+        }
+    }
 
-        if (count * item_h > popup_h - 8.0f && max_scroll > 0.0f) {
-            float visible_h = popup_h - 8.0f;
-            float thumb_h = (visible_h / (count * item_h)) * visible_h;
-            if (thumb_h < 12.0f) thumb_h = 12.0f;
-            float thumb_y = popup_r.y + 4.0f + (slot.current / max_scroll) * (visible_h - thumb_h);
-            Rect track_r = {popup_r.x + popup_r.w - 8.0f, popup_r.y + 4.0f, 4.0f, popup_r.h - 8.0f};
-            Rect thumb_r = {track_r.x, thumb_y, track_r.w, thumb_h};
-            Color track_c = g_style.border; track_c.a = 0.3f;
-            fill_round_rect(track_r, 2.0f, maybe_disabled(track_c));
-            fill_round_rect(thumb_r, 2.0f, maybe_disabled(g_style.text_dim));
-        }
+    if ((open || popup_visible) && (popup_hov || raw_hov || g_input.mouse_pressed || g_input.mouse_released || g_input.mouse_down)) {
+        consume_mouse = true;
+    }
+    if (consume_mouse) {
+        g_input.mouse_pressed = false;
+        g_input.mouse_released = false;
+        g_input.mouse_down = false;
     }
 
     draw_widget_label(vis, outer, focused);

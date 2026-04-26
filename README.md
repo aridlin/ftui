@@ -240,6 +240,8 @@ int env = 0;
 ftui::dropdown("Environment", envs, 3, &env);
 ```
 
+Dropdown popups render as top-layer overlays, flip upward when needed to stay in bounds, and use the lightweight frosted popup treatment on Windows when effects are enabled.
+
 Listbox:
 
 ```cpp
@@ -408,6 +410,7 @@ Windows can enable a lightweight effects layer with:
 - hover and press easing
 - tab underline motion
 - tab content slide motion
+- frosted dropdown popups on Windows
 
 Runtime opt-out:
 
