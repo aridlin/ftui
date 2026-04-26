@@ -75,6 +75,23 @@ Linux note:
 - `open_file_dialog()` uses `zenity` when available.
 - The Linux backend intentionally keeps a simpler rendering path than Windows in the current release.
 
+Example builds from the repo root:
+
+```bash
+clang++ demo.cpp -o demo.exe -std=c++17 -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -lwindowscodecs
+clang++ examples/benchmark.cpp -o benchmark.exe -std=c++17 -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -lwindowscodecs
+```
+
+## Repository layout
+
+- `ftui.hpp`: the single-header library
+- `demo.cpp`: compatibility entrypoint that builds the showcase example
+- `examples/showcase.cpp`: broad widget and layout tour
+- `examples/control_panel.cpp`: settings-heavy utility app example
+- `examples/log_viewer.cpp`: read-only output and operator-notes example
+- `examples/benchmark.cpp`: synthetic workload / FPS stress example
+- `ftui.svg`: built-in icon source used by the project
+
 ## Compatibility
 
 FTUI 1.x treats the common surface as additive-first.
@@ -270,6 +287,8 @@ if (ftui::collapsing_header("Advanced", &advanced_open)) {
 }
 ```
 
+With the Windows effects path enabled, collapsible sections reveal and hide their body gradually and the widgets below them ease into their new positions instead of snapping.
+
 ## Layout helpers
 
 Equal row:
@@ -410,6 +429,7 @@ Windows can enable a lightweight effects layer with:
 - hover and press easing
 - tab underline motion
 - tab content slide motion
+- collapsible section reveal and layout easing
 - frosted dropdown popups on Windows
 
 Runtime opt-out:
@@ -445,18 +465,13 @@ Disable the built-in quit shortcut:
 ftui::set_quit_on_ctrl_q(false);
 ```
 
-## Demo
+## Examples
 
-[`demo.cpp`](/C:/Users/aridlin/code/claude/ftui/demo.cpp) shows:
+[`demo.cpp`](/C:/Users/aridlin/code/claude/ftui/demo.cpp) remains the easiest root-level build target and now simply includes the showcase example so older commands still work.
 
-- wrapped text and filtered input
-- editable multiline text
-- read-only log output
-- dropdown, listbox, and radio pickers
-- scroll areas
-- collapsible sections
-- modal flow
-- disabled scopes and tooltips
-- weighted rows and one-shot layout helpers
+- [`examples/showcase.cpp`](/C:/Users/aridlin/code/claude/ftui/examples/showcase.cpp): broad FTUI tour covering forms, text areas, log output, scroll areas, themes, modals, and child windows
+- [`examples/control_panel.cpp`](/C:/Users/aridlin/code/claude/ftui/examples/control_panel.cpp): a settings-heavy control panel with collapsible sections, confirmation flow, and activity output
+- [`examples/log_viewer.cpp`](/C:/Users/aridlin/code/claude/ftui/examples/log_viewer.cpp): a focused log/transcript app using `log_view()`, multiline notes, filters, and a nested history scroller
+- [`examples/benchmark.cpp`](/C:/Users/aridlin/code/claude/ftui/examples/benchmark.cpp): a synthetic benchmark app for row-count, workload, and frame-pacing checks with the FPS overlay enabled
 
 [^linux]: Linux support is first-class at the API level and actively maintained, but the Windows backend currently receives the richer visual effects path first so the Linux renderer can stay lean and dependency-light.

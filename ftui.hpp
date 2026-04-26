@@ -379,6 +379,21 @@ struct CollapseSlot {
     bool  initialized = false;
     bool  open = false;
     float progress = 0;
+    float body_height = 0;
+};
+
+struct ActiveCollapseFx {
+    int   key = 0;
+    float top_target = 0;
+    float top_display = 0;
+    float body_height = 0;
+    float progress = 1.0f;
+};
+
+struct CollapseRectFx {
+    Rect rect = {};
+    Rect clip = {};
+    bool clip_active = false;
 };
 
 struct NextLayoutState {
@@ -460,6 +475,10 @@ static NextLayoutState g_next_layout;
 static TooltipState g_tooltip;
 static DropdownOverlayState g_dropdown_overlay;
 static DropdownOverlayState g_dropdown_overlay_prev;
+static ActiveCollapseFx g_active_collapse_fx[16];
+static int        g_active_collapse_fx_count = 0;
+static int        g_pending_collapse_key = 0;
+static float      g_pending_collapse_start_y = 0.0f;
 static int        g_disabled_depth = 0;
 static int        g_focus_request_id = 0;
 static int        g_modal_open_id = 0;
@@ -640,6 +659,16 @@ static CollapseSlot& collapse_slot_for(int key) {
     slot = {};
     slot.key = key;
     return slot;
+}
+
+static void finalize_pending_collapse_measure() {
+    if (!g_pending_collapse_key) return;
+    CollapseSlot& slot = collapse_slot_for(g_pending_collapse_key);
+    float measured = g_ctx.cursor_y - g_pending_collapse_start_y;
+    if (measured < 0.0f) measured = 0.0f;
+    slot.body_height = measured;
+    g_pending_collapse_key = 0;
+    g_pending_collapse_start_y = 0.0f;
 }
 
 static MotionSlot& motion_slot_for(int key) {
@@ -884,6 +913,73 @@ static void draw_widget_label(const char* vis, Rect outer, bool emphasized = fal
     float label_h = widget_label_height(vis);
     Rect lr = {outer.x, outer.y, outer.w, label_h};
     draw_text_utf8(vis, lr, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, emphasized ? 0.22f : 0.0f)));
+}
+
+static Rect rect_intersection(Rect a, Rect b) {
+    float x0 = a.x > b.x ? a.x : b.x;
+    float y0 = a.y > b.y ? a.y : b.y;
+    float x1 = (a.x + a.w) < (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    float y1 = (a.y + a.h) < (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+static float transformed_layout_y(float target_y) {
+    float y = target_y;
+    for (int i = 0; i < g_active_collapse_fx_count; ++i) {
+        const ActiveCollapseFx& fx = g_active_collapse_fx[i];
+        if (fx.body_height <= 0.0f) continue;
+        float body_end = fx.top_target + fx.body_height;
+        if (target_y >= body_end - 0.5f) {
+            y -= fx.body_height * (1.0f - fx.progress);
+        }
+    }
+    return y;
+}
+
+static CollapseRectFx collapse_rect_fx(Rect target) {
+    CollapseRectFx out = {};
+    out.rect = target;
+
+    for (int i = 0; i < g_active_collapse_fx_count; ++i) {
+        const ActiveCollapseFx& fx = g_active_collapse_fx[i];
+        if (fx.body_height <= 0.0f) continue;
+        float body_end = fx.top_target + fx.body_height;
+        float hidden_h = fx.body_height * (1.0f - fx.progress);
+        if (target.y >= body_end - 0.5f) {
+            out.rect.y -= hidden_h;
+        } else if (target.y + target.h > fx.top_target && target.y < body_end) {
+            float visible_h = fx.body_height * fx.progress;
+            Rect clip = {
+                g_ctx.content_region.x - 4.0f,
+                fx.top_display,
+                g_ctx.content_region.w + 8.0f,
+                visible_h
+            };
+            if (out.rect.y < clip.y) {
+                float delta = clip.y - out.rect.y;
+                out.rect.y = clip.y;
+                out.rect.h -= delta;
+            }
+            float clip_bottom = clip.y + clip.h;
+            float rect_bottom = out.rect.y + out.rect.h;
+            if (rect_bottom > clip_bottom) out.rect.h = clip_bottom - out.rect.y;
+            if (out.rect.h < 0.0f) out.rect.h = 0.0f;
+            out.clip = out.clip_active ? rect_intersection(out.clip, clip) : clip;
+            out.clip_active = true;
+        }
+    }
+
+    return out;
+}
+
+static Rect labeled_body_rect(const char* vis, Rect outer) {
+    float label_h = widget_label_height(vis);
+    float shown_label_h = outer.h < label_h ? outer.h : label_h;
+    float body_h = outer.h - shown_label_h;
+    if (body_h < 0.0f) body_h = 0.0f;
+    return {outer.x, outer.y + shown_label_h, outer.w, body_h};
 }
 
 static float tooltip_delay_seconds() {
@@ -1755,6 +1851,9 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
+    g_active_collapse_fx_count = 0;
+    g_pending_collapse_key = 0;
+    g_pending_collapse_start_y = 0.0f;
     g_dropdown_capture_input = g_dropdown_overlay_prev.active;
     g_dropdown_overlay = {};
     begin_tooltip_frame();
@@ -1804,6 +1903,7 @@ void begin() {
 void end() {
     using namespace internal;
     if(!g_drawing) return;
+    finalize_pending_collapse_measure();
     g_renderer.target->PopAxisAlignedClip();
 
     if (g_frame_content_fx.active) {
@@ -1920,6 +2020,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         UINT prev_frame_w, prev_frame_h;
         ScrollSlot scroll_slots[128];
         CollapseSlot collapse_slots[64];
+        ActiveCollapseFx active_collapse_fx[16];
+        int active_collapse_fx_count;
+        int pending_collapse_key;
+        float pending_collapse_start_y;
         NextLayoutState next_layout;
         TooltipState tooltip;
         DropdownOverlayState dropdown_overlay, dropdown_overlay_prev;
@@ -1943,6 +2047,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.prev_frame_w=g_prev_frame_w;s.prev_frame_h=g_prev_frame_h;
     memcpy(s.scroll_slots, g_scroll_slots, sizeof(g_scroll_slots));
     memcpy(s.collapse_slots, g_collapse_slots, sizeof(g_collapse_slots));
+    memcpy(s.active_collapse_fx, g_active_collapse_fx, sizeof(g_active_collapse_fx));
+    s.active_collapse_fx_count = g_active_collapse_fx_count;
+    s.pending_collapse_key = g_pending_collapse_key;
+    s.pending_collapse_start_y = g_pending_collapse_start_y;
     s.next_layout=g_next_layout;
     s.tooltip=g_tooltip;
     s.dropdown_overlay=g_dropdown_overlay;
@@ -1973,6 +2081,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_prev_frame_bitmap=nullptr; g_prev_frame_pixels.clear(); g_prev_frame_w=0; g_prev_frame_h=0;
     memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
     memset(g_collapse_slots, 0, sizeof(g_collapse_slots));
+    memset(g_active_collapse_fx, 0, sizeof(g_active_collapse_fx));
+    g_active_collapse_fx_count = 0;
+    g_pending_collapse_key = 0;
+    g_pending_collapse_start_y = 0.0f;
     g_next_layout={}; g_tooltip={}; g_dropdown_overlay={}; g_dropdown_overlay_prev={}; g_disabled_depth=0; g_focus_request_id=0;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     g_dropdown_capture_input=false;
@@ -2024,6 +2136,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_prev_frame_w=s.prev_frame_w;g_prev_frame_h=s.prev_frame_h;
     memcpy(g_scroll_slots, s.scroll_slots, sizeof(g_scroll_slots));
     memcpy(g_collapse_slots, s.collapse_slots, sizeof(g_collapse_slots));
+    memcpy(g_active_collapse_fx, s.active_collapse_fx, sizeof(g_active_collapse_fx));
+    g_active_collapse_fx_count = s.active_collapse_fx_count;
+    g_pending_collapse_key = s.pending_collapse_key;
+    g_pending_collapse_start_y = s.pending_collapse_start_y;
     g_next_layout=s.next_layout;
     g_tooltip=s.tooltip;
     g_dropdown_overlay=s.dropdown_overlay;
@@ -2512,6 +2628,9 @@ void begin() {
     using namespace internal;
     g_ctx.hot_id=0;
     g_frame_content_fx = {};
+    g_active_collapse_fx_count = 0;
+    g_pending_collapse_key = 0;
+    g_pending_collapse_start_y = 0.0f;
     g_dropdown_capture_input = g_dropdown_overlay_prev.active;
     g_dropdown_overlay = {};
     begin_tooltip_frame();
@@ -2557,6 +2676,7 @@ void begin() {
 void end() {
     using namespace internal;
     if (!g_drawing) return;
+    finalize_pending_collapse_measure();
     cairo_restore(g_renderer.cr); // pop content clip
     float new_ch=g_ctx.cursor_y+g_scroll_y-g_ctx.content_region.y;
     if(new_ch<0)new_ch=0;
@@ -2634,6 +2754,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         float draw_off_x,draw_off_y,draw_opacity;
         ScrollSlot scroll_slots[128];
         CollapseSlot collapse_slots[64];
+        ActiveCollapseFx active_collapse_fx[16];
+        int active_collapse_fx_count;
+        int pending_collapse_key;
+        float pending_collapse_start_y;
         NextLayoutState next_layout;
         TooltipState tooltip;
         DropdownOverlayState dropdown_overlay, dropdown_overlay_prev;
@@ -2655,6 +2779,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.draw_off_x=g_draw_fx_off_x;s.draw_off_y=g_draw_fx_off_y;s.draw_opacity=g_draw_fx_opacity;
     memcpy(s.scroll_slots, g_scroll_slots, sizeof(g_scroll_slots));
     memcpy(s.collapse_slots, g_collapse_slots, sizeof(g_collapse_slots));
+    memcpy(s.active_collapse_fx, g_active_collapse_fx, sizeof(g_active_collapse_fx));
+    s.active_collapse_fx_count = g_active_collapse_fx_count;
+    s.pending_collapse_key = g_pending_collapse_key;
+    s.pending_collapse_start_y = g_pending_collapse_start_y;
     s.next_layout=g_next_layout;
     s.tooltip=g_tooltip;
     s.dropdown_overlay=g_dropdown_overlay;
@@ -2677,6 +2805,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
     memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
     memset(g_collapse_slots, 0, sizeof(g_collapse_slots));
+    memset(g_active_collapse_fx, 0, sizeof(g_active_collapse_fx));
+    g_active_collapse_fx_count = 0;
+    g_pending_collapse_key = 0;
+    g_pending_collapse_start_y = 0.0f;
     g_next_layout={}; g_tooltip={}; g_dropdown_overlay={}; g_dropdown_overlay_prev={}; g_disabled_depth=0; g_focus_request_id=0;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     g_dropdown_capture_input=false;
@@ -2717,6 +2849,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_draw_fx_off_x=s.draw_off_x;g_draw_fx_off_y=s.draw_off_y;g_draw_fx_opacity=s.draw_opacity;
     memcpy(g_scroll_slots, s.scroll_slots, sizeof(g_scroll_slots));
     memcpy(g_collapse_slots, s.collapse_slots, sizeof(g_collapse_slots));
+    memcpy(g_active_collapse_fx, s.active_collapse_fx, sizeof(g_active_collapse_fx));
+    g_active_collapse_fx_count = s.active_collapse_fx_count;
+    g_pending_collapse_key = s.pending_collapse_key;
+    g_pending_collapse_start_y = s.pending_collapse_start_y;
     g_next_layout=s.next_layout;
     g_tooltip=s.tooltip;
     g_dropdown_overlay=s.dropdown_overlay;
@@ -2788,8 +2924,12 @@ void text(const char* label) {
     split_label(label, vis, sizeof(vis), &hs);
     float h = g_style.item_height;
     Rect r = next_rect(h);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
+    if (cfx.clip_active) push_clip(cfx.clip);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,0,0,0.4f});
     draw_text_utf8(vis, r, maybe_disabled(g_style.text));
+    if (cfx.clip_active) pop_clip();
     mark_last_item(0, r, rect_contains(r, g_input.mouse_x, g_input.mouse_y), false);
 }
 
@@ -2799,6 +2939,9 @@ void text_wrapped(const char* text) {
     compute_wrapped_ranges(text ? text : "", g_ctx.content_region.w, true, lines);
     float lh = text_line_height();
     Rect r = next_rect((float)lines.size() * lh);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
+    if (cfx.clip_active) push_clip(cfx.clip);
     float y = r.y;
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string line((text ? text : "") + lines[i].start, (text ? text : "") + lines[i].end);
@@ -2806,6 +2949,7 @@ void text_wrapped(const char* text) {
         draw_text_utf8(line.c_str(), lr, maybe_disabled(g_style.text));
         y += lh;
     }
+    if (cfx.clip_active) pop_clip();
     mark_last_item(0, r, rect_contains(r, g_input.mouse_x, g_input.mouse_y), false);
 }
 
@@ -2813,8 +2957,12 @@ void separator() {
     if (!g_drawing) return;
     float h = g_style.item_spacing * 2 + 1;
     Rect r = next_rect(h);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
+    if (cfx.clip_active) push_clip(cfx.clip);
     float my = r.y + r.h * 0.5f;
     draw_line(r.x, my, r.x + r.w, my, 1.0f, g_style.border);
+    if (cfx.clip_active) pop_clip();
 }
 
 void spacing(float px) {
@@ -2830,6 +2978,8 @@ bool button(const char* label) {
     register_focusable(id);
 
     Rect r = next_rect(g_style.item_height);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
     bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -2852,9 +3002,11 @@ bool button(const char* label) {
     bg = lerp_color(bg, g_style.input_focus, 0.06f + motion.hover * 0.05f + motion.active * 0.14f);
     bg = lerp_color(bg, g_style.button_active, motion.active * 0.35f);
     Color border = lerp_color(g_style.border, g_style.input_focus, 0.12f + motion.hover * 0.14f + motion.active * 0.22f);
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
     Rect text_r = offset_rect(r, 0.0f, motion.active * 1.0f);
     draw_text_utf8_centered(vis, text_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, 0.72f + motion.hover * 0.20f + motion.active * 0.08f)));
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, r, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,1,0,0.4f});
@@ -2870,7 +3022,10 @@ bool input(const char* label, char* buffer, int buffer_size,
 
     register_focusable(id);
 
-    Rect r = {}, outer = next_labeled_rect(vis, g_style.item_height, &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, g_style.item_height, &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -3023,6 +3178,7 @@ bool input(const char* label, char* buffer, int buffer_size,
     // Draw
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
     Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
 
     float pad = 8.0f;
@@ -3073,6 +3229,7 @@ bool input(const char* label, char* buffer, int buffer_size,
     pop_clip();
 
     draw_widget_label(vis, outer, focused);
+    if (cfx.clip_active) pop_clip();
     mark_last_item(id, outer, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0,0,1,0.4f});
     return changed;
@@ -3093,7 +3250,10 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
 
     float lh = text_line_height();
     float widget_h = rows * lh + 8.0f;
-    Rect r = {}, outer = next_labeled_rect(vis, widget_h, &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, widget_h, &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -3268,7 +3428,8 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
         }
 
         rebuild_lines(lines);
-        float visible_h = widget_h - 8.0f;
+        float visible_h = r.h - 8.0f;
+        if (visible_h < lh) visible_h = lh;
         int cur_line = line_index_for(lines, g_ta_cursor);
         float cursor_y_in_widget = (float)cur_line * lh;
         if (cursor_y_in_widget - ta_scroll_target_y < 0.0f) ta_scroll_target_y = cursor_y_in_widget;
@@ -3285,14 +3446,18 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
     update_motion_slot(motion, raw_hov, enabled && hov && g_input.mouse_down, focused);
     Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
 
     Rect clip_r = {r.x + 2, r.y + 2, r.w - 4, r.h - 4};
+    if (clip_r.w < 0.0f) clip_r.w = 0.0f;
+    if (clip_r.h < 0.0f) clip_r.h = 0.0f;
     push_clip(clip_r);
 
     rebuild_lines(lines);
     float total_h = (float)lines.size() * lh;
-    float ta_visible_h = widget_h - 8.0f;
+    float ta_visible_h = r.h - 8.0f;
+    if (ta_visible_h < lh) ta_visible_h = lh;
     float ta_max_scroll = total_h > ta_visible_h ? (total_h - ta_visible_h) : 0.0f;
     if ((flags & TextAreaFlags::AutoScrollBottom) && !focused) ta_scroll_target_y = ta_max_scroll;
     ta_scroll_target_y = clampf(ta_scroll_target_y, 0.0f, ta_max_scroll);
@@ -3348,6 +3513,7 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
     }
 
     draw_widget_label(vis, outer, focused);
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, outer, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0,0,1,0.4f});
@@ -3368,7 +3534,10 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
 
     float lh = text_line_height();
     float widget_h = rows * lh + 8.0f;
-    Rect r = {}, outer = next_labeled_rect(vis, widget_h, &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, widget_h, &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -3393,7 +3562,8 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
     std::vector<TextRange> lines;
     compute_wrapped_ranges(src, text_w, (flags & LogViewFlags::WordWrap), lines);
 
-    float visible_h = widget_h - 8.0f;
+    float visible_h = r.h - 8.0f;
+    if (visible_h < lh) visible_h = lh;
     float total_h = (float)lines.size() * lh;
     float max_scroll = total_h > visible_h ? (total_h - visible_h) : 0.0f;
     if ((flags & LogViewFlags::AutoScrollBottom) && !focused) slot.target = max_scroll;
@@ -3434,9 +3604,12 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
     update_motion_slot(motion, raw_hov, false, focused);
     Color border_col = lerp_color(g_style.border, g_style.input_focus, focused ? 0.7f : 0.0f);
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, 0.0f, focused ? 1.0f : 0.0f);
 
     Rect clip_r = {r.x + 2, r.y + 2, r.w - 4, r.h - 4};
+    if (clip_r.w < 0.0f) clip_r.w = 0.0f;
+    if (clip_r.h < 0.0f) clip_r.h = 0.0f;
     push_clip(clip_r);
 
     int sel_lo = g_ta_sel_anchor < g_ta_cursor ? g_ta_sel_anchor : g_ta_cursor;
@@ -3478,6 +3651,7 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
     }
 
     draw_widget_label(vis, outer, focused);
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, outer, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.3f,0.7f,1,0.4f});
@@ -3491,6 +3665,8 @@ bool checkbox(const char* label, bool* value) {
     register_focusable(id);
 
     Rect r = next_rect(g_style.item_height);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
     bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -3522,6 +3698,7 @@ bool checkbox(const char* label, bool* value) {
     bg = lerp_color(bg, g_style.button_hover, motion.hover * 0.28f);
     bg = lerp_color(bg, g_style.input_focus, *value ? 0.14f : 0.04f);
     Color border = lerp_color(g_style.border, g_style.input_focus, focused ? 0.85f : (*value ? 0.35f : 0.0f));
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(box, fmaxf(2.0f, g_style.rounding * 0.35f),
                        maybe_disabled(bg), maybe_disabled(border),
                        motion.hover, motion.active, focused ? 1.0f : 0.0f);
@@ -3536,6 +3713,7 @@ bool checkbox(const char* label, bool* value) {
 
     Rect lbl_r = {box.x + box_sz + 8.0f, r.y, r.w - box_sz - 8.0f, r.h};
     draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, 0.52f + motion.hover * 0.42f)));
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, r, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,0,1,0.4f});
@@ -3550,7 +3728,10 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     register_focusable(id);
 
     if (max_v < min_v) { float tmp = min_v; min_v = max_v; max_v = tmp; }
-    Rect r = {}, outer = next_labeled_rect(vis, g_style.item_height, &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, g_style.item_height, &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     float value_w = 80.0f;
     Rect track_r = {r.x, r.y + r.h * 0.5f - 3.0f, r.w - value_w, 6.0f};
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
@@ -3593,6 +3774,7 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused);
 
     Color track_bg = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f);
+    if (cfx.clip_active) push_clip(cfx.clip);
     fill_round_rect(track_r, 3.0f, maybe_disabled(track_bg));
     stroke_round_rect(track_r, 3.0f, g_style.border_width,
                       maybe_disabled(lerp_color(g_style.border, g_style.input_focus, focused ? 0.65f : motion.active * 0.25f)));
@@ -3614,6 +3796,7 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     Rect val_r = {r.x + r.w - value_w + 8.0f, r.y, value_w - 8.0f, r.h};
     draw_text_utf8(val_str, val_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.hover * 0.30f + (focused ? 0.35f : 0.0f))));
     draw_widget_label(vis, outer, focused);
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, outer, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {1,1,0,0.4f});
@@ -3623,8 +3806,12 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
 void image(ImageHandle* img, float width, float height) {
     if (!g_drawing) return;
     Rect r = next_rect(height);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
     if (width < r.w) r.w = width;
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_image_handle(img, r);
+    if (cfx.clip_active) pop_clip();
     mark_last_item(0, r, false, false);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0,1,1,0.4f});
 }
@@ -3633,6 +3820,8 @@ bool tabs(const char* const* labels, int count, int* selected) {
     if (!g_drawing || count <= 0) return false;
     float tab_h = g_style.item_height;
     Rect r = next_rect(tab_h);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
     float tab_w = r.w / count;
     bool changed = false;
     size_t ptr_bits = (size_t)(const void*)selected;
@@ -3679,6 +3868,7 @@ bool tabs(const char* const* labels, int count, int* selected) {
         }
     }
 
+    if (cfx.clip_active) push_clip(cfx.clip);
     for (int i = 0; i < count; i++) {
         char vis[128]; const char* hs;
         split_label(labels[i], vis, sizeof(vis), &hs);
@@ -3769,6 +3959,7 @@ bool tabs(const char* const* labels, int count, int* selected) {
     } else if (g_tab_content_owner == bar_id && fx.switch_t >= 1.0f) {
         g_tab_content_owner = 0;
     }
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(last_id, last_rect, last_hov, last_focus);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.5f,0,1,0.4f});
@@ -3789,7 +3980,10 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         if (*selected >= count) *selected = count - 1;
     }
 
-    Rect r = {}, outer = next_labeled_rect(vis, g_style.item_height, &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, g_style.item_height, &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     bool open = (g_dropdown_open_id == id);
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool base_enabled = (g_disabled_depth == 0) && (!g_modal_open_id || g_inside_modal);
@@ -3873,6 +4067,7 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
     update_motion_slot(motion, hov || popup_hov, enabled && g_ctx.active_id == id, focused);
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (open ? 0.10f : 0.0f));
     Color border_col = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.65f : 0.0f) + (open ? 0.20f : 0.0f));
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col),
                        motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
@@ -3881,6 +4076,7 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
     draw_text_utf8(current ? current : "", text_r, maybe_disabled(g_style.text));
     Rect arrow_r = {r.x + r.w - 22.0f, r.y + (r.h - 8.0f) * 0.5f, 10.0f, 8.0f};
     fill_triangle(arrow_r, (open && open_up) ? 1 : 0, maybe_disabled(g_style.text_dim));
+    if (cfx.clip_active) pop_clip();
 
     if (popup_visible && popup_anim_h > 8.0f) {
         float max_scroll = count * item_h - (popup_h - 8.0f);
@@ -3953,7 +4149,10 @@ bool listbox(const char* label, const char* const* items, int count, int* select
     }
 
     float item_h = g_style.item_height - 4.0f;
-    Rect r = {}, outer = next_labeled_rect(vis, visible_rows * item_h + 8.0f, &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, visible_rows * item_h + 8.0f, &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -3996,10 +4195,13 @@ bool listbox(const char* label, const char* const* items, int count, int* select
     update_motion_slot(motion, hov, false, focused);
     Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
     Color border_col = lerp_color(g_style.border, g_style.input_focus, focused ? 0.7f : 0.0f);
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col),
                        motion.hover, 0.0f, focused ? 1.0f : 0.0f);
 
     Rect clip_r = {r.x + 2.0f, r.y + 2.0f, r.w - 4.0f, r.h - 4.0f};
+    if (clip_r.w < 0.0f) clip_r.w = 0.0f;
+    if (clip_r.h < 0.0f) clip_r.h = 0.0f;
     push_clip(clip_r);
     for (int i = 0; i < count; ++i) {
         Rect ir = {r.x + 4.0f, r.y + 4.0f - slot.current + i * item_h, r.w - 12.0f, item_h};
@@ -4037,6 +4239,7 @@ bool listbox(const char* label, const char* const* items, int count, int* select
     }
 
     draw_widget_label(vis, outer, focused);
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, outer, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.0f,0.9f,0.5f,0.4f});
@@ -4056,7 +4259,10 @@ bool radio_group(const char* label, const char* const* items, int count, int* se
     int rows = (count + columns - 1) / columns;
     float gap = g_style.item_spacing;
     float item_h = g_style.item_height;
-    Rect r = {}, outer = next_labeled_rect(vis, rows * item_h + gap * (rows - 1), &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, rows * item_h + gap * (rows - 1), &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     float cell_w = (r.w - gap * (columns - 1)) / columns;
     bool enabled = widget_interaction_enabled();
     bool changed = false;
@@ -4067,11 +4273,13 @@ bool radio_group(const char* label, const char* const* items, int count, int* se
     bool last_hov = false;
     bool last_focus = false;
 
+    if (cfx.clip_active) push_clip(cfx.clip);
     for (int i = 0; i < count; ++i) {
         ids[i] = base_id ^ (i * 911);
         register_focusable(ids[i]);
         if (is_widget_focused(ids[i])) focused_idx = i;
     }
+    if (cfx.clip_active) pop_clip();
 
     if (focused_idx >= 0 && enabled) {
         int next_idx = focused_idx;
@@ -4149,7 +4357,11 @@ bool collapsing_header(const char* label, bool* open) {
     if (!slot.initialized) { slot.initialized = true; slot.open = false; }
     bool state = open ? *open : slot.open;
 
+    finalize_pending_collapse_measure();
+
     Rect r = next_rect(g_style.item_height);
+    CollapseRectFx cfx = collapse_rect_fx(r);
+    r = cfx.rect;
     bool raw_hov = rect_contains(r, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -4169,22 +4381,40 @@ bool collapsing_header(const char* label, bool* open) {
     else slot.open = state;
     if (effects_enabled()) slot.progress = step_anim(slot.progress, state ? 1.0f : 0.0f, g_dt, 18.0f);
     else slot.progress = state ? 1.0f : 0.0f;
+    bool show_body = state || (effects_enabled() && slot.progress > 0.001f);
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || state);
     Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover * 0.40f);
     bg = lerp_color(bg, g_style.panel, state ? 0.10f : 0.0f);
     Color border = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.55f : 0.0f) + (state ? 0.16f : 0.0f));
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
     Rect arrow_r = {r.x + 10.0f, r.y + (r.h - 10.0f) * 0.5f, 10.0f, 10.0f};
     fill_triangle(arrow_r, slot.progress > 0.5f ? 0 : 2, maybe_disabled(g_style.text_dim));
     Rect text_r = {r.x + 28.0f, r.y, r.w - 32.0f, r.h};
     draw_text_utf8(vis, text_r, maybe_disabled(g_style.text));
+    if (cfx.clip_active) pop_clip();
+
+    if (show_body) {
+        float body_top_target = g_ctx.cursor_y;
+        float body_top_display = transformed_layout_y(body_top_target);
+        if (effects_enabled() && slot.body_height > 0.5f && g_active_collapse_fx_count < 16) {
+            ActiveCollapseFx& fx = g_active_collapse_fx[g_active_collapse_fx_count++];
+            fx.key = id;
+            fx.top_target = body_top_target;
+            fx.top_display = body_top_display;
+            fx.body_height = slot.body_height;
+            fx.progress = ease_smooth(slot.progress);
+        }
+        g_pending_collapse_key = id;
+        g_pending_collapse_start_y = body_top_target;
+    }
 
     mark_last_item(id, r, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {0.8f,0.4f,0.1f,0.4f});
-    return state;
+    return show_body;
 }
 
 void scroll_area(const char* label, float height, std::function<void()> fn) {
@@ -4194,7 +4424,10 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
     int id = hash_str(hs);
     ScrollSlot& slot = scroll_slot_for(id ^ 0x442211);
 
-    Rect r = {}, outer = next_labeled_rect(vis, height, &r);
+    Rect target_r = {}, target_outer = next_labeled_rect(vis, height, &target_r);
+    CollapseRectFx cfx = collapse_rect_fx(target_outer);
+    Rect outer = cfx.rect;
+    Rect r = labeled_body_rect(vis, outer);
     bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
     bool enabled = widget_interaction_enabled();
     bool hov = raw_hov && enabled;
@@ -4202,6 +4435,8 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
     bool had_scroll_prev = slot.content > (r.h - 12.0f);
     float sb_reserve = had_scroll_prev ? 10.0f : 0.0f;
     Rect inner = {r.x + 6.0f, r.y + 6.0f, r.w - 12.0f - sb_reserve, r.h - 12.0f};
+    if (inner.w < 0.0f) inner.w = 0.0f;
+    if (inner.h < 0.0f) inner.h = 0.0f;
 
     if (hov && g_input.wheel_y != 0.0f) {
         slot.target -= g_input.wheel_y;
@@ -4211,9 +4446,12 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, false, false);
     Color panel_col = lerp_color(g_style.panel, g_style.input_bg, motion.hover * 0.12f);
+    if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(g_style.border), motion.hover, 0.0f, 0.0f);
 
     Rect clip_r = {r.x + 2.0f, r.y + 2.0f, r.w - 4.0f, r.h - 4.0f};
+    if (clip_r.w < 0.0f) clip_r.w = 0.0f;
+    if (clip_r.h < 0.0f) clip_r.h = 0.0f;
     push_clip(clip_r);
 
     Rect saved_region = g_ctx.content_region;
@@ -4273,6 +4511,7 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
     }
 
     draw_widget_label(vis, outer, false);
+    if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, outer, raw_hov, false);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.3f,1.0f,0.4f,0.4f});
