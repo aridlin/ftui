@@ -36,8 +36,10 @@
 #include <cmath>
 #include <initializer_list>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <functional>
+#include <cassert>
 
 // ============================================================
 // Public API
@@ -50,11 +52,41 @@ enum class Align { Start, Center, End };
 struct Color { float r, g, b, a; };
 
 struct Style {
-    Color background, panel, text, text_dim, border;
-    Color button, button_hover, button_active;
-    Color input_bg, input_focus;
-    float window_padding, item_spacing, item_height;
-    float rounding, border_width, font_size;
+    Color background    = {0.055f,0.055f,0.059f,1.0f};
+    Color panel         = {0.090f,0.094f,0.102f,1.0f};
+    Color text          = {0.910f,0.910f,0.910f,1.0f};
+    Color text_dim      = {0.663f,0.678f,0.702f,1.0f};
+    Color border        = {0.169f,0.176f,0.192f,1.0f};
+    Color button        = {0.090f,0.094f,0.102f,1.0f};
+    Color button_hover  = {0.137f,0.149f,0.169f,1.0f};
+    Color button_active = {0.176f,0.192f,0.220f,1.0f};
+    Color input_bg      = {0.071f,0.075f,0.082f,1.0f};
+    Color input_focus   = {0.310f,0.420f,0.780f,1.0f};
+    Color accent        = {0.310f,0.420f,0.780f,1.0f};
+    Color warning       = {0.894f,0.486f,0.353f,1.0f};
+    Color success       = {0.420f,0.741f,0.522f,1.0f};
+    float window_padding = 20.0f;
+    float item_spacing   = 10.0f;
+    float item_height    = 36.0f;
+    float rounding       = 8.0f;
+    float border_width   = 1.0f;
+    float font_size      = 16.0f;
+};
+
+enum class ColorRole {
+    Background,
+    Panel,
+    Text,
+    TextDim,
+    Border,
+    Button,
+    ButtonHover,
+    ButtonActive,
+    InputBg,
+    InputFocus,
+    Accent,
+    Warning,
+    Success,
 };
 
 Style default_dark_style();
@@ -65,6 +97,11 @@ Style one_dark_style();
 
 void         set_style(const Style& s);
 const Style& get_style();
+Color        color_from_hex(const char* hex);
+Color        color_from_hex(std::string_view hex);
+void         push_color(ColorRole role, Color color);
+void         pop_color();
+void         set_next_color(ColorRole role, Color color);
 
 enum class BuiltinIcon {
     Symbol,
@@ -149,6 +186,8 @@ void log_view(const char* label, const char* text, int rows = 8,
 bool checkbox(const char* label, bool* value);
 bool slider_float(const char* label, float* value, float min_v, float max_v);
 bool button(const char* label);
+bool button(const char* label, ColorRole role);
+bool button(const char* label, Color color);
 bool dropdown(const char* label, const char* const* items, int count, int* selected, int popup_rows = 8);
 bool listbox(const char* label, const char* const* items, int count, int* selected, int visible_rows = 6);
 bool radio_group(const char* label, const char* const* items, int count, int* selected, int columns = 1);
@@ -256,6 +295,14 @@ namespace internal {
 static Style startup_style() {
     return FTUI_DEFAULT_STYLE();
 }
+
+static const Style& fallback_style() {
+    static Style s = startup_style();
+    return s;
+}
+
+static constexpr int kColorRoleCount = 13;
+static constexpr int kColorOverrideStackCap = 64;
 
 static int hash_str(const char* s) {
     unsigned h = 2166136261u;
@@ -438,7 +485,25 @@ struct DropdownOverlayState {
     float scroll = 0;
     float popup_h = 0;
     float popup_p = 1.0f;
+    Color popup_fill = {};
+    Color popup_border = {};
+    Color item_hover = {};
+    Color item_selected = {};
+    Color item_text = {};
+    Color item_text_selected = {};
+    Color scrollbar_thumb = {};
+    Color scrollbar_track = {};
     std::vector<std::string> labels;
+};
+
+struct ColorOverrideEntry {
+    ColorRole role = ColorRole::Text;
+    Color color = {};
+};
+
+struct ColorOverrideTable {
+    bool used[kColorRoleCount] = {};
+    Color colors[kColorRoleCount] = {};
 };
 
 // ---- Shared globals -------------------------------------------------
@@ -475,6 +540,11 @@ static NextLayoutState g_next_layout;
 static TooltipState g_tooltip;
 static DropdownOverlayState g_dropdown_overlay;
 static DropdownOverlayState g_dropdown_overlay_prev;
+static ColorOverrideEntry g_color_stack[kColorOverrideStackCap];
+static int        g_color_stack_count = 0;
+static ColorOverrideTable g_next_color_pending;
+static ColorOverrideTable g_active_widget_colors;
+static int        g_active_widget_color_depth = 0;
 static ActiveCollapseFx g_active_collapse_fx[16];
 static int        g_active_collapse_fx_count = 0;
 static int        g_pending_collapse_key = 0;
@@ -543,6 +613,126 @@ static Color with_alpha(Color c, float a) {
     return c;
 }
 
+static int color_role_index(ColorRole role) {
+    switch (role) {
+        case ColorRole::Background:  return 0;
+        case ColorRole::Panel:       return 1;
+        case ColorRole::Text:        return 2;
+        case ColorRole::TextDim:     return 3;
+        case ColorRole::Border:      return 4;
+        case ColorRole::Button:      return 5;
+        case ColorRole::ButtonHover: return 6;
+        case ColorRole::ButtonActive:return 7;
+        case ColorRole::InputBg:     return 8;
+        case ColorRole::InputFocus:  return 9;
+        case ColorRole::Accent:      return 10;
+        case ColorRole::Warning:     return 11;
+        case ColorRole::Success:     return 12;
+    }
+    return 2;
+}
+
+static Color style_color_for_role(const Style& style, ColorRole role) {
+    switch (role) {
+        case ColorRole::Background:   return style.background;
+        case ColorRole::Panel:        return style.panel;
+        case ColorRole::Text:         return style.text;
+        case ColorRole::TextDim:      return style.text_dim;
+        case ColorRole::Border:       return style.border;
+        case ColorRole::Button:       return style.button;
+        case ColorRole::ButtonHover:  return style.button_hover;
+        case ColorRole::ButtonActive: return style.button_active;
+        case ColorRole::InputBg:      return style.input_bg;
+        case ColorRole::InputFocus:   return style.input_focus;
+        case ColorRole::Accent:       return style.accent;
+        case ColorRole::Warning:      return style.warning;
+        case ColorRole::Success:      return style.success;
+    }
+    return style.text;
+}
+
+static Color resolve_color(ColorRole role) {
+    int idx = color_role_index(role);
+    if (g_active_widget_color_depth > 0 && g_active_widget_colors.used[idx]) {
+        return g_active_widget_colors.colors[idx];
+    }
+    for (int i = g_color_stack_count - 1; i >= 0; --i) {
+        if (g_color_stack[i].role == role) return g_color_stack[i].color;
+    }
+    return style_color_for_role(g_style, role);
+}
+
+struct WidgetColorScope {
+    ColorOverrideTable prev = {};
+    ColorOverrideTable own = {};
+    int prev_depth = 0;
+    bool active = false;
+
+    WidgetColorScope() {
+        prev = g_active_widget_colors;
+        prev_depth = g_active_widget_color_depth;
+        own = g_next_color_pending;
+        g_active_widget_colors = own;
+        g_active_widget_color_depth = 1;
+        g_next_color_pending = {};
+        active = true;
+    }
+
+    void suspend_for_children() {
+        if (!active) return;
+        g_active_widget_colors = {};
+        g_active_widget_color_depth = 0;
+    }
+
+    void resume_after_children() {
+        if (!active) return;
+        g_active_widget_colors = own;
+        g_active_widget_color_depth = 1;
+    }
+
+    ~WidgetColorScope() {
+        if (!active) return;
+        g_active_widget_colors = prev;
+        g_active_widget_color_depth = prev_depth;
+    }
+};
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static Color parse_hex_color(std::string_view hex) {
+    constexpr Color fallback = {1.0f, 1.0f, 1.0f, 1.0f};
+    auto fail = [&]() -> Color {
+#ifndef NDEBUG
+        assert(false && "ftui::color_from_hex: invalid hex color");
+#endif
+        return fallback;
+    };
+
+    if (hex.size() != 7 && hex.size() != 9) return fail();
+    if (hex.empty() || hex[0] != '#') return fail();
+
+    unsigned bytes[4] = {255u, 255u, 255u, 255u};
+    int count = hex.size() == 7 ? 3 : 4;
+    for (int i = 0; i < count; ++i) {
+        int hi = hex_nibble(hex[1 + i * 2]);
+        int lo = hex_nibble(hex[2 + i * 2]);
+        if (hi < 0 || lo < 0) return fail();
+        bytes[i] = (unsigned)((hi << 4) | lo);
+    }
+
+    return {
+        bytes[0] / 255.0f,
+        bytes[1] / 255.0f,
+        bytes[2] / 255.0f,
+        bytes[3] / 255.0f,
+    };
+}
+
 static Rect offset_rect(Rect r, float dx, float dy) {
     r.x += dx; r.y += dy; return r;
 }
@@ -591,7 +781,7 @@ static float clampf(float v, float lo, float hi) {
 }
 
 static Color disabled_color(Color c) {
-    Color out = lerp_color(c, g_style.panel, 0.42f);
+    Color out = lerp_color(c, resolve_color(ColorRole::Panel), 0.42f);
     out.a *= 0.70f;
     return out;
 }
@@ -723,11 +913,11 @@ static void draw_widget_chrome(Rect r, float rounding, Color fill, Color border,
 
     float glow = clamp01(hover_p * 0.45f + active_p * 0.65f + focus_p * 0.80f);
     Color shadow = {0.0f, 0.0f, 0.0f, 0.07f + glow * 0.08f};
-    Color shell = lerp_color(fill, g_style.panel, 0.12f);
-    shell = lerp_color(shell, g_style.input_focus, hover_p * 0.03f + focus_p * 0.05f);
+    Color shell = lerp_color(fill, resolve_color(ColorRole::Panel), 0.12f);
+    shell = lerp_color(shell, resolve_color(ColorRole::InputFocus), hover_p * 0.03f + focus_p * 0.05f);
     shell.a = clamp01(0.94f + hover_p * 0.02f + focus_p * 0.02f);
     Color inner = {1.0f, 1.0f, 1.0f, 0.025f + hover_p * 0.015f + focus_p * 0.020f};
-    Color rim = lerp_color(border, g_style.input_focus, clamp01(active_p * 0.35f + focus_p * 0.55f));
+    Color rim = lerp_color(border, resolve_color(ColorRole::InputFocus), clamp01(active_p * 0.35f + focus_p * 0.55f));
     rim.a = clamp01(0.50f + glow * 0.18f);
 
     fill_round_rect(offset_rect(r, 0.0f, 1.0f), rounding + 0.5f, shadow);
@@ -830,16 +1020,16 @@ static void draw_tooltip_overlay() {
     if (r.x < 8.0f) r.x = 8.0f;
     if (r.y < 8.0f) r.y = 8.0f;
 
-    Color fill = lerp_color(g_style.panel, g_style.background, 0.18f);
+    Color fill = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Background), 0.18f);
     fill.a = 0.98f * g_tooltip.opacity;
-    Color border = g_style.border; border.a *= g_tooltip.opacity;
+    Color border = resolve_color(ColorRole::Border); border.a *= g_tooltip.opacity;
     draw_widget_chrome(r, fmaxf(4.0f, g_style.rounding * 0.75f), fill, border, 0.0f, 0.0f, 0.0f);
 
     for (size_t i = 0; i < lines.size(); ++i) {
         TextRange tr = lines[i];
         std::string line(g_tooltip.text.c_str() + tr.start, g_tooltip.text.c_str() + tr.end);
         Rect lr = {r.x + pad, r.y + pad + (float)i * lh, r.w - pad * 2.0f, lh};
-        Color text = g_style.text; text.a *= g_tooltip.opacity;
+        Color text = resolve_color(ColorRole::Text); text.a *= g_tooltip.opacity;
         draw_text_utf8(line.c_str(), lr, text);
     }
 }
@@ -848,18 +1038,12 @@ static void draw_dropdown_overlay() {
     if (!g_dropdown_overlay.active || g_dropdown_overlay.labels.empty() || g_dropdown_overlay.count <= 0) return;
 
     const DropdownOverlayState& ov = g_dropdown_overlay;
-    Color popup_fill = g_style.panel;
-    Color popup_border = g_style.border;
 #if FTUI_WINDOWS_EFFECTS
     if (effects_enabled()) {
         draw_previous_frame_blur_panel(ov.popup_r, ov.popup_p);
-        popup_fill = lerp_color(g_style.panel, g_style.background, 0.08f);
-        popup_fill.a = 0.92f;
-        popup_border = lerp_color(g_style.border, g_style.input_focus, 0.18f);
-        popup_border.a = 0.98f;
     }
 #endif
-    draw_widget_chrome(ov.popup_r, g_style.rounding, maybe_disabled(popup_fill), maybe_disabled(popup_border), 0.0f, 0.0f, 0.0f);
+    draw_widget_chrome(ov.popup_r, g_style.rounding, maybe_disabled(ov.popup_fill), maybe_disabled(ov.popup_border), 0.0f, 0.0f, 0.0f);
 
     Rect clip_r = {ov.popup_r.x + 2.0f, ov.popup_r.y + 2.0f, ov.popup_r.w - 4.0f, ov.popup_r.h - 4.0f};
     push_clip(clip_r);
@@ -868,12 +1052,12 @@ static void draw_dropdown_overlay() {
         if (ir.y + ir.h < ov.popup_r.y || ir.y > ov.popup_r.y + ov.popup_r.h) continue;
         bool item_hov = ov.open && rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
         bool item_sel = (ov.selected_index == i);
-        Color item_bg = item_sel ? with_alpha(g_style.input_focus, 0.22f) :
-                        item_hov ? with_alpha(g_style.button_hover, 0.35f) :
-                                   with_alpha(g_style.panel, 0.0f);
+        Color item_bg = item_sel ? ov.item_selected :
+                        item_hov ? ov.item_hover :
+                                   Color{0.0f, 0.0f, 0.0f, 0.0f};
         if (item_bg.a > 0.0f) fill_round_rect(ir, g_style.rounding * 0.6f, maybe_disabled(item_bg));
         Rect itr = {ir.x + 8.0f, ir.y, ir.w - 16.0f, ir.h};
-        draw_text_utf8(ov.labels[i].c_str(), itr, maybe_disabled(item_sel ? g_style.text : g_style.text_dim));
+        draw_text_utf8(ov.labels[i].c_str(), itr, maybe_disabled(item_sel ? ov.item_text_selected : ov.item_text));
     }
     pop_clip();
 
@@ -888,9 +1072,8 @@ static void draw_dropdown_overlay() {
             float thumb_y = ov.popup_r.y + 4.0f + (ov.scroll / max_scroll) * (visible_h - thumb_h);
             Rect track_r = {ov.popup_r.x + ov.popup_r.w - 8.0f, ov.popup_r.y + 4.0f, 4.0f, ov.popup_r.h - 8.0f};
             Rect thumb_r = {track_r.x, thumb_y, track_r.w, thumb_h};
-            Color track_c = g_style.border; track_c.a = 0.3f;
-            fill_round_rect(track_r, 2.0f, maybe_disabled(track_c));
-            fill_round_rect(thumb_r, 2.0f, maybe_disabled(g_style.text_dim));
+            fill_round_rect(track_r, 2.0f, maybe_disabled(ov.scrollbar_track));
+            fill_round_rect(thumb_r, 2.0f, maybe_disabled(ov.scrollbar_thumb));
         }
     }
 }
@@ -912,7 +1095,7 @@ static void draw_widget_label(const char* vis, Rect outer, bool emphasized = fal
     if (!vis || !vis[0]) return;
     float label_h = widget_label_height(vis);
     Rect lr = {outer.x, outer.y, outer.w, label_h};
-    draw_text_utf8(vis, lr, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, emphasized ? 0.22f : 0.0f)));
+    draw_text_utf8(vis, lr, maybe_disabled(lerp_color(resolve_color(ColorRole::TextDim), resolve_color(ColorRole::Text), emphasized ? 0.22f : 0.0f)));
 }
 
 static Rect rect_intersection(Rect a, Rect b) {
@@ -1123,6 +1306,31 @@ static void apply_cmd_theme() {
 void set_quit_on_ctrl_q(bool e) { internal::g_shortcuts_enabled = e; }
 void set_style(const Style& s)  { internal::g_style = s; internal::sync_native_window_chrome(); }
 const Style& get_style()         { return internal::g_style; }
+Color color_from_hex(const char* hex) { return internal::parse_hex_color(hex ? std::string_view(hex) : std::string_view{}); }
+Color color_from_hex(std::string_view hex) { return internal::parse_hex_color(hex); }
+void push_color(ColorRole role, Color color) {
+    if (internal::g_color_stack_count >= internal::kColorOverrideStackCap) {
+#ifndef NDEBUG
+        assert(false && "ftui::push_color: override stack overflow");
+#endif
+        return;
+    }
+    internal::g_color_stack[internal::g_color_stack_count++] = {role, color};
+}
+void pop_color() {
+    if (internal::g_color_stack_count <= 0) {
+#ifndef NDEBUG
+        assert(false && "ftui::pop_color: override stack underflow");
+#endif
+        return;
+    }
+    internal::g_color_stack_count--;
+}
+void set_next_color(ColorRole role, Color color) {
+    int idx = internal::color_role_index(role);
+    internal::g_next_color_pending.used[idx] = true;
+    internal::g_next_color_pending.colors[idx] = color;
+}
 void set_window_icon(void* native_icon) { internal::apply_window_icon_handles(native_icon, native_icon, false, BuiltinIcon::Symbol); }
 void set_window_icon_builtin(BuiltinIcon variant) { internal::apply_window_icon_handles(nullptr, nullptr, true, variant); }
 DebugState&  debug()             { return internal::g_debug; }
@@ -1181,6 +1389,7 @@ Style default_dark_style() {
     s.border = {0.169f,0.176f,0.192f,1}; s.button = {0.090f,0.094f,0.102f,1};
     s.button_hover = {0.137f,0.149f,0.169f,1}; s.button_active = {0.176f,0.192f,0.220f,1};
     s.input_bg = {0.071f,0.075f,0.082f,1}; s.input_focus = {0.310f,0.420f,0.780f,1};
+    s.accent = s.input_focus; s.warning = {0.894f,0.486f,0.353f,1}; s.success = {0.420f,0.741f,0.522f,1};
     s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=8; s.border_width=1; s.font_size=16;
     return s;
 }
@@ -1191,6 +1400,7 @@ Style catppuccin_mocha_style() {
     s.border = {0.271f,0.278f,0.353f,1}; s.button = {0.192f,0.196f,0.267f,1};
     s.button_hover = {0.271f,0.278f,0.353f,1}; s.button_active = {0.341f,0.349f,0.431f,1};
     s.input_bg = {0.149f,0.149f,0.220f,1}; s.input_focus = {0.537f,0.706f,0.980f,1};
+    s.accent = s.input_focus; s.warning = {0.961f,0.471f,0.561f,1}; s.success = {0.651f,0.890f,0.631f,1};
     s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=8; s.border_width=1; s.font_size=16;
     return s;
 }
@@ -1201,6 +1411,7 @@ Style nord_style() {
     s.border = {0.263f,0.298f,0.369f,1}; s.button = {0.231f,0.259f,0.322f,1};
     s.button_hover = {0.263f,0.298f,0.369f,1}; s.button_active = {0.298f,0.337f,0.416f,1};
     s.input_bg = {0.200f,0.227f,0.282f,1}; s.input_focus = {0.533f,0.753f,0.816f,1};
+    s.accent = s.input_focus; s.warning = {0.816f,0.529f,0.440f,1}; s.success = {0.639f,0.745f,0.549f,1};
     s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=6; s.border_width=1; s.font_size=16;
     return s;
 }
@@ -1211,6 +1422,7 @@ Style gruvbox_dark_style() {
     s.border = {0.314f,0.294f,0.282f,1}; s.button = {0.235f,0.220f,0.212f,1};
     s.button_hover = {0.314f,0.294f,0.282f,1}; s.button_active = {0.400f,0.373f,0.329f,1};
     s.input_bg = {0.196f,0.188f,0.188f,1}; s.input_focus = {0.271f,0.522f,0.533f,1};
+    s.accent = s.input_focus; s.warning = {0.984f,0.490f,0.247f,1}; s.success = {0.722f,0.733f,0.247f,1};
     s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=4; s.border_width=1; s.font_size=16;
     return s;
 }
@@ -1221,6 +1433,7 @@ Style one_dark_style() {
     s.border = {0.208f,0.231f,0.271f,1}; s.button = {0.173f,0.192f,0.227f,1};
     s.button_hover = {0.208f,0.231f,0.271f,1}; s.button_active = {0.247f,0.278f,0.329f,1};
     s.input_bg = {0.145f,0.161f,0.192f,1}; s.input_focus = {0.380f,0.686f,0.937f,1};
+    s.accent = s.input_focus; s.warning = {0.878f,0.423f,0.458f,1}; s.success = {0.596f,0.757f,0.420f,1};
     s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=6; s.border_width=1; s.font_size=16;
     return s;
 }
@@ -2025,6 +2238,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         int pending_collapse_key;
         float pending_collapse_start_y;
         NextLayoutState next_layout;
+        ColorOverrideEntry color_stack[kColorOverrideStackCap];
+        int color_stack_count;
+        ColorOverrideTable next_color_pending, active_widget_colors;
+        int active_widget_color_depth;
         TooltipState tooltip;
         DropdownOverlayState dropdown_overlay, dropdown_overlay_prev;
         int disabled_depth, focus_request_id, modal_open_id, modal_request_id, dropdown_open_id;
@@ -2052,6 +2269,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.pending_collapse_key = g_pending_collapse_key;
     s.pending_collapse_start_y = g_pending_collapse_start_y;
     s.next_layout=g_next_layout;
+    memcpy(s.color_stack, g_color_stack, sizeof(g_color_stack));
+    s.color_stack_count = g_color_stack_count;
+    s.next_color_pending = g_next_color_pending;
+    s.active_widget_colors = g_active_widget_colors;
+    s.active_widget_color_depth = g_active_widget_color_depth;
     s.tooltip=g_tooltip;
     s.dropdown_overlay=g_dropdown_overlay;
     s.dropdown_overlay_prev=g_dropdown_overlay_prev;
@@ -2086,6 +2308,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_pending_collapse_key = 0;
     g_pending_collapse_start_y = 0.0f;
     g_next_layout={}; g_tooltip={}; g_dropdown_overlay={}; g_dropdown_overlay_prev={}; g_disabled_depth=0; g_focus_request_id=0;
+    memcpy(g_color_stack, s.color_stack, sizeof(g_color_stack));
+    g_color_stack_count = s.color_stack_count;
+    g_next_color_pending = s.next_color_pending;
+    g_active_widget_colors = s.active_widget_colors;
+    g_active_widget_color_depth = s.active_widget_color_depth;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     g_dropdown_capture_input=false;
     reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
@@ -2141,6 +2368,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_pending_collapse_key = s.pending_collapse_key;
     g_pending_collapse_start_y = s.pending_collapse_start_y;
     g_next_layout=s.next_layout;
+    memcpy(g_color_stack, s.color_stack, sizeof(g_color_stack));
+    g_color_stack_count = s.color_stack_count;
+    g_next_color_pending = s.next_color_pending;
+    g_active_widget_colors = s.active_widget_colors;
+    g_active_widget_color_depth = s.active_widget_color_depth;
     g_tooltip=s.tooltip;
     g_dropdown_overlay=s.dropdown_overlay;
     g_dropdown_overlay_prev=s.dropdown_overlay_prev;
@@ -2759,6 +2991,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         int pending_collapse_key;
         float pending_collapse_start_y;
         NextLayoutState next_layout;
+        ColorOverrideEntry color_stack[kColorOverrideStackCap];
+        int color_stack_count;
+        ColorOverrideTable next_color_pending, active_widget_colors;
+        int active_widget_color_depth;
         TooltipState tooltip;
         DropdownOverlayState dropdown_overlay, dropdown_overlay_prev;
         int disabled_depth, focus_request_id, modal_open_id, modal_request_id, dropdown_open_id;
@@ -2784,6 +3020,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.pending_collapse_key = g_pending_collapse_key;
     s.pending_collapse_start_y = g_pending_collapse_start_y;
     s.next_layout=g_next_layout;
+    memcpy(s.color_stack, g_color_stack, sizeof(g_color_stack));
+    s.color_stack_count = g_color_stack_count;
+    s.next_color_pending = g_next_color_pending;
+    s.active_widget_colors = g_active_widget_colors;
+    s.active_widget_color_depth = g_active_widget_color_depth;
     s.tooltip=g_tooltip;
     s.dropdown_overlay=g_dropdown_overlay;
     s.dropdown_overlay_prev=g_dropdown_overlay_prev;
@@ -2810,6 +3051,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_pending_collapse_key = 0;
     g_pending_collapse_start_y = 0.0f;
     g_next_layout={}; g_tooltip={}; g_dropdown_overlay={}; g_dropdown_overlay_prev={}; g_disabled_depth=0; g_focus_request_id=0;
+    memcpy(g_color_stack, s.color_stack, sizeof(g_color_stack));
+    g_color_stack_count = s.color_stack_count;
+    g_next_color_pending = s.next_color_pending;
+    g_active_widget_colors = s.active_widget_colors;
+    g_active_widget_color_depth = s.active_widget_color_depth;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     g_dropdown_capture_input=false;
     reset_effect_state(false);
@@ -2854,6 +3100,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_pending_collapse_key = s.pending_collapse_key;
     g_pending_collapse_start_y = s.pending_collapse_start_y;
     g_next_layout=s.next_layout;
+    memcpy(g_color_stack, s.color_stack, sizeof(g_color_stack));
+    g_color_stack_count = s.color_stack_count;
+    g_next_color_pending = s.next_color_pending;
+    g_active_widget_colors = s.active_widget_colors;
+    g_active_widget_color_depth = s.active_widget_color_depth;
     g_tooltip=s.tooltip;
     g_dropdown_overlay=s.dropdown_overlay;
     g_dropdown_overlay_prev=s.dropdown_overlay_prev;
@@ -2920,6 +3171,7 @@ using namespace internal;
 
 void text(const char* label) {
     if (!g_drawing) return;
+    WidgetColorScope color_scope;
     char vis[256]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     float h = g_style.item_height;
@@ -2928,13 +3180,14 @@ void text(const char* label) {
     r = cfx.rect;
     if (cfx.clip_active) push_clip(cfx.clip);
     if (g_debug.show_layout_rects) stroke_round_rect(r, 0, 1, {1,0,0,0.4f});
-    draw_text_utf8(vis, r, maybe_disabled(g_style.text));
+    draw_text_utf8(vis, r, maybe_disabled(resolve_color(ColorRole::Text)));
     if (cfx.clip_active) pop_clip();
     mark_last_item(0, r, rect_contains(r, g_input.mouse_x, g_input.mouse_y), false);
 }
 
 void text_wrapped(const char* text) {
     if (!g_drawing) return;
+    WidgetColorScope color_scope;
     std::vector<TextRange> lines;
     compute_wrapped_ranges(text ? text : "", g_ctx.content_region.w, true, lines);
     float lh = text_line_height();
@@ -2942,11 +3195,12 @@ void text_wrapped(const char* text) {
     CollapseRectFx cfx = collapse_rect_fx(r);
     r = cfx.rect;
     if (cfx.clip_active) push_clip(cfx.clip);
+    Color text_col = maybe_disabled(resolve_color(ColorRole::Text));
     float y = r.y;
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string line((text ? text : "") + lines[i].start, (text ? text : "") + lines[i].end);
         Rect lr = {r.x, y, r.w, lh};
-        draw_text_utf8(line.c_str(), lr, maybe_disabled(g_style.text));
+        draw_text_utf8(line.c_str(), lr, text_col);
         y += lh;
     }
     if (cfx.clip_active) pop_clip();
@@ -2955,13 +3209,14 @@ void text_wrapped(const char* text) {
 
 void separator() {
     if (!g_drawing) return;
+    WidgetColorScope color_scope;
     float h = g_style.item_spacing * 2 + 1;
     Rect r = next_rect(h);
     CollapseRectFx cfx = collapse_rect_fx(r);
     r = cfx.rect;
     if (cfx.clip_active) push_clip(cfx.clip);
     float my = r.y + r.h * 0.5f;
-    draw_line(r.x, my, r.x + r.w, my, 1.0f, g_style.border);
+    draw_line(r.x, my, r.x + r.w, my, 1.0f, resolve_color(ColorRole::Border));
     if (cfx.clip_active) pop_clip();
 }
 
@@ -2970,8 +3225,9 @@ void spacing(float px) {
     next_rect(px);
 }
 
-bool button(const char* label) {
+static bool button_impl(const char* label, const Color* tint_override, const ColorRole* tint_role) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[256]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -2997,15 +3253,28 @@ bool button(const char* label) {
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, raw_hov, enabled && g_ctx.active_id == id, focused);
 
-    Color bg = lerp_color(g_style.button, g_style.panel, 0.30f);
-    bg = lerp_color(bg, g_style.button_hover, 0.20f + motion.hover * 0.35f);
-    bg = lerp_color(bg, g_style.input_focus, 0.06f + motion.hover * 0.05f + motion.active * 0.14f);
-    bg = lerp_color(bg, g_style.button_active, motion.active * 0.35f);
-    Color border = lerp_color(g_style.border, g_style.input_focus, 0.12f + motion.hover * 0.14f + motion.active * 0.22f);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color tint = tint_override ? *tint_override : (tint_role ? resolve_color(*tint_role) : resolve_color(ColorRole::Button));
+    Color button = tint_override || tint_role ? tint : resolve_color(ColorRole::Button);
+    Color button_hover = tint_override || tint_role ? lerp_color(tint, resolve_color(ColorRole::ButtonHover), 0.35f)
+                                       : resolve_color(ColorRole::ButtonHover);
+    Color button_active = tint_override || tint_role ? lerp_color(tint, resolve_color(ColorRole::ButtonActive), 0.30f)
+                                        : resolve_color(ColorRole::ButtonActive);
+    Color border_base = tint_override || tint_role ? lerp_color(resolve_color(ColorRole::Border), tint, 0.10f)
+                                      : resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color text = resolve_color(ColorRole::Text);
+
+    Color bg = lerp_color(button, panel, 0.30f);
+    bg = lerp_color(bg, button_hover, 0.20f + motion.hover * 0.35f);
+    bg = lerp_color(bg, focus, 0.06f + motion.hover * 0.05f + motion.active * 0.14f);
+    bg = lerp_color(bg, button_active, motion.active * 0.35f);
+    Color border = lerp_color(border_base, focus, 0.12f + motion.hover * 0.14f + motion.active * 0.22f);
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
     Rect text_r = offset_rect(r, 0.0f, motion.active * 1.0f);
-    draw_text_utf8_centered(vis, text_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, 0.72f + motion.hover * 0.20f + motion.active * 0.08f)));
+    draw_text_utf8_centered(vis, text_r, maybe_disabled(lerp_color(text_dim, text, 0.72f + motion.hover * 0.20f + motion.active * 0.08f)));
     if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, r, raw_hov, focused);
@@ -3013,9 +3282,22 @@ bool button(const char* label) {
     return clicked;
 }
 
+bool button(const char* label) {
+    return button_impl(label, nullptr, nullptr);
+}
+
+bool button(const char* label, ColorRole role) {
+    return button_impl(label, nullptr, &role);
+}
+
+bool button(const char* label, Color color) {
+    return button_impl(label, &color, nullptr);
+}
+
 bool input(const char* label, char* buffer, int buffer_size,
            InputFlags flags, bool* enter_pressed) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -3176,8 +3458,13 @@ bool input(const char* label, char* buffer, int buffer_size,
     update_motion_slot(motion, raw_hov, enabled && hov && g_input.mouse_down, focused);
 
     // Draw
-    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
-    Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text = resolve_color(ColorRole::Text);
+    Color panel_col = lerp_color(input_bg, panel, motion.hover * 0.18f + motion.focus * 0.08f);
+    Color border_col = lerp_color(border, focus, motion.focus);
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
 
@@ -3213,17 +3500,17 @@ bool input(const char* label, char* buffer, int buffer_size,
         float sx = inner.x - scroll_x + measure_text_at(disp.c_str(), lo);
         float ex = inner.x - scroll_x + measure_text_at(disp.c_str(), hi);
         Rect sel_r = {sx, r.y + 4, ex - sx, r.h - 8};
-        Color sel_col = g_style.input_focus; sel_col.a = 0.35f;
+        Color sel_col = focus; sel_col.a = 0.35f;
         fill_rect(sel_r, sel_col);
     }
 
     Rect text_r = {inner.x - scroll_x, inner.y, inner.w + scroll_x, inner.h};
-    draw_text_utf8(disp.c_str(), text_r, maybe_disabled(g_style.text));
+    draw_text_utf8(disp.c_str(), text_r, maybe_disabled(text));
 
     // Cursor blink
     if (focused && (g_ctx.frame_index / 30) % 2 == 0) {
         float cx = inner.x - scroll_x + measure_text_at(disp.c_str(), g_text_cursor);
-        draw_line(cx, r.y + 5, cx, r.y + r.h - 5, 1.5f, maybe_disabled(g_style.text));
+        draw_line(cx, r.y + 5, cx, r.y + r.h - 5, 1.5f, maybe_disabled(text));
     }
 
     pop_clip();
@@ -3237,6 +3524,7 @@ bool input(const char* label, char* buffer, int buffer_size,
 
 bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, TextAreaFlags flags) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -3444,8 +3732,14 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, raw_hov, enabled && hov && g_input.mouse_down, focused);
-    Color border_col = lerp_color(g_style.border, g_style.input_focus, motion.focus);
-    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + motion.focus * 0.08f);
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color border_col = lerp_color(border, focus, motion.focus);
+    Color panel_col = lerp_color(input_bg, panel, motion.hover * 0.18f + motion.focus * 0.08f);
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
 
@@ -3480,7 +3774,7 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
                 float sx = r.x + pad_x + measure_text_at(buffer + tr.start, line_sel_lo - tr.start);
                 float ex = r.x + pad_x + measure_text_at(buffer + tr.start, line_sel_hi - tr.start);
                 Rect sel_r = {sx, line_y, ex - sx, lh};
-                Color sc = g_style.input_focus; sc.a = 0.35f;
+                Color sc = focus; sc.a = 0.35f;
                 fill_rect(sel_r, sc);
             }
         }
@@ -3488,12 +3782,12 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
         if (tr.end > tr.start) {
             std::string line_str(buffer + tr.start, buffer + tr.end);
             Rect lr = {r.x + pad_x, line_y, text_w, lh};
-            draw_text_utf8(line_str.c_str(), lr, maybe_disabled(g_style.text));
+            draw_text_utf8(line_str.c_str(), lr, maybe_disabled(text));
         }
 
         if (focused && g_ta_cursor >= tr.start && g_ta_cursor <= tr.end && (g_ctx.frame_index / 30) % 2 == 0) {
             float cx = r.x + pad_x + measure_text_at(buffer + tr.start, g_ta_cursor - tr.start);
-            draw_line(cx, line_y + 2, cx, line_y + lh - 2, 1.5f, maybe_disabled(g_style.text));
+            draw_line(cx, line_y + 2, cx, line_y + lh - 2, 1.5f, maybe_disabled(text));
         }
     }
 
@@ -3507,9 +3801,9 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
         float thumb_y = r.y + 4.0f + (ta_scroll_y / (total_h - visible_h)) * (visible_h - thumb_h);
         Rect track_r = {sb_x, r.y + 4.0f, sb_w, visible_h};
         Rect thumb_r = {sb_x, thumb_y, sb_w, thumb_h};
-        Color track_c = g_style.border; track_c.a = 0.3f;
+        Color track_c = border; track_c.a = 0.3f;
         fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
-        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(text_dim));
     }
 
     draw_widget_label(vis, outer, focused);
@@ -3526,6 +3820,7 @@ bool text_area(const char* label, char* buffer, int buffer_size, int rows) {
 
 void log_view(const char* label, const char* text, int rows, LogViewFlags flags) {
     if (!g_drawing) return;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -3602,8 +3897,14 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, raw_hov, false, focused);
-    Color border_col = lerp_color(g_style.border, g_style.input_focus, focused ? 0.7f : 0.0f);
-    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text_col = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color border_col = lerp_color(border, focus, focused ? 0.7f : 0.0f);
+    Color panel_col = lerp_color(input_bg, panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, 0.0f, focused ? 1.0f : 0.0f);
 
@@ -3627,14 +3928,14 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
                 float sx = r.x + pad_x + measure_text_at(src + tr.start, line_sel_lo - tr.start);
                 float ex = r.x + pad_x + measure_text_at(src + tr.start, line_sel_hi - tr.start);
                 Rect sel_r = {sx, line_y, ex - sx, lh};
-                Color sc = g_style.input_focus; sc.a = 0.30f;
+                Color sc = focus; sc.a = 0.30f;
                 fill_rect(sel_r, sc);
             }
         }
 
         std::string line(src + tr.start, src + tr.end);
         Rect lr = {r.x + pad_x, line_y, text_w, lh};
-        draw_text_utf8(line.c_str(), lr, maybe_disabled(g_style.text));
+        draw_text_utf8(line.c_str(), lr, maybe_disabled(text_col));
     }
     pop_clip();
 
@@ -3645,9 +3946,9 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
         float thumb_y = r.y + 4 + (slot.current / (total_h - visible_h)) * (visible_h - thumb_h);
         Rect track_r = {sb_x, r.y + 4, sb_w, visible_h};
         Rect thumb_r = {sb_x, thumb_y, sb_w, thumb_h};
-        Color track_c = g_style.border; track_c.a = 0.3f;
+        Color track_c = border; track_c.a = 0.3f;
         fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
-        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(text_dim));
     }
 
     draw_widget_label(vis, outer, focused);
@@ -3659,6 +3960,7 @@ void log_view(const char* label, const char* text, int rows, LogViewFlags flags)
 
 bool checkbox(const char* label, bool* value) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -3694,10 +3996,17 @@ bool checkbox(const char* label, bool* value) {
     Rect box = {r.x, r.y + (r.h - box_sz) * 0.5f, box_sz, box_sz};
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || *value);
-    Color bg = lerp_color(g_style.input_bg, g_style.panel, 0.14f);
-    bg = lerp_color(bg, g_style.button_hover, motion.hover * 0.28f);
-    bg = lerp_color(bg, g_style.input_focus, *value ? 0.14f : 0.04f);
-    Color border = lerp_color(g_style.border, g_style.input_focus, focused ? 0.85f : (*value ? 0.35f : 0.0f));
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color border_base = resolve_color(ColorRole::Border);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color bg = lerp_color(input_bg, panel, 0.14f);
+    bg = lerp_color(bg, button_hover, motion.hover * 0.28f);
+    bg = lerp_color(bg, focus, *value ? 0.14f : 0.04f);
+    Color border = lerp_color(border_base, focus, focused ? 0.85f : (*value ? 0.35f : 0.0f));
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(box, fmaxf(2.0f, g_style.rounding * 0.35f),
                        maybe_disabled(bg), maybe_disabled(border),
@@ -3706,13 +4015,13 @@ bool checkbox(const char* label, bool* value) {
     if (*value) {
         float inset = 5.0f;
         Rect mark = {box.x + inset, box.y + inset, box.w - inset * 2.0f, box.h - inset * 2.0f};
-        Color mark_fill = g_style.input_focus;
+        Color mark_fill = focus;
         mark_fill.a = 0.82f;
         fill_rect(mark, maybe_disabled(mark_fill));
     }
 
     Rect lbl_r = {box.x + box_sz + 8.0f, r.y, r.w - box_sz - 8.0f, r.h};
-    draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, 0.52f + motion.hover * 0.42f)));
+    draw_text_utf8(vis, lbl_r, maybe_disabled(lerp_color(text_dim, text, 0.52f + motion.hover * 0.42f)));
     if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, r, raw_hov, focused);
@@ -3722,6 +4031,7 @@ bool checkbox(const char* label, bool* value) {
 
 bool slider_float(const char* label, float* value, float min_v, float max_v) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -3773,28 +4083,37 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused);
 
-    Color track_bg = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f);
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color button = resolve_color(ColorRole::Button);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color button_active = resolve_color(ColorRole::ButtonActive);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color track_bg = lerp_color(input_bg, panel, motion.hover * 0.18f);
     if (cfx.clip_active) push_clip(cfx.clip);
     fill_round_rect(track_r, 3.0f, maybe_disabled(track_bg));
     stroke_round_rect(track_r, 3.0f, g_style.border_width,
-                      maybe_disabled(lerp_color(g_style.border, g_style.input_focus, focused ? 0.65f : motion.active * 0.25f)));
+                      maybe_disabled(lerp_color(border, focus, focused ? 0.65f : motion.active * 0.25f)));
 
     float t = max_v > min_v ? ((*value - min_v) / (max_v - min_v)) : 0.0f;
     t = clampf(t, 0.0f, 1.0f);
     Rect fill_r = {track_r.x, track_r.y, track_r.w * t, track_r.h};
-    if (fill_r.w > 0.0f) fill_round_rect(fill_r, 3.0f, maybe_disabled(with_alpha(g_style.input_focus, 0.78f + motion.active * 0.18f)));
+    if (fill_r.w > 0.0f) fill_round_rect(fill_r, 3.0f, maybe_disabled(with_alpha(focus, 0.78f + motion.active * 0.18f)));
 
     float knob_sz = 14.0f;
     Rect knob = {track_r.x + track_r.w * t - knob_sz * 0.5f, r.y + r.h * 0.5f - knob_sz * 0.5f, knob_sz, knob_sz};
-    Color knob_col = lerp_color(g_style.button, g_style.button_hover, motion.hover);
-    knob_col = lerp_color(knob_col, g_style.button_active, motion.active);
-    draw_widget_chrome(knob, knob_sz * 0.5f, maybe_disabled(knob_col), maybe_disabled(g_style.input_focus),
+    Color knob_col = lerp_color(button, button_hover, motion.hover);
+    knob_col = lerp_color(knob_col, button_active, motion.active);
+    draw_widget_chrome(knob, knob_sz * 0.5f, maybe_disabled(knob_col), maybe_disabled(focus),
                        motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
     char val_str[48];
     snprintf(val_str, sizeof(val_str), "%.2f", *value);
     Rect val_r = {r.x + r.w - value_w + 8.0f, r.y, value_w - 8.0f, r.h};
-    draw_text_utf8(val_str, val_r, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, motion.hover * 0.30f + (focused ? 0.35f : 0.0f))));
+    draw_text_utf8(val_str, val_r, maybe_disabled(lerp_color(text_dim, text, motion.hover * 0.30f + (focused ? 0.35f : 0.0f))));
     draw_widget_label(vis, outer, focused);
     if (cfx.clip_active) pop_clip();
 
@@ -3818,6 +4137,7 @@ void image(ImageHandle* img, float width, float height) {
 
 bool tabs(const char* const* labels, int count, int* selected) {
     if (!g_drawing || count <= 0) return false;
+    WidgetColorScope color_scope;
     float tab_h = g_style.item_height;
     Rect r = next_rect(tab_h);
     CollapseRectFx cfx = collapse_rect_fx(r);
@@ -3869,6 +4189,14 @@ bool tabs(const char* const* labels, int count, int* selected) {
     }
 
     if (cfx.clip_active) push_clip(cfx.clip);
+    Color button = resolve_color(ColorRole::Button);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color button_active = resolve_color(ColorRole::ButtonActive);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
     for (int i = 0; i < count; i++) {
         char vis[128]; const char* hs;
         split_label(labels[i], vis, sizeof(vis), &hs);
@@ -3900,12 +4228,12 @@ bool tabs(const char* const* labels, int count, int* selected) {
         MotionSlot& motion = motion_slot_for(id);
         update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || sel);
 
-        Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover * 0.45f);
-        bg = lerp_color(bg, g_style.panel, focused ? 0.18f : 0.0f);
-        bg = lerp_color(bg, g_style.button_active, sel ? 0.22f : motion.active * 0.75f);
-        Color border = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.55f : 0.0f) + (sel ? 0.18f : 0.0f));
-        draw_widget_chrome(tr, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
-        draw_text_utf8_centered(vis, tr, maybe_disabled(lerp_color(g_style.text_dim, g_style.text, clamp01((sel ? 0.55f : 0.0f) + motion.hover * 0.35f + (focused ? 0.35f : 0.0f)))));
+        Color bg = lerp_color(button, button_hover, motion.hover * 0.45f);
+        bg = lerp_color(bg, panel, focused ? 0.18f : 0.0f);
+        bg = lerp_color(bg, button_active, sel ? 0.22f : motion.active * 0.75f);
+        Color border_col = lerp_color(border, focus, (focused ? 0.55f : 0.0f) + (sel ? 0.18f : 0.0f));
+        draw_widget_chrome(tr, g_style.rounding, maybe_disabled(bg), maybe_disabled(border_col), motion.hover, motion.active, focused ? 1.0f : 0.0f);
+        draw_text_utf8_centered(vis, tr, maybe_disabled(lerp_color(text_dim, text, clamp01((sel ? 0.55f : 0.0f) + motion.hover * 0.35f + (focused ? 0.35f : 0.0f)))));
     }
 
     *selected = current_selected;
@@ -3944,7 +4272,7 @@ bool tabs(const char* const* labels, int count, int* selected) {
             fx.underline_w = target_w;
         }
         Rect accent = {fx.underline_x, r.y + r.h - 3, fx.underline_w, 3};
-        fill_round_rect(accent, 1.5f, with_alpha(g_style.input_focus, 0.78f));
+        fill_round_rect(accent, 1.5f, with_alpha(focus, 0.78f));
     }
 
     if (effects_enabled() && g_tab_content_owner == bar_id && fx.switch_t < 1.0f && !g_frame_content_fx.active) {
@@ -3968,6 +4296,7 @@ bool tabs(const char* const* labels, int count, int* selected) {
 
 bool dropdown(const char* label, const char* const* items, int count, int* selected, int popup_rows) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -4065,17 +4394,24 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov || popup_hov, enabled && g_ctx.active_id == id, focused);
-    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (open ? 0.10f : 0.0f));
-    Color border_col = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.65f : 0.0f) + (open ? 0.20f : 0.0f));
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color panel_col = lerp_color(input_bg, panel, motion.hover * 0.18f + (open ? 0.10f : 0.0f));
+    Color border_col = lerp_color(border, focus, (focused ? 0.65f : 0.0f) + (open ? 0.20f : 0.0f));
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col),
                        motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
     const char* current = (count > 0 && selected) ? items[*selected] : "(empty)";
     Rect text_r = {r.x + 10.0f, r.y, r.w - 34.0f, r.h};
-    draw_text_utf8(current ? current : "", text_r, maybe_disabled(g_style.text));
+    draw_text_utf8(current ? current : "", text_r, maybe_disabled(text));
     Rect arrow_r = {r.x + r.w - 22.0f, r.y + (r.h - 8.0f) * 0.5f, 10.0f, 8.0f};
-    fill_triangle(arrow_r, (open && open_up) ? 1 : 0, maybe_disabled(g_style.text_dim));
+    fill_triangle(arrow_r, (open && open_up) ? 1 : 0, maybe_disabled(text_dim));
     if (cfx.clip_active) pop_clip();
 
     if (popup_visible && popup_anim_h > 8.0f) {
@@ -4112,6 +4448,15 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
         g_dropdown_overlay.scroll = slot.current;
         g_dropdown_overlay.popup_h = popup_h;
         g_dropdown_overlay.popup_p = popup_p;
+        g_dropdown_overlay.popup_fill = with_alpha(panel, effects_enabled() ? 0.96f : 0.98f);
+        g_dropdown_overlay.popup_border = with_alpha(border, effects_enabled() ? 0.92f : 1.0f);
+        g_dropdown_overlay.item_hover = with_alpha(button_hover, 0.34f);
+        g_dropdown_overlay.item_selected = with_alpha(focus, 0.24f);
+        g_dropdown_overlay.item_text = text_dim;
+        g_dropdown_overlay.item_text_selected = text;
+        Color scrollbar_track = border; scrollbar_track.a = 0.30f;
+        g_dropdown_overlay.scrollbar_track = scrollbar_track;
+        g_dropdown_overlay.scrollbar_thumb = text_dim;
         g_dropdown_overlay.labels.clear();
         g_dropdown_overlay.labels.reserve((size_t)count);
         for (int i = 0; i < count; ++i) {
@@ -4136,6 +4481,7 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
 
 bool listbox(const char* label, const char* const* items, int count, int* selected, int visible_rows) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -4193,8 +4539,15 @@ bool listbox(const char* label, const char* const* items, int count, int* select
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, false, focused);
-    Color panel_col = lerp_color(g_style.input_bg, g_style.panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
-    Color border_col = lerp_color(g_style.border, g_style.input_focus, focused ? 0.7f : 0.0f);
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color panel_col = lerp_color(input_bg, panel, motion.hover * 0.18f + (focused ? 0.08f : 0.0f));
+    Color border_col = lerp_color(border, focus, focused ? 0.7f : 0.0f);
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col),
                        motion.hover, 0.0f, focused ? 1.0f : 0.0f);
@@ -4213,16 +4566,16 @@ bool listbox(const char* label, const char* const* items, int count, int* select
             if (selected) *selected = i;
         }
         bool item_sel = selected && *selected == i;
-        Color item_bg = item_sel ? with_alpha(g_style.input_focus, 0.22f) :
-                        item_hov ? with_alpha(g_style.button_hover, 0.30f) :
-                                   with_alpha(g_style.panel, 0.0f);
+        Color item_bg = item_sel ? with_alpha(focus, 0.22f) :
+                        item_hov ? with_alpha(button_hover, 0.30f) :
+                                   with_alpha(panel, 0.0f);
         if (item_bg.a > 0.0f) fill_round_rect(ir, g_style.rounding * 0.6f, maybe_disabled(item_bg));
         Rect item_text_r = {ir.x + 8.0f, ir.y, ir.w - 16.0f, ir.h};
-        draw_text_utf8(items[i] ? items[i] : "", item_text_r, maybe_disabled(item_sel ? g_style.text : g_style.text_dim));
+        draw_text_utf8(items[i] ? items[i] : "", item_text_r, maybe_disabled(item_sel ? text : text_dim));
     }
     if (count == 0) {
         Rect empty_r = {r.x + 8.0f, r.y, r.w - 16.0f, r.h};
-        draw_text_utf8("(empty)", empty_r, maybe_disabled(g_style.text_dim));
+        draw_text_utf8("(empty)", empty_r, maybe_disabled(text_dim));
     }
     pop_clip();
 
@@ -4233,9 +4586,9 @@ bool listbox(const char* label, const char* const* items, int count, int* select
         float thumb_y = r.y + 4.0f + (slot.current / (total_h - visible_h)) * (visible_h - thumb_h);
         Rect track_r = {sb_x, r.y + 4.0f, sb_w, visible_h};
         Rect thumb_r = {sb_x, thumb_y, sb_w, thumb_h};
-        Color track_c = g_style.border; track_c.a = 0.3f;
+        Color track_c = border; track_c.a = 0.3f;
         fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
-        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(g_style.text_dim));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(text_dim));
     }
 
     draw_widget_label(vis, outer, focused);
@@ -4248,6 +4601,7 @@ bool listbox(const char* label, const char* const* items, int count, int* select
 
 bool radio_group(const char* label, const char* const* items, int count, int* selected, int columns) {
     if (!g_drawing || count <= 0 || !selected) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int base_id = hash_str(hs);
@@ -4296,6 +4650,13 @@ bool radio_group(const char* label, const char* const* items, int count, int* se
         }
     }
 
+    Color button = resolve_color(ColorRole::Button);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color button_active = resolve_color(ColorRole::ButtonActive);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
     for (int i = 0; i < count; ++i) {
         int row_i = i / columns;
         int col_i = i % columns;
@@ -4322,21 +4683,21 @@ bool radio_group(const char* label, const char* const* items, int count, int* se
 
         MotionSlot& motion = motion_slot_for(ids[i]);
         update_motion_slot(motion, hov, enabled && g_ctx.active_id == ids[i], focused || sel);
-        Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover * 0.42f);
-        bg = lerp_color(bg, g_style.button_active, sel ? 0.20f : motion.active * 0.65f);
-        Color border = lerp_color(g_style.border, g_style.input_focus, (sel ? 0.28f : 0.0f) + (focused ? 0.55f : 0.0f));
-        draw_widget_chrome(ir, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
+        Color bg = lerp_color(button, button_hover, motion.hover * 0.42f);
+        bg = lerp_color(bg, button_active, sel ? 0.20f : motion.active * 0.65f);
+        Color border_col = lerp_color(border, focus, (sel ? 0.28f : 0.0f) + (focused ? 0.55f : 0.0f));
+        draw_widget_chrome(ir, g_style.rounding, maybe_disabled(bg), maybe_disabled(border_col), motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
         float box_sz = 12.0f;
         Rect box = {ir.x + 10.0f, ir.y + (ir.h - box_sz) * 0.5f, box_sz, box_sz};
-        stroke_round_rect(box, 3.0f, 1.0f, maybe_disabled(sel ? g_style.input_focus : g_style.border));
+        stroke_round_rect(box, 3.0f, 1.0f, maybe_disabled(sel ? focus : border));
         if (sel) {
             Rect inner = {box.x + 3.0f, box.y + 3.0f, box.w - 6.0f, box.h - 6.0f};
-            fill_rect(inner, maybe_disabled(g_style.input_focus));
+            fill_rect(inner, maybe_disabled(focus));
         }
 
         Rect tr = {box.x + box.w + 8.0f, ir.y, ir.w - box.w - 18.0f, ir.h};
-        draw_text_utf8(items[i] ? items[i] : "", tr, maybe_disabled(sel ? g_style.text : g_style.text_dim));
+        draw_text_utf8(items[i] ? items[i] : "", tr, maybe_disabled(sel ? text : text_dim));
     }
 
     draw_widget_label(vis, outer, false);
@@ -4348,6 +4709,7 @@ bool radio_group(const char* label, const char* const* items, int count, int* se
 
 bool collapsing_header(const char* label, bool* open) {
     if (!g_drawing) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -4385,16 +4747,23 @@ bool collapsing_header(const char* label, bool* open) {
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, enabled && g_ctx.active_id == id, focused || state);
-    Color bg = lerp_color(g_style.button, g_style.button_hover, motion.hover * 0.40f);
-    bg = lerp_color(bg, g_style.panel, state ? 0.10f : 0.0f);
-    Color border = lerp_color(g_style.border, g_style.input_focus, (focused ? 0.55f : 0.0f) + (state ? 0.16f : 0.0f));
+    Color button = resolve_color(ColorRole::Button);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color bg = lerp_color(button, button_hover, motion.hover * 0.40f);
+    bg = lerp_color(bg, panel, state ? 0.10f : 0.0f);
+    Color border_col = lerp_color(border, focus, (focused ? 0.55f : 0.0f) + (state ? 0.16f : 0.0f));
     if (cfx.clip_active) push_clip(cfx.clip);
-    draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border_col), motion.hover, motion.active, focused ? 1.0f : 0.0f);
 
     Rect arrow_r = {r.x + 10.0f, r.y + (r.h - 10.0f) * 0.5f, 10.0f, 10.0f};
-    fill_triangle(arrow_r, slot.progress > 0.5f ? 0 : 2, maybe_disabled(g_style.text_dim));
+    fill_triangle(arrow_r, slot.progress > 0.5f ? 0 : 2, maybe_disabled(text_dim));
     Rect text_r = {r.x + 28.0f, r.y, r.w - 32.0f, r.h};
-    draw_text_utf8(vis, text_r, maybe_disabled(g_style.text));
+    draw_text_utf8(vis, text_r, maybe_disabled(text));
     if (cfx.clip_active) pop_clip();
 
     if (show_body) {
@@ -4419,6 +4788,7 @@ bool collapsing_header(const char* label, bool* open) {
 
 void scroll_area(const char* label, float height, std::function<void()> fn) {
     if (!g_drawing || height <= 0.0f || !fn) return;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -4445,9 +4815,14 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
 
     MotionSlot& motion = motion_slot_for(id);
     update_motion_slot(motion, hov, false, false);
-    Color panel_col = lerp_color(g_style.panel, g_style.input_bg, motion.hover * 0.12f);
+    Color panel = resolve_color(ColorRole::Panel);
+    Color input_bg = resolve_color(ColorRole::InputBg);
+    Color border = resolve_color(ColorRole::Border);
+    Color focus = resolve_color(ColorRole::InputFocus);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color panel_col = lerp_color(panel, input_bg, motion.hover * 0.12f);
     if (cfx.clip_active) push_clip(cfx.clip);
-    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(g_style.border), motion.hover, 0.0f, 0.0f);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border), motion.hover, 0.0f, 0.0f);
 
     Rect clip_r = {r.x + 2.0f, r.y + 2.0f, r.w - 4.0f, r.h - 4.0f};
     if (clip_r.w < 0.0f) clip_r.w = 0.0f;
@@ -4463,7 +4838,9 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
     g_ctx.cursor_x = inner.x;
     g_ctx.cursor_y = inner.y - slot.current;
     g_ctx.row_ctx = {};
+    color_scope.suspend_for_children();
     fn();
+    color_scope.resume_after_children();
     slot.content = g_ctx.cursor_y + slot.current - inner.y;
 
     g_ctx.content_region = saved_region;
@@ -4505,9 +4882,9 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
             slot.target += (g_input.mouse_y < thumb_y ? -visible_h : visible_h);
             slot.target = clampf(slot.target, 0.0f, max_scroll);
         }
-        Color track_c = g_style.border; track_c.a = 0.3f;
+        Color track_c = border; track_c.a = 0.3f;
         fill_round_rect(track_r, sb_w * 0.5f, maybe_disabled(track_c));
-        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(slot.dragging ? g_style.input_focus : g_style.text_dim));
+        fill_round_rect(thumb_r, sb_w * 0.5f, maybe_disabled(slot.dragging ? focus : text_dim));
     }
 
     draw_widget_label(vis, outer, false);
@@ -4519,6 +4896,7 @@ void scroll_area(const char* label, float height, std::function<void()> fn) {
 
 bool modal(const char* label, std::function<void()> fn) {
     if (!g_drawing || !label || !fn) return false;
+    WidgetColorScope color_scope;
     char vis[128]; const char* hs;
     split_label(label, vis, sizeof(vis), &hs);
     int id = hash_str(hs);
@@ -4546,10 +4924,13 @@ bool modal(const char* label, std::function<void()> fn) {
         modal_w,
         modal_h
     };
-    draw_widget_chrome(panel, fmaxf(g_style.rounding, 10.0f), g_style.panel, g_style.border, 0.0f, 0.0f, 1.0f);
+    Color panel_col = resolve_color(ColorRole::Panel);
+    Color border = resolve_color(ColorRole::Border);
+    Color text = resolve_color(ColorRole::Text);
+    draw_widget_chrome(panel, fmaxf(g_style.rounding, 10.0f), panel_col, border, 0.0f, 0.0f, 1.0f);
 
     Rect title_r = {panel.x + 16.0f, panel.y + 10.0f, panel.w - 32.0f, g_style.item_height};
-    draw_text_utf8(vis, title_r, g_style.text);
+    draw_text_utf8(vis, title_r, text);
 
     Rect saved_region = g_ctx.content_region;
     float saved_cursor_x = g_ctx.cursor_x;
@@ -4562,7 +4943,9 @@ bool modal(const char* label, std::function<void()> fn) {
     g_ctx.cursor_x = g_ctx.content_region.x;
     g_ctx.cursor_y = g_ctx.content_region.y;
     g_ctx.row_ctx = {};
+    color_scope.suspend_for_children();
     fn();
+    color_scope.resume_after_children();
 
     g_ctx.content_region = saved_region;
     g_ctx.cursor_x = saved_cursor_x;

@@ -92,6 +92,7 @@ int main() {
 
     bool general_open = true;
     bool layout_open = true;
+    bool color_open = true;
     bool modal_was_open = false;
 
     static const char* history_lines[] = {
@@ -245,6 +246,35 @@ int main() {
                     ftui::button("Wide cell");
                     ftui::button("Narrow cell");
                 });
+            }
+
+            if (ftui::collapsing_header("Color showcase##settings", &color_open)) {
+                ftui::text_wrapped(
+                    "Theme presets now expose semantic accent, warning, and success colors. "
+                    "You can also use one-shot or scoped hex overrides without changing the surrounding style.");
+
+                ftui::row(3, [&]() {
+                    ftui::button("Accent", ftui::ColorRole::Accent);
+                    ftui::button("Warning", ftui::ColorRole::Warning);
+                    ftui::button("Success", ftui::ColorRole::Success);
+                });
+
+                ftui::row(2, [&]() {
+                    ftui::set_next_color(ftui::ColorRole::Button, ftui::color_from_hex("#c93c3c"));
+                    ftui::set_next_color(ftui::ColorRole::Text, ftui::color_from_hex("#fff5f5"));
+                    ftui::button("One-shot hex");
+
+                    ftui::button("Direct tint", ftui::color_from_hex("#7c3aed"));
+                });
+
+                ftui::push_color(ftui::ColorRole::Button, ftui::color_from_hex("#2f855a"));
+                ftui::push_color(ftui::ColorRole::Text, ftui::color_from_hex("#f7fff9"));
+                ftui::row(2, [&]() {
+                    ftui::button("Scoped green A");
+                    ftui::button("Scoped green B");
+                });
+                ftui::pop_color();
+                ftui::pop_color();
             }
 
             ftui::separator();

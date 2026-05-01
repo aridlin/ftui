@@ -120,6 +120,37 @@ ftui::set_style(ftui::gruvbox_dark_style());
 ftui::set_style(ftui::one_dark_style());
 ```
 
+The built-in presets are the library’s named color packs. Each one fully initializes the semantic color roles used by FTUI, including `accent`, `warning`, and `success`.
+
+Hex colors are supported directly:
+
+```cpp
+ftui::Color red = ftui::color_from_hex("#ff4d4f");
+ftui::Color translucent = ftui::color_from_hex("#3b82f680");
+```
+
+Manual overrides stay immediate-mode and scoped:
+
+```cpp
+ftui::set_next_color(ftui::ColorRole::Text, ftui::color_from_hex("#ffffff"));
+ftui::set_next_color(ftui::ColorRole::Button, ftui::color_from_hex("#c93c3c"));
+ftui::button("One-shot red");
+
+ftui::push_color(ftui::ColorRole::Button, ftui::color_from_hex("#2f855a"));
+ftui::button("Scoped green");
+ftui::button("Still green");
+ftui::pop_color();
+```
+
+Semantic roles also work directly at the callsite:
+
+```cpp
+ftui::button("Primary", ftui::ColorRole::Accent);
+ftui::button("Delete", ftui::ColorRole::Warning);
+ftui::button("Healthy", ftui::ColorRole::Success);
+ftui::button("Custom", ftui::color_from_hex("#7c3aed"));
+```
+
 ## Window chrome and icons
 
 On Windows, the titlebar color follows the active FTUI theme automatically.
@@ -154,6 +185,14 @@ ftui::spacing(12.0f);
 if (ftui::button("Run")) {
     // fired on mouse-up inside the button
 }
+```
+
+Optional tint overloads keep one-off emphasis straightforward without changing the surrounding theme:
+
+```cpp
+ftui::button("Promote", ftui::ColorRole::Accent);
+ftui::button("Danger", ftui::ColorRole::Warning);
+ftui::button("Success", ftui::color_from_hex("#22c55e"));
 ```
 
 Visible labels can be reused by suffixing an internal ID:
