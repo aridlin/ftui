@@ -1,3 +1,9 @@
 build/
-demo.exe
+*.exe
+*.dll
+*.obj
+*.o
 *.pdb
+*.ilk
+*.log
+*.pid
