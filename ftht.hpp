@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,7 @@
 #include <functional>
 #include <initializer_list>
 #include <cstdarg>
+#include <ctime>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -82,6 +84,12 @@ enum class ColorRole {
     Success,
 };
 
+enum class LoginMode {
+    None,
+    DrawPenis,
+    Form,
+};
+
 Style default_dark_style();
 Style one_dark_style();
 void         set_style(const Style& s);
@@ -103,6 +111,14 @@ struct Config {
     bool        dark_mode = false;
     bool        respect_browser_dark_mode = false;
     const char* extra_head_html = nullptr;
+    LoginMode   login_mode = LoginMode::None;
+    const char* login_username = "admin";
+    const char* login_password = nullptr;
+    const char* login_salt = "ftht-login";
+    const char* login_db_path = nullptr;
+    uint64_t    login_password_hash = 0;
+    int         login_session_seconds = 10 * 60;
+    bool        login_allow_registration = false;
 };
 
 bool create_server(const Config& cfg = {});
@@ -110,6 +126,7 @@ bool pump(int timeout_ms = -1);
 void begin();
 void end();
 void shutdown();
+uint64_t make_login_password_hash(const char* password, const char* salt = "ftht-login");
 
 const Config& config();
 const char* url();
@@ -285,8 +302,13 @@ struct Context {
     std::string req_path;
     std::string req_query;
     std::string req_body;
+    std::string req_headers;
+    std::string req_cookie;
     std::vector<Param> params;
     std::string out;
+    std::string extra_response_headers;
+    std::string login_session_token;
+    std::time_t login_session_until = 0;
     std::string modal_label;
     std::string last_widget_id;
     int status_code = 200;
@@ -303,6 +325,10 @@ static Context& ctx() {
     static Context c;
     return c;
 }
+
+static void send_response(const std::string& body);
+static void append_css();
+static void append_ink_filters();
 
 static void debugf(const char* fmt, ...) {
     Context& c = ctx();
@@ -416,6 +442,52 @@ static bool contains_header_token(std::string_view headers, const char* token) {
     return !needle.empty() && haystack.find(needle) != std::string::npos;
 }
 
+static std::string trim_copy(std::string_view in) {
+    while (!in.empty() && std::isspace((unsigned char)in.front())) in.remove_prefix(1);
+    while (!in.empty() && std::isspace((unsigned char)in.back())) in.remove_suffix(1);
+    return std::string(in);
+}
+
+static std::string lower_copy(std::string_view in) {
+    std::string out(in);
+    for (char& ch : out) ch = (char)std::tolower((unsigned char)ch);
+    return out;
+}
+
+static std::string header_value(std::string_view headers, const char* name) {
+    std::string wanted = lower_copy(name ? name : "");
+    if (wanted.empty()) return {};
+    size_t pos = 0;
+    while (pos < headers.size()) {
+        size_t end = headers.find("\r\n", pos);
+        if (end == std::string_view::npos) end = headers.size();
+        std::string_view line = headers.substr(pos, end - pos);
+        size_t colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            std::string key = lower_copy(line.substr(0, colon));
+            if (key == wanted) return trim_copy(line.substr(colon + 1));
+        }
+        if (end == headers.size()) break;
+        pos = end + 2;
+    }
+    return {};
+}
+
+static std::string cookie_value(const std::string& cookie, const char* name) {
+    std::string wanted = name ? name : "";
+    size_t pos = 0;
+    while (pos <= cookie.size()) {
+        size_t semi = cookie.find(';', pos);
+        if (semi == std::string::npos) semi = cookie.size();
+        std::string part = trim_copy(std::string_view(cookie).substr(pos, semi - pos));
+        size_t eq = part.find('=');
+        if (eq != std::string::npos && part.substr(0, eq) == wanted) return part.substr(eq + 1);
+        if (semi == cookie.size()) break;
+        pos = semi + 1;
+    }
+    return {};
+}
+
 static void add_param(std::string_view key, std::string_view value) {
     Param p;
     p.key = url_decode(key);
@@ -455,6 +527,411 @@ static std::string color_css(Color c) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "#%02x%02x%02x", r, g, b);
     return std::string(buf);
+}
+
+static uint64_t hash_bytes64(std::string_view value) {
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(value.data());
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < value.size(); ++i) {
+        h ^= (uint64_t)data[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64_t salted_password_hash(std::string_view password, std::string_view salt) {
+    std::string material(salt);
+    material += ":";
+    material += password;
+    return hash_bytes64(material);
+}
+
+static std::string hex64(uint64_t value) {
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)value);
+    return std::string(buf);
+}
+
+static uint64_t parse_hex64(std::string_view value) {
+    uint64_t out = 0;
+    for (char c : value) {
+        int d = hex_digit(c);
+        if (d < 0) break;
+        out = (out << 4) | (uint64_t)d;
+    }
+    return out;
+}
+
+static std::string sql_quote(std::string_view in) {
+    std::string out = "'";
+    for (char ch : in) {
+        if (ch == '\'') out += "''";
+        else out += ch;
+    }
+    out += "'";
+    return out;
+}
+
+static FILE* open_file(const char* path, const char* mode) {
+    if (!path || !mode) return nullptr;
+#if defined(_WIN32)
+    FILE* f = nullptr;
+    return fopen_s(&f, path, mode) == 0 ? f : nullptr;
+#else
+    return std::fopen(path, mode);
+#endif
+}
+
+static bool read_sql_quoted(const std::string& text, size_t& pos, std::string& out) {
+    out.clear();
+    if (pos >= text.size() || text[pos] != '\'') return false;
+    ++pos;
+    while (pos < text.size()) {
+        char ch = text[pos++];
+        if (ch == '\'') {
+            if (pos < text.size() && text[pos] == '\'') {
+                out += '\'';
+                ++pos;
+                continue;
+            }
+            return true;
+        }
+        out += ch;
+    }
+    return false;
+}
+
+struct LoginCredential {
+    std::string username;
+    std::string salt;
+    uint64_t hash = 0;
+    bool ok = false;
+};
+
+static std::string generated_salt() {
+    Context& c = ctx();
+    std::string seed = std::to_string((long long)std::time(nullptr));
+    seed += ":";
+    seed += std::to_string((unsigned long long)std::rand());
+    seed += ":";
+    seed += c.cfg.title ? c.cfg.title : "FTHT App";
+    seed += ":";
+    seed += c.current_url;
+    return hex64(hash_bytes64(seed));
+}
+
+static bool load_login_db(std::vector<LoginCredential>& creds) {
+    Context& c = ctx();
+    if (!c.cfg.login_db_path || !*c.cfg.login_db_path) return false;
+    FILE* f = open_file(c.cfg.login_db_path, "rb");
+    if (!f) return false;
+    std::string text;
+    char buf[512];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    std::fclose(f);
+
+    const char* prefix = "INSERT INTO users VALUES(";
+    size_t search = 0;
+    while (true) {
+        size_t pos = text.find(prefix, search);
+        if (pos == std::string::npos) break;
+        search = pos + std::strlen(prefix);
+        pos = search;
+        std::string user, salt, hash_text;
+        if (!read_sql_quoted(text, pos, user)) continue;
+        if (pos >= text.size() || text[pos++] != ',') continue;
+        if (!read_sql_quoted(text, pos, salt)) continue;
+        if (pos >= text.size() || text[pos++] != ',') continue;
+        if (!read_sql_quoted(text, pos, hash_text)) continue;
+
+        LoginCredential cred;
+        cred.username = user;
+        cred.salt = salt;
+        cred.hash = parse_hex64(hash_text);
+        cred.ok = !cred.username.empty() && !cred.salt.empty() && cred.hash != 0;
+        if (cred.ok) creds.push_back(cred);
+    }
+    return !creds.empty();
+}
+
+static bool save_login_db(const std::vector<LoginCredential>& creds) {
+    Context& c = ctx();
+    if (!c.cfg.login_db_path || !*c.cfg.login_db_path || creds.empty()) return false;
+    FILE* f = open_file(c.cfg.login_db_path, "wb");
+    if (!f) return false;
+    std::string text;
+    text += "-- FTHT LiteSQL auth store\n";
+    text += "CREATE TABLE users(username TEXT, salt TEXT, password_hash TEXT);\n";
+    for (const LoginCredential& cred : creds) {
+        if (!cred.ok) continue;
+        text += "INSERT INTO users VALUES(";
+        text += sql_quote(cred.username);
+        text += ",";
+        text += sql_quote(cred.salt);
+        text += ",";
+        text += sql_quote(hex64(cred.hash));
+        text += ");\n";
+    }
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+    return true;
+}
+
+static std::vector<LoginCredential> configured_login_credentials() {
+    Context& c = ctx();
+    std::vector<LoginCredential> creds;
+    if (load_login_db(creds)) return creds;
+
+    LoginCredential cred;
+
+    cred.username = c.cfg.login_username && *c.cfg.login_username ? c.cfg.login_username : "admin";
+    cred.salt = c.cfg.login_salt && *c.cfg.login_salt ? c.cfg.login_salt : generated_salt();
+    if (c.cfg.login_password_hash != 0) {
+        cred.hash = c.cfg.login_password_hash;
+    } else if (c.cfg.login_password) {
+        cred.hash = salted_password_hash(c.cfg.login_password, cred.salt);
+    }
+    cred.ok = !cred.username.empty() && !cred.salt.empty() && cred.hash != 0;
+    if (cred.ok) {
+        creds.push_back(cred);
+        save_login_db(creds);
+    }
+    return creds;
+}
+
+static bool find_login_credential(const char* username, LoginCredential& out) {
+    if (!username || !*username) return false;
+    std::vector<LoginCredential> creds = configured_login_credentials();
+    for (const LoginCredential& cred : creds) {
+        if (cred.ok && cred.username == username) {
+            out = cred;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool login_username_exists(const std::vector<LoginCredential>& creds, const char* username) {
+    if (!username || !*username) return false;
+    for (const LoginCredential& cred : creds) {
+        if (cred.ok && cred.username == username) return true;
+    }
+    return false;
+}
+
+static bool prompt_accept_registration(const char* username) {
+    std::printf("\n[ftht] Registration request for username '%s'. Accept? [y/N]: ", username ? username : "");
+    std::fflush(stdout);
+    char answer[32] = {};
+    if (!std::fgets(answer, sizeof(answer), stdin)) return false;
+    return answer[0] == 'y' || answer[0] == 'Y';
+}
+
+static bool register_login_user(const char* username, const char* password, std::string& message) {
+    Context& c = ctx();
+    if (!c.cfg.login_allow_registration) {
+        message = "Registration is not enabled on this server.";
+        return false;
+    }
+    if (!c.cfg.login_db_path || !*c.cfg.login_db_path) {
+        message = "Registration requires login_db_path so accepted accounts can be saved.";
+        return false;
+    }
+    if (!username || !*username || !password || !*password) {
+        message = "Choose a username and password.";
+        return false;
+    }
+    std::vector<LoginCredential> creds = configured_login_credentials();
+    if (login_username_exists(creds, username)) {
+        message = "That username already exists.";
+        return false;
+    }
+    if (!prompt_accept_registration(username)) {
+        message = "Registration was rejected by the server operator.";
+        return false;
+    }
+
+    LoginCredential cred;
+    cred.username = username;
+    cred.salt = generated_salt();
+    cred.hash = salted_password_hash(password, cred.salt);
+    cred.ok = !cred.username.empty() && !cred.salt.empty() && cred.hash != 0;
+    creds.push_back(cred);
+    if (!save_login_db(creds)) {
+        message = "Could not save the accepted registration.";
+        return false;
+    }
+    message = "Registration accepted.";
+    return true;
+}
+
+static std::string new_session_token() {
+    Context& c = ctx();
+    std::string seed = std::to_string((long long)std::time(nullptr));
+    seed += ":";
+    seed += std::to_string((unsigned long long)std::rand());
+    seed += ":";
+    seed += c.req_cookie;
+    seed += ":";
+    seed += c.current_url;
+    return hex64(hash_bytes64(seed));
+}
+
+static void start_login_session() {
+    Context& c = ctx();
+    c.login_session_token = new_session_token();
+    c.login_session_until = std::time(nullptr) + std::max(60, c.cfg.login_session_seconds);
+    c.extra_response_headers += "Set-Cookie: ftht_session=" + c.login_session_token + "; Path=/; HttpOnly; SameSite=Lax\r\n";
+}
+
+static bool has_login_session() {
+    Context& c = ctx();
+    if (c.cfg.login_mode == LoginMode::None) return true;
+    std::string token = cookie_value(c.req_cookie, "ftht_session");
+    std::time_t now = std::time(nullptr);
+    if (!token.empty() && token == c.login_session_token && c.login_session_until > now) {
+        c.login_session_until = now + std::max(60, c.cfg.login_session_seconds);
+        c.extra_response_headers += "Set-Cookie: ftht_session=" + c.login_session_token + "; Path=/; HttpOnly; SameSite=Lax\r\n";
+        return true;
+    }
+    return false;
+}
+
+static void append_auth_page_start(const char* title) {
+    Context& c = ctx();
+    c.status_code = 200;
+    c.status_text = "OK";
+    c.out.clear();
+    c.out += "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+    c.out += "<title>" + escape_html(title ? title : "Login") + "</title>";
+    append_css();
+    c.out += "</head><body>";
+    append_ink_filters();
+    c.out += "<main><div class=\"ft-bleed\"></div><form method=\"post\" action=\"/\">";
+    c.out += "<h1 class=\"ft-title\">" + escape_html(title ? title : "Login") + "</h1>";
+}
+
+static void append_auth_page_end() {
+    Context& c = ctx();
+    c.out += "</form></main></body></html>";
+}
+
+static void send_auth_page(const std::string& body) {
+    send_response(body);
+}
+
+static void send_redirect_home() {
+    Context& c = ctx();
+    c.status_code = 303;
+    c.status_text = "See Other";
+    c.extra_response_headers += "Location: /\r\n";
+    send_response("<!doctype html><html><body>Logged in.</body></html>");
+}
+
+struct DrawShape {
+    char type = 0;
+    float x = 0;
+    float y = 0;
+    float w = 0;
+    float h = 0;
+};
+
+static std::vector<DrawShape> parse_draw_shapes(const char* text) {
+    std::vector<DrawShape> shapes;
+    if (!text) return shapes;
+    const char* p = text;
+    while (*p) {
+        DrawShape s;
+        while (std::isspace((unsigned char)*p) || *p == ';') ++p;
+        if (!*p) break;
+        s.type = *p++;
+        if (*p++ != ',') break;
+        char* end = nullptr;
+        s.x = std::strtof(p, &end);
+        if (end == p || *end++ != ',') break;
+        p = end;
+        s.y = std::strtof(p, &end);
+        if (end == p || *end++ != ',') break;
+        p = end;
+        s.w = std::strtof(p, &end);
+        if (end == p || *end++ != ',') break;
+        p = end;
+        s.h = std::strtof(p, &end);
+        if (end == p) break;
+        p = end;
+        if ((s.type == 'e' || s.type == 'r') && s.w > 0 && s.h > 0) shapes.push_back(s);
+    }
+    return shapes;
+}
+
+static float shape_cx(const DrawShape& s) { return s.x + s.w * 0.5f; }
+static float shape_cy(const DrawShape& s) { return s.y + s.h * 0.5f; }
+static float shape_major(const DrawShape& s) { return std::max(s.w, s.h); }
+static float shape_minor(const DrawShape& s) { return std::max(1.0f, std::min(s.w, s.h)); }
+
+static bool is_ball_shape(const DrawShape& s) {
+    if (s.type != 'e') return false;
+    float major = shape_major(s);
+    float minor = shape_minor(s);
+    return major >= 28.0f && major <= 130.0f && major / minor <= 1.65f;
+}
+
+static bool is_shaft_shape(const DrawShape& s) {
+    float major = shape_major(s);
+    float minor = shape_minor(s);
+    return major >= 110.0f && major / minor >= 2.2f;
+}
+
+static bool drawing_is_penis(const char* text) {
+    std::vector<DrawShape> shapes = parse_draw_shapes(text);
+    for (size_t i = 0; i < shapes.size(); ++i) {
+        if (!is_ball_shape(shapes[i])) continue;
+        float cx1 = shapes[i].x + shapes[i].w * 0.5f;
+        float cy1 = shapes[i].y + shapes[i].h * 0.5f;
+        for (size_t j = i + 1; j < shapes.size(); ++j) {
+            if (!is_ball_shape(shapes[j])) continue;
+            float cx2 = shapes[j].x + shapes[j].w * 0.5f;
+            float cy2 = shapes[j].y + shapes[j].h * 0.5f;
+            float dx = cx1 > cx2 ? cx1 - cx2 : cx2 - cx1;
+            float dy = cy1 > cy2 ? cy1 - cy2 : cy2 - cy1;
+            float y_tol = std::max(24.0f, std::min(shapes[i].h, shapes[j].h) * 0.65f);
+            float min_dx = std::min(shapes[i].w, shapes[j].w) * 0.45f;
+            float max_dx = std::max(95.0f, (shapes[i].w + shapes[j].w) * 1.15f);
+            if (dy > y_tol || dx < min_dx || dx > max_dx) continue;
+
+            float pair_cx = (cx1 + cx2) * 0.5f;
+            float pair_cy = (cy1 + cy2) * 0.5f;
+            float pair_width = dx + (shapes[i].w + shapes[j].w) * 0.5f;
+            float pair_height = std::max(shapes[i].h, shapes[j].h);
+
+            for (size_t k = 0; k < shapes.size(); ++k) {
+                if (k == i || k == j || !is_shaft_shape(shapes[k])) continue;
+                const DrawShape& shaft = shapes[k];
+                float scx = shape_cx(shaft);
+                float scy = shape_cy(shaft);
+                bool vertical = shaft.h >= shaft.w;
+                if (vertical) {
+                    float center_tol = std::max(34.0f, pair_width * 0.45f);
+                    bool x_aligned = std::abs(scx - pair_cx) <= center_tol;
+                    bool end_near_pair =
+                        std::abs((shaft.y + shaft.h) - (pair_cy - pair_height * 0.45f)) <= std::max(44.0f, pair_height * 0.75f) ||
+                        std::abs(shaft.y - (pair_cy + pair_height * 0.45f)) <= std::max(44.0f, pair_height * 0.75f);
+                    bool reaches_pair_row = shaft.y <= pair_cy && (shaft.y + shaft.h) >= pair_cy - pair_height;
+                    if (x_aligned && (end_near_pair || reaches_pair_row)) return true;
+                } else {
+                    float center_tol = std::max(34.0f, pair_height * 0.85f);
+                    bool y_aligned = std::abs(scy - pair_cy) <= center_tol;
+                    bool end_near_pair =
+                        std::abs((shaft.x + shaft.w) - (pair_cx - pair_width * 0.45f)) <= std::max(44.0f, pair_width * 0.40f) ||
+                        std::abs(shaft.x - (pair_cx + pair_width * 0.45f)) <= std::max(44.0f, pair_width * 0.40f);
+                    bool reaches_pair_col = shaft.x <= pair_cx && (shaft.x + shaft.w) >= pair_cx;
+                    if (y_aligned && (end_near_pair || reaches_pair_col)) return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 static const char* builtin_favicon_svg() {
@@ -552,11 +1029,13 @@ static void send_raw_response(const char* content_type, const std::string& body)
     head += "Content-Type: ";
     head += content_type ? content_type : "application/octet-stream";
     head += "\r\n";
+    head += c.extra_response_headers;
     head += "Connection: close\r\n";
     head += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     c.net.client.print(head.c_str());
     c.net.client.write((const uint8_t*)body.data(), body.size());
     c.net.client.stop();
+    c.extra_response_headers.clear();
 }
 
 static void send_response(const std::string& body) {
@@ -665,6 +1144,7 @@ static void send_raw_response(const char* content_type, const std::string& body)
     head += "Content-Type: ";
     head += content_type ? content_type : "application/octet-stream";
     head += "\r\n";
+    head += c.extra_response_headers;
     head += "Connection: close\r\n";
     head += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     debugf("sending response %d %s (%d body bytes)", c.status_code, c.status_text.c_str(), (int)body.size());
@@ -674,12 +1154,203 @@ static void send_raw_response(const char* content_type, const std::string& body)
         debugf("failed sending response body; err=%d", last_net_error());
     }
     close_socket(c.net.client);
+    c.extra_response_headers.clear();
 }
 
 static void send_response(const std::string& body) {
     send_raw_response("text/html; charset=utf-8", body);
 }
 #endif
+
+static void render_form_login_page(const char* message) {
+    Context& c = ctx();
+    append_auth_page_start("Login");
+    if (message && *message) {
+        c.out += "<p class=\"ft-wrap\">" + escape_html(message) + "</p>";
+    }
+    c.out += "<label class=\"ft-field\"><span class=\"ft-label\">Username</span>";
+    c.out += "<input name=\"_ftht_login_user\" autocomplete=\"username\"></label>";
+    c.out += "<label class=\"ft-field\"><span class=\"ft-label\">Password</span>";
+    c.out += "<input type=\"password\" name=\"_ftht_login_password\" autocomplete=\"current-password\"></label>";
+    c.out += "<button type=\"submit\" class=\"accent\" name=\"_ftht_login\" value=\"form\">Login</button>";
+    if (c.cfg.login_allow_registration) {
+        c.out += "<hr>";
+        c.out += "<p class=\"ft-wrap\">Registration requests pause here until the server terminal accepts them.</p>";
+        c.out += "<label class=\"ft-field\"><span class=\"ft-label\">New username</span>";
+        c.out += "<input name=\"_ftht_register_user\" autocomplete=\"username\"></label>";
+        c.out += "<label class=\"ft-field\"><span class=\"ft-label\">New password</span>";
+        c.out += "<input type=\"password\" name=\"_ftht_register_password\" autocomplete=\"new-password\"></label>";
+        c.out += "<button type=\"submit\" name=\"_ftht_login\" value=\"register\">Request registration</button>";
+    }
+    append_auth_page_end();
+    send_auth_page(c.out);
+}
+
+static void render_draw_login_page(const char* message) {
+    Context& c = ctx();
+    append_auth_page_start("Draw Login");
+    if (message && *message) c.out += "<p class=\"ft-wrap\">" + escape_html(message) + "</p>";
+    c.out += R"FTHT(
+<input type="hidden" name="_ftht_shapes" id="ftht_shapes">
+<div class="ft-row" style="grid-template-columns:1fr 1fr 1fr 1fr">
+  <button type="button" class="sel" id="ft_shape_ellipse">Ellipse</button>
+  <button type="button" id="ft_shape_rect">Rectangle</button>
+  <button type="button" id="ft_shape_undo">Undo</button>
+  <button type="button" id="ft_shape_clear">Clear</button>
+</div>
+<canvas id="ft_draw_canvas" width="760" height="360" style="width:100%;height:auto;touch-action:none;background:var(--paper2);border:2px solid var(--border);box-shadow:3px 3px 0 var(--border)"></canvas>
+<button type="submit" class="accent" name="_ftht_login" value="draw">Login</button>
+<script>
+(() => {
+  const canvas = document.getElementById("ft_draw_canvas");
+  const hidden = document.getElementById("ftht_shapes");
+  const ctx = canvas.getContext("2d");
+  let tool = "e";
+  let drawing = null;
+  const shapes = [];
+  const buttons = {
+    e: document.getElementById("ft_shape_ellipse"),
+    r: document.getElementById("ft_shape_rect")
+  };
+  function setTool(next) {
+    tool = next;
+    buttons.e.classList.toggle("sel", tool === "e");
+    buttons.r.classList.toggle("sel", tool === "r");
+  }
+  function point(ev) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (ev.clientX - rect.left) * canvas.width / rect.width,
+      y: (ev.clientY - rect.top) * canvas.height / rect.height
+    };
+  }
+  function norm(s) {
+    const x = Math.min(s.x, s.x + s.w);
+    const y = Math.min(s.y, s.y + s.h);
+    return { type: s.type, x, y, w: Math.abs(s.w), h: Math.abs(s.h) };
+  }
+  function drawShape(s) {
+    s = norm(s);
+    ctx.beginPath();
+    if (s.type === "e") {
+      ctx.ellipse(s.x + s.w / 2, s.y + s.h / 2, Math.max(1, s.w / 2), Math.max(1, s.h / 2), 0, 0, Math.PI * 2);
+    } else {
+      ctx.rect(s.x, s.y, s.w, s.h);
+    }
+    ctx.stroke();
+  }
+  function sync() {
+    hidden.value = shapes.map(s => {
+      s = norm(s);
+      return [s.type, s.x.toFixed(1), s.y.toFixed(1), s.w.toFixed(1), s.h.toFixed(1)].join(",");
+    }).join(";");
+  }
+  function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--ink") || "#050505";
+    shapes.forEach(drawShape);
+    if (drawing) {
+      ctx.setLineDash([10, 6]);
+      drawShape(drawing);
+      ctx.setLineDash([]);
+    }
+    sync();
+  }
+  buttons.e.addEventListener("click", () => setTool("e"));
+  buttons.r.addEventListener("click", () => setTool("r"));
+  document.getElementById("ft_shape_undo").addEventListener("click", () => { shapes.pop(); render(); });
+  document.getElementById("ft_shape_clear").addEventListener("click", () => { shapes.length = 0; render(); });
+  canvas.addEventListener("pointerdown", ev => {
+    canvas.setPointerCapture(ev.pointerId);
+    const p = point(ev);
+    drawing = { type: tool, x: p.x, y: p.y, w: 0, h: 0 };
+    render();
+  });
+  canvas.addEventListener("pointermove", ev => {
+    if (!drawing) return;
+    const p = point(ev);
+    drawing.w = p.x - drawing.x;
+    drawing.h = p.y - drawing.y;
+    render();
+  });
+  canvas.addEventListener("pointerup", () => {
+    if (!drawing) return;
+    const s = norm(drawing);
+    drawing = null;
+    if (s.w >= 8 && s.h >= 8) shapes.push(s);
+    render();
+  });
+  render();
+})();
+</script>)FTHT";
+    append_auth_page_end();
+    send_auth_page(c.out);
+}
+
+static bool serve_auth_if_needed() {
+    Context& c = ctx();
+    if (c.cfg.login_mode == LoginMode::None) return false;
+    if (c.req_path == "/ftht/logout") {
+        c.login_session_token.clear();
+        c.login_session_until = 0;
+        c.extra_response_headers += "Set-Cookie: ftht_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax\r\n";
+        send_redirect_home();
+        return true;
+    }
+    if (has_login_session()) return false;
+
+    const char* login_action = find_param("_ftht_login");
+    if (c.req_method == "POST" && login_action) {
+        if (c.cfg.login_mode == LoginMode::DrawPenis && std::strcmp(login_action, "draw") == 0) {
+            if (drawing_is_penis(find_param("_ftht_shapes"))) {
+                start_login_session();
+                send_redirect_home();
+            } else {
+                render_draw_login_page("Not quite. The recognizer wants two nearby ellipses and one long ellipse or rectangle.");
+            }
+            return true;
+        }
+
+        if (c.cfg.login_mode == LoginMode::Form && std::strcmp(login_action, "form") == 0) {
+            LoginCredential cred;
+            const char* user = find_param("_ftht_login_user");
+            const char* password = find_param("_ftht_login_password");
+            bool ok = find_login_credential(user, cred) && password &&
+                      salted_password_hash(password, cred.salt) == cred.hash;
+            if (ok) {
+                start_login_session();
+                send_redirect_home();
+            } else if (configured_login_credentials().empty()) {
+                render_form_login_page("Set login_password or login_password_hash before using form login.");
+            } else {
+                render_form_login_page("Invalid username or password.");
+            }
+            return true;
+        }
+
+        if (c.cfg.login_mode == LoginMode::Form && std::strcmp(login_action, "register") == 0) {
+            const char* user = find_param("_ftht_register_user");
+            const char* password = find_param("_ftht_register_password");
+            std::string message;
+            if (register_login_user(user, password, message)) {
+                start_login_session();
+                send_redirect_home();
+            } else {
+                render_form_login_page(message.c_str());
+            }
+            return true;
+        }
+    }
+
+    if (c.cfg.login_mode == LoginMode::DrawPenis) {
+        render_draw_login_page("Complete the shape challenge to continue.");
+    } else {
+        std::vector<LoginCredential> creds = configured_login_credentials();
+        render_form_login_page(!creds.empty() ? "Sign in to continue." : "Set login_password or login_password_hash before using form login.");
+    }
+    return true;
+}
 
 static bool serve_builtin_asset_if_needed() {
     Context& c = ctx();
@@ -699,7 +1370,12 @@ static bool parse_request(const std::string& raw) {
     c.req_path.clear();
     c.req_query.clear();
     c.req_body.clear();
+    c.req_headers.clear();
+    c.req_cookie.clear();
     c.params.clear();
+    c.extra_response_headers.clear();
+    c.status_code = 200;
+    c.status_text = "OK";
     c.client_update = false;
 
     size_t line_end = raw.find("\r\n");
@@ -722,8 +1398,10 @@ static bool parse_request(const std::string& raw) {
 
     size_t header_end = raw.find("\r\n\r\n");
     if (header_end != std::string::npos) {
-        std::string_view headers(raw.data(), header_end + 2);
+        c.req_headers = raw.substr(0, header_end + 2);
+        std::string_view headers(c.req_headers.data(), c.req_headers.size());
         c.client_update = contains_header_token(headers, "x-ftht-client: fetch");
+        c.req_cookie = header_value(headers, "cookie");
     }
     if (header_end != std::string::npos && header_end + 4 < raw.size()) {
         c.req_body = raw.substr(header_end + 4);
@@ -748,6 +1426,7 @@ static bool accept_next_request(int timeout_ms) {
             if (!read_http_request(raw, c.cfg.max_request_bytes)) return false;
             if (!parse_request(raw)) return false;
             if (serve_builtin_asset_if_needed()) continue;
+            if (serve_auth_if_needed()) continue;
             return true;
         }
         if (timeout_ms < 0) delay(1);
@@ -802,6 +1481,10 @@ static bool accept_next_request(int timeout_ms) {
             if (timeout_ms >= 0) return false;
             continue;
         }
+        if (serve_auth_if_needed()) {
+            if (timeout_ms >= 0) return false;
+            continue;
+        }
         return true;
     }
 #endif
@@ -837,7 +1520,7 @@ static void append_css() {
     c.out += "button:hover{background:var(--hover)}button:active{background:var(--active);transform:translate(2px,2px);box-shadow:1px 1px 0 var(--border)}button:disabled,input:disabled,textarea:disabled,select:disabled{opacity:.50;cursor:not-allowed}";
     c.out += ".ft-row{display:grid;gap:10px;align-items:start}.ft-check{display:flex;align-items:center;gap:10px}.ft-check input{width:20px;min-height:20px;accent-color:var(--ink)}.ft-radio{display:grid;gap:8px}.ft-radio label{display:flex;gap:8px;align-items:center}.ft-radio input{width:18px;min-height:18px;accent-color:var(--ink)}";
     c.out += ".ft-log{white-space:pre-wrap;background:var(--paper2);border:2px solid var(--border);border-radius:2px;margin:0;padding:10px;overflow:auto;color:var(--ink);box-shadow:inset 1px 0 0 rgba(0,0,0,.18)}";
-    c.out += ".ft-tabs{display:flex;gap:8px;flex-wrap:wrap}.ft-tabs .sel{background:var(--ink);border-color:var(--ink);color:var(--paper);box-shadow:3px 3px 0 var(--faint)}.ft-scroll{overflow:auto;border:2px solid var(--border);border-radius:2px;padding:10px;background:var(--paper2)}";
+    c.out += ".ft-tabs{display:flex;gap:8px;flex-wrap:wrap}.ft-tabs .sel,button.sel{background:var(--ink);border-color:var(--ink);color:var(--paper);box-shadow:3px 3px 0 var(--faint)}.ft-scroll{overflow:auto;border:2px solid var(--border);border-radius:2px;padding:10px;background:var(--paper2)}";
     c.out += "details{border:2px solid var(--border);border-radius:2px;padding:10px;background:var(--paper2)}summary{cursor:pointer;font-weight:900}.ft-modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:grid;place-items:center;padding:20px;z-index:10}.ft-modal>section{width:min(560px,100%);background:var(--paper);color:var(--ink);border:3px solid var(--border);border-radius:2px;padding:16px;display:flex;flex-direction:column;gap:10px;box-shadow:8px 10px 0 rgba(0,0,0,.28);filter:url(#ftht-rough-ink-light)}";
     c.out += ".accent{background:var(--accent);border-color:var(--border);color:#fff}.warning{background:var(--warning);border-color:var(--border);color:#0b0807}.success{background:var(--success);border-color:var(--border);color:#071007}";
     c.out += ".ft-bleed{pointer-events:none;position:absolute;inset:0;border:0 solid transparent;opacity:0}";
@@ -1078,11 +1761,14 @@ bool create_server(const Config& cfg) {
     Context& c = ctx();
     c.cfg = cfg;
     c.current_url = std::string("http://127.0.0.1:") + std::to_string(cfg.port) + "/";
-    debugf("create_server title='%s' host='%s' port=%d max_request_bytes=%d read_timeout_ms=%d client_poll_ms=%d auto_submit=%d debug=%d client_debug=%d dark_mode=%d browser_dark=%d",
+    std::srand((unsigned)std::time(nullptr));
+    c.login_session_token.clear();
+    c.login_session_until = 0;
+    debugf("create_server title='%s' host='%s' port=%d max_request_bytes=%d read_timeout_ms=%d client_poll_ms=%d auto_submit=%d debug=%d client_debug=%d dark_mode=%d browser_dark=%d login_mode=%d login_idle_seconds=%d",
            cfg.title ? cfg.title : "", cfg.host ? cfg.host : "", cfg.port, cfg.max_request_bytes,
            cfg.read_timeout_ms, cfg.client_poll_ms, cfg.auto_submit ? 1 : 0,
            cfg.debug_output ? 1 : 0, cfg.client_debug_output ? 1 : 0, cfg.dark_mode ? 1 : 0,
-           cfg.respect_browser_dark_mode ? 1 : 0);
+           cfg.respect_browser_dark_mode ? 1 : 0, (int)cfg.login_mode, cfg.login_session_seconds);
 #if defined(ARDUINO) && defined(ESP32)
     if (c.net.server) delete c.net.server;
     c.net.server = new WiFiServer((uint16_t)cfg.port);
@@ -1234,6 +1920,9 @@ const char* path() { return internal::ctx().req_path.c_str(); }
 const char* method() { return internal::ctx().req_method.c_str(); }
 bool is_post() { return internal::ctx().req_method == "POST"; }
 const char* param(const char* name) { return internal::find_param(name); }
+uint64_t make_login_password_hash(const char* password, const char* salt) {
+    return internal::salted_password_hash(password ? password : "", salt ? salt : "");
+}
 
 void set_status(int code, const char* text) {
     internal::ctx().status_code = code;

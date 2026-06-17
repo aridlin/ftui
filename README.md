@@ -71,6 +71,46 @@ int main() {
 
 Open <http://127.0.0.1:8080/> in a browser after starting the program.
 
+## Optional Login
+
+FTHT binds to `0.0.0.0` by default so device panels are reachable from other machines.
+Login is optional and off by default:
+
+```cpp
+ftht::Config cfg;
+cfg.login_mode = ftht::LoginMode::None; // default
+```
+
+For a small form login, set a username and password. FTHT stores only a salted hash in
+the optional LiteSQL text file:
+
+```cpp
+ftht::Config cfg;
+cfg.login_mode = ftht::LoginMode::Form;
+cfg.login_username = "admin";
+cfg.login_password = "change-me";
+cfg.login_db_path = "ftht_login.litesql";
+cfg.login_allow_registration = true; // optional; prompts the server terminal
+```
+
+Use `ftht::make_login_password_hash(password, salt)` if you prefer to pass
+`cfg.login_password_hash` instead of a plaintext setup password.
+
+When registration is enabled, browser registration requests are not accepted
+automatically. The server prints a terminal prompt for the requested username and
+only writes the new salted hash if the operator answers `y`.
+
+For the joke drawing challenge:
+
+```cpp
+ftht::Config cfg;
+cfg.login_mode = ftht::LoginMode::DrawPenis;
+```
+
+The drawing challenge exposes a tiny canvas with rectangle and ellipse tools. It accepts
+two nearby ellipses plus one long ellipse or rectangle. Login sessions expire after 10
+minutes of inactivity by default; override with `cfg.login_session_seconds`.
+
 ## Build
 
 Windows with `clang++`:
@@ -78,6 +118,8 @@ Windows with `clang++`:
 ```bash
 clang++ examples/http_showcase.cpp -o ftht_showcase.exe -std=c++17 -lws2_32
 clang++ examples/device_panel.cpp -o ftht_device_panel.exe -std=c++17 -lws2_32
+clang++ examples/login_form_demo.cpp -o ftht_login_form_demo.exe -std=c++17 -lws2_32
+clang++ examples/login_draw_demo.cpp -o ftht_login_draw_demo.exe -std=c++17 -lws2_32
 ```
 
 Windows with MSVC:
@@ -89,7 +131,19 @@ Linux:
 ```bash
 g++ examples/http_showcase.cpp -o ftht_showcase -std=c++17
 g++ examples/device_panel.cpp -o ftht_device_panel -std=c++17
+g++ examples/login_form_demo.cpp -o ftht_login_form_demo -std=c++17
+g++ examples/login_draw_demo.cpp -o ftht_login_draw_demo -std=c++17
 ```
+
+## Login Demos
+
+`examples/login_form_demo.cpp` runs on <http://127.0.0.1:8081/> with
+username `admin` and password `secret`. It writes `ftht_form_login_demo.litesql`
+with salted hashes and enables registration; approve or reject new users in the
+terminal running the server.
+
+`examples/login_draw_demo.cpp` runs on <http://127.0.0.1:8082/> and uses the
+drawing challenge. Complete the shape challenge to unlock the protected panel.
 
 ## ESP32 Shape
 
