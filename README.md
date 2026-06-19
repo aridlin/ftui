@@ -8,6 +8,16 @@ It is a single header, keeps the baseline loop small, and aims for utility-app w
 - Linux backend: X11 + Cairo
 - Distribution model: single header, no CMake required
 
+## Screenshots
+
+| Showcase overview | Drawer and progress masks |
+| --- | --- |
+| ![FTUI showcase overview](assets/screenshots/showcase-overview.png) | ![FTUI drawer and progress masks](assets/screenshots/showcase-drawer-progress.png) |
+
+| Controls and colors | Ghostty-style theme and toasts |
+| --- | --- |
+| ![FTUI controls and color showcase](assets/screenshots/showcase-controls.png) | ![FTUI Ghostty-style theme and toasts](assets/screenshots/showcase-ghostty-toasts.png) |
+
 ## Philosophy
 
 - Keep the default path tiny: `create_window() -> pump() -> begin() -> widgets -> end() -> shutdown()`
