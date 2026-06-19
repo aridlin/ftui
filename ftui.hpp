@@ -1342,7 +1342,7 @@ static void draw_command_overlay(int window_w, int window_h) {
 
     char cmd[32];
     snprintf(cmd, sizeof(cmd), ":%s_", g_cmd.buf);
-    const char* hint = ":td :tc :tn :tg :to :th :q";
+    const char* hint = ":td :fps60 :fx :df :dit :q";
     float lh = text_line_height();
     float pad_x = 12.0f;
     float pad_y = 8.0f;
@@ -1618,6 +1618,103 @@ static void apply_cmd_theme() {
     else if (strcmp(g_cmd.buf, "th") == 0) apply_named_theme("ghostty-green", true);
 }
 
+static bool parse_cmd_int(const char* prefix, int* out) {
+    size_t n = strlen(prefix);
+    if (strncmp(g_cmd.buf, prefix, n) != 0 || !g_cmd.buf[n]) return false;
+    char* end = nullptr;
+    long v = strtol(g_cmd.buf + n, &end, 10);
+    if (!end || *end != '\0') return false;
+    *out = (int)v;
+    return true;
+}
+
+static bool apply_cmd_action() {
+    if (!g_cmd.buf[0]) return false;
+
+    const std::string before_theme = g_style_name;
+    apply_cmd_theme();
+    if (g_style_name != before_theme || strcmp(g_cmd.buf, "td") == 0 ||
+        strcmp(g_cmd.buf, "tc") == 0 || strcmp(g_cmd.buf, "tn") == 0 ||
+        strcmp(g_cmd.buf, "tg") == 0 || strcmp(g_cmd.buf, "to") == 0 ||
+        strcmp(g_cmd.buf, "th") == 0) {
+        return true;
+    }
+
+    int value = 0;
+    if (parse_cmd_int("fps", &value)) {
+        g_frame_limit_fps = value;
+        g_redraw_requested = true;
+        wake_event_loop();
+        return true;
+    }
+    if (parse_cmd_int("ds", &value)) {
+        g_dither_size = value < 1 ? 1 : (value > 32 ? 32 : value);
+        g_redraw_requested = true;
+        wake_event_loop();
+        return true;
+    }
+    if (parse_cmd_int("op", &value)) {
+        g_window_opacity = clampf((float)value / 100.0f, 0.20f, 1.0f);
+        sync_native_window_transparency();
+        g_redraw_requested = true;
+        wake_event_loop();
+        return true;
+    }
+
+    if (strcmp(g_cmd.buf, "df") == 0) { g_debug.show_fps = !g_debug.show_fps; g_redraw_requested = true; return true; }
+    if (strcmp(g_cmd.buf, "dl") == 0) { g_debug.show_layout_rects = !g_debug.show_layout_rects; g_redraw_requested = true; return true; }
+    if (strcmp(g_cmd.buf, "di") == 0) {
+        bool next = !(g_debug.show_hovered_id || g_debug.show_active_id);
+        g_debug.show_hovered_id = next;
+        g_debug.show_active_id = next;
+        g_redraw_requested = true;
+        return true;
+    }
+    if (strcmp(g_cmd.buf, "dw") == 0) { g_debug.log_widget_calls = !g_debug.log_widget_calls; g_redraw_requested = true; return true; }
+    if (strcmp(g_cmd.buf, "fx") == 0) { g_effects_enabled = !g_effects_enabled; g_redraw_requested = true; wake_event_loop(); return true; }
+    if (strcmp(g_cmd.buf, "fx0") == 0) { g_effects_enabled = false; g_redraw_requested = true; return true; }
+    if (strcmp(g_cmd.buf, "fx1") == 0) { g_effects_enabled = true; g_redraw_requested = true; wake_event_loop(); return true; }
+    if (strcmp(g_cmd.buf, "rr") == 0) { g_redraw_requested = true; wake_event_loop(); return true; }
+    if (strcmp(g_cmd.buf, "ct") == 0) {
+        for (ToastSlot& s : g_toasts) s = {};
+        g_redraw_requested = true;
+        return true;
+    }
+
+    if (strcmp(g_cmd.buf, "blur") == 0) {
+        g_window_transparency = WindowTransparency::Blur;
+        sync_native_window_transparency();
+        g_redraw_requested = true;
+        wake_event_loop();
+        return true;
+    }
+    if (strcmp(g_cmd.buf, "dit") == 0 || strcmp(g_cmd.buf, "dither") == 0) {
+        g_window_transparency = WindowTransparency::BayerDither;
+        sync_native_window_transparency();
+        g_redraw_requested = true;
+        wake_event_loop();
+        return true;
+    }
+    if (strcmp(g_cmd.buf, "plain") == 0) {
+        g_window_transparency = WindowTransparency::Plain;
+        sync_native_window_transparency();
+        g_redraw_requested = true;
+        wake_event_loop();
+        return true;
+    }
+    if (strcmp(g_cmd.buf, "opaque") == 0) {
+        g_window_transparency = WindowTransparency::Opaque;
+        sync_native_window_transparency();
+        g_redraw_requested = true;
+        wake_event_loop();
+        return true;
+    }
+    if (strcmp(g_cmd.buf, "bb") == 0) { g_backdrop_effect = BackdropEffect::Blur; g_redraw_requested = true; return true; }
+    if (strcmp(g_cmd.buf, "bd") == 0) { g_backdrop_effect = BackdropEffect::BayerDither; g_redraw_requested = true; return true; }
+
+    return false;
+}
+
 static bool has_ext(const char* path, const char* ext) {
     if (!path || !ext) return false;
     size_t lp = strlen(path), le = strlen(ext);
@@ -1860,26 +1957,27 @@ static bool is_builtin_mask_shape(const char* shape) {
 
 static bool load_builtin_mask_shape(const char* shape, MaskData& out) {
     if (!shape) return false;
-    out.w = 160;
-    out.h = 64;
+    const int s = 4;
+    out.w = 160 * s;
+    out.h = 64 * s;
     out.bits.assign((size_t)out.w * (size_t)out.h, 0);
     if (strcmp(shape, "battery") == 0) {
-        fill_mask_rect(out, 4, 12, 136, 52);
-        fill_mask_rect(out, 140, 24, 156, 40);
+        fill_mask_rect(out, 4 * s, 12 * s, 136 * s, 52 * s);
+        fill_mask_rect(out, 140 * s, 24 * s, 156 * s, 40 * s);
     } else if (strcmp(shape, "tank") == 0) {
-        fill_mask_rect(out, 8, 16, 152, 54);
-        fill_mask_rect(out, 24, 8, 136, 20);
+        fill_mask_rect(out, 8 * s, 16 * s, 152 * s, 54 * s);
+        fill_mask_rect(out, 24 * s, 8 * s, 136 * s, 20 * s);
     } else if (strcmp(shape, "pill") == 0) {
-        fill_mask_rect(out, 32, 8, 128, 56);
-        fill_mask_ellipse(out, 32, 32, 24, 24);
-        fill_mask_ellipse(out, 128, 32, 24, 24);
+        fill_mask_rect(out, 32 * s, 8 * s, 128 * s, 56 * s);
+        fill_mask_ellipse(out, 32.0f * s, 32.0f * s, 24.0f * s, 24.0f * s);
+        fill_mask_ellipse(out, 128.0f * s, 32.0f * s, 24.0f * s, 24.0f * s);
     } else if (strcmp(shape, "circle") == 0) {
-        out.w = 96; out.h = 96; out.bits.assign((size_t)out.w * (size_t)out.h, 0);
-        fill_mask_ellipse(out, 48, 48, 44, 44);
+        out.w = 96 * s; out.h = 96 * s; out.bits.assign((size_t)out.w * (size_t)out.h, 0);
+        fill_mask_ellipse(out, 48.0f * s, 48.0f * s, 44.0f * s, 44.0f * s);
     } else if (strcmp(shape, "logo") == 0) {
-        std::vector<MaskPoint> tri = {{80, 4}, {156, 58}, {4, 58}};
+        std::vector<MaskPoint> tri = {{80.0f * s, 4.0f * s}, {156.0f * s, 58.0f * s}, {4.0f * s, 58.0f * s}};
         fill_mask_polygon(out, tri);
-        fill_mask_rect(out, 68, 22, 92, 60);
+        fill_mask_rect(out, 68 * s, 22 * s, 92 * s, 60 * s);
     } else {
         return false;
     }
@@ -2903,8 +3001,8 @@ static void wake_event_loop() {
 }
 
 static void execute_command() {
-    if (strcmp(g_cmd.buf,"q")==0) PostQuitMessage(0);
-    else apply_cmd_theme();
+    if (strcmp(g_cmd.buf,"q")==0 || strcmp(g_cmd.buf,"quit")==0) PostQuitMessage(0);
+    else apply_cmd_action();
     cmd_clear();
 }
 
@@ -3475,10 +3573,16 @@ static bool load_mask_from_image(const char* path, MaskData& out) {
     if (FAILED(hr)) return false;
     out.w = (int)w; out.h = (int)h;
     out.bits.assign((size_t)out.w * (size_t)out.h, 0);
+    bool has_bright_mask = false;
     for (size_t i = 0, p = 0; i < out.bits.size(); ++i, p += 4) {
         int lum = ((int)px[p] * 54 + (int)px[p + 1] * 183 + (int)px[p + 2] * 19) / 256;
         int alpha = px[p + 3];
-        out.bits[i] = (alpha > 32 && lum > 96) ? 255 : 0;
+        if (alpha > 32 && lum > 96) { has_bright_mask = true; break; }
+    }
+    for (size_t i = 0, p = 0; i < out.bits.size(); ++i, p += 4) {
+        int lum = ((int)px[p] * 54 + (int)px[p + 1] * 183 + (int)px[p + 2] * 19) / 256;
+        int alpha = px[p + 3];
+        out.bits[i] = (alpha > 32 && (has_bright_mask ? lum > 96 : true)) ? 255 : 0;
     }
     return true;
 }
@@ -3890,8 +3994,8 @@ static std::string clipboard_get() {
 }
 
 static void execute_command() {
-    if (strcmp(g_cmd.buf,"q")==0) g_platform.running=false;
-    else apply_cmd_theme();
+    if (strcmp(g_cmd.buf,"q")==0 || strcmp(g_cmd.buf,"quit")==0) g_platform.running=false;
+    else apply_cmd_action();
     cmd_clear();
 }
 
@@ -4403,6 +4507,18 @@ static bool load_mask_from_image(const char* path, MaskData& out) {
     unsigned char* data = cairo_image_surface_get_data(img);
     out.w = w; out.h = h;
     out.bits.assign((size_t)w * (size_t)h, 0);
+    bool has_bright_mask = false;
+    for (int y = 0; y < h && !has_bright_mask; ++y) {
+        unsigned char* row = data + y * stride;
+        for (int x = 0; x < w; ++x) {
+            unsigned char b = row[x * 4 + 0];
+            unsigned char g = row[x * 4 + 1];
+            unsigned char r = row[x * 4 + 2];
+            unsigned char a = row[x * 4 + 3];
+            int lum = ((int)r * 54 + (int)g * 183 + (int)b * 19) / 256;
+            if (a > 32 && lum > 96) { has_bright_mask = true; break; }
+        }
+    }
     for (int y = 0; y < h; ++y) {
         unsigned char* row = data + y * stride;
         for (int x = 0; x < w; ++x) {
@@ -4411,7 +4527,7 @@ static bool load_mask_from_image(const char* path, MaskData& out) {
             unsigned char r = row[x * 4 + 2];
             unsigned char a = row[x * 4 + 3];
             int lum = ((int)r * 54 + (int)g * 183 + (int)b * 19) / 256;
-            out.bits[(size_t)y * (size_t)w + (size_t)x] = (a > 32 && lum > 96) ? 255 : 0;
+            out.bits[(size_t)y * (size_t)w + (size_t)x] = (a > 32 && (has_bright_mask ? lum > 96 : true)) ? 255 : 0;
         }
     }
     cairo_surface_destroy(img);
@@ -5622,42 +5738,77 @@ static void draw_masked_progress(Rect r, float progress, const ProgressStyle& st
     if (style.wave_front || style.glint) g_redraw_requested = true;
     float fill_px = p * inner.w;
     float phase = (float)g_ctx.frame_index * 0.085f;
-    float wave_amp_mask = 0.0f;
+    float wave_amp_px = 0.0f;
     if (style.wave_front && p > 0.02f && p < 0.995f) {
-        float amp_px = fminf(5.0f, fmaxf(1.5f, inner.h * 0.16f));
-        wave_amp_mask = (amp_px / fmaxf(1.0f, inner.w)) * (float)mask->w;
+        wave_amp_px = fminf(7.0f, fmaxf(2.0f, inner.h * 0.18f));
     }
 
-    for (int my = 0; my < mask->h; ++my) {
-        float sy0 = inner.y + inner.h * ((float)my / (float)mask->h);
-        float sy1 = inner.y + inner.h * ((float)(my + 1) / (float)mask->h);
+    int out_w = (int)ceilf(inner.w);
+    int out_h = (int)ceilf(inner.h);
+    if (out_w < 1) out_w = 1;
+    if (out_h < 1) out_h = 1;
+    auto mask_on = [&](int ox, int oy) -> bool {
+        int mx = (int)(((float)ox + 0.5f) * (float)mask->w / (float)out_w);
+        int my = (int)(((float)oy + 0.5f) * (float)mask->h / (float)out_h);
+        if (mx < 0) mx = 0; else if (mx >= mask->w) mx = mask->w - 1;
+        if (my < 0) my = 0; else if (my >= mask->h) my = mask->h - 1;
+        return mask->bits[(size_t)my * (size_t)mask->w + (size_t)mx] > 0;
+    };
+    auto row_front = [&](int oy) -> float {
+        float front = fill_px;
+        if (wave_amp_px > 0.0f) front += sinf((float)oy * 0.34f + phase) * wave_amp_px;
+        return clampf(front, 0.0f, inner.w);
+    };
+
+    for (int oy = 0; oy < out_h; ++oy) {
+        float sy0 = inner.y + inner.h * ((float)oy / (float)out_h);
+        float sy1 = inner.y + inner.h * ((float)(oy + 1) / (float)out_h);
+        float front = row_front(oy);
         int run_start = -1;
         bool run_fill = false;
-        for (int mx = 0; mx <= mask->w; ++mx) {
-            bool on = mx < mask->w && mask->bits[(size_t)my * (size_t)mask->w + (size_t)mx] > 0;
-            float front = p * (float)mask->w;
-            if (wave_amp_mask > 0.0f) front += sinf((float)my * 0.42f + phase) * wave_amp_mask;
-            front = clampf(front, 0.0f, (float)mask->w);
-            bool fill_on = on && (float)mx <= front;
-            if (on && run_start < 0) { run_start = mx; run_fill = fill_on; }
+        for (int ox = 0; ox <= out_w; ++ox) {
+            bool on = ox < out_w && mask_on(ox, oy);
+            float px = inner.w * ((float)ox / (float)out_w);
+            bool fill_on = on && px <= front;
+            if (on && run_start < 0) { run_start = ox; run_fill = fill_on; }
             bool boundary = !on || fill_on != run_fill;
             if (run_start >= 0 && boundary) {
-                float sx0 = inner.x + inner.w * ((float)run_start / (float)mask->w);
-                float sx1 = inner.x + inner.w * ((float)mx / (float)mask->w);
+                float sx0 = inner.x + inner.w * ((float)run_start / (float)out_w);
+                float sx1 = inner.x + inner.w * ((float)ox / (float)out_w);
                 fill_rect({sx0, sy0, sx1 - sx0, sy1 - sy0}, maybe_disabled(run_fill ? filled : ghost));
-                run_start = on ? mx : -1;
+                run_start = on ? ox : -1;
                 run_fill = fill_on;
             }
         }
     }
 
     if (style.glint && p > 0.03f) {
-        push_clip({inner.x, inner.y, fill_px, inner.h});
-        fill_rect({inner.x + 4.0f, inner.y + 3.0f, fmaxf(0.0f, fill_px - 8.0f), 1.0f},
-                  maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.10f}));
         float gx = inner.x + fmodf((float)g_ctx.frame_index * 0.85f, inner.w + 120.0f) - 60.0f;
-        fill_rect({gx, inner.y, 10.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.035f}));
-        pop_clip();
+        for (int oy = 0; oy < out_h; ++oy) {
+            float sy0 = inner.y + inner.h * ((float)oy / (float)out_h);
+            float sy1 = inner.y + inner.h * ((float)(oy + 1) / (float)out_h);
+            float front = row_front(oy);
+            int run_start = -1;
+            float run_alpha = 0.0f;
+            for (int ox = 0; ox <= out_w; ++ox) {
+                float px = inner.w * ((float)ox / (float)out_w);
+                float sx = inner.x + px;
+                bool on = ox < out_w && mask_on(ox, oy) && px <= front;
+                float dist = fabsf((sx + inner.w / (float)out_w * 0.5f) - (gx + 5.0f));
+                float a = on ? fmaxf(0.0f, 1.0f - dist / 8.0f) * 0.055f : 0.0f;
+                if (on && oy < 2 && px > 4.0f && px < front - 4.0f) a = fmaxf(a, 0.09f);
+                bool draw = a > 0.004f;
+                if (draw && run_start < 0) { run_start = ox; run_alpha = a; }
+                bool boundary = !draw || fabsf(a - run_alpha) > 0.018f;
+                if (run_start >= 0 && boundary) {
+                    float sx0 = inner.x + inner.w * ((float)run_start / (float)out_w);
+                    float sx1 = inner.x + inner.w * ((float)ox / (float)out_w);
+                    fill_rect({sx0, sy0, sx1 - sx0, sy1 - sy0}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, run_alpha}));
+                    run_start = draw ? ox : -1;
+                    run_alpha = a;
+                }
+            }
+        }
     }
 }
 

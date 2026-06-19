@@ -161,7 +161,16 @@ Vim-style commands:
 - `:tg` Gruvbox dark
 - `:to` One Dark
 - `:th` Ghostty green
-- `:q` quit
+- `:fps60` set the frame limit; use any integer, or `:fps0` to disable limiting
+- `:fx`, `:fx0`, `:fx1` toggle, disable, or enable animations/effects
+- `:df`, `:dl`, `:di`, `:dw` toggle FPS, layout rects, widget IDs, or widget logging
+- `:dit`, `:plain`, `:opaque`, `:blur` switch window transparency mode
+- `:op85` set window opacity as a percentage
+- `:ds6` set dither motif size
+- `:bb`, `:bd` switch backdrop blur/dither style
+- `:rr` request redraw
+- `:ct` clear toasts
+- `:q`, `:quit` quit
 
 Built-in presets:
 
@@ -315,7 +324,7 @@ ftui::progress_bar(progress);
 ftui::progress_bar(progress, "Loading assets");
 ```
 
-Masked progress bars fill the white/opaque area of an SVG, PNG, or image from left to right:
+Masked progress bars fill the white/opaque area of an SVG, PNG, or image from left to right. PNG masks can also be dark alpha silhouettes; if no bright pixels are present, FTUI uses alpha as the fillable area:
 
 ```cpp
 ftui::ProgressStyle style;

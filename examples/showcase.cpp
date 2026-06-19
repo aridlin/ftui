@@ -160,6 +160,14 @@ int main() {
             battery.glint = true;
             ftui::progress_bar(transfer_progress, battery);
 
+            ftui::ProgressStyle png_mask;
+            png_mask.label = "PNG mask";
+            png_mask.mask_path = "probar.png";
+            png_mask.height = 52.0f;
+            png_mask.wave_front = true;
+            png_mask.glint = true;
+            ftui::progress_bar(transfer_progress, png_mask);
+
             ftui::ProgressStyle pill;
             pill.label = "Built-in pill mask";
             pill.mask_shape = "pill";
