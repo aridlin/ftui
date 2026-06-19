@@ -143,8 +143,8 @@ struct Config {
     bool        resizable     = true;
     bool        center_window = true;
     void*       icon          = nullptr;    // HICON on Windows; ignored on Linux
-    bool        enable_effects = true;      // Windows-only visual effects layer
-    BackdropEffect backdrop_effect = BackdropEffect::Blur; // Windows effects panels
+    bool        enable_effects = true;      // Smooth scrolling and widget animations
+    BackdropEffect backdrop_effect = BackdropEffect::Blur; // Blur is Windows-only; dither is cross-platform
     int         dither_size   = 4;          // BayerDither cell size in pixels
     WindowTransparency window_transparency = WindowTransparency::Opaque;
     float       window_opacity = 0.92f;     // Plain/Blur whole-window opacity
@@ -232,6 +232,7 @@ bool listbox(const char* label, const char* const* items, int count, int* select
 bool radio_group(const char* label, const char* const* items, int count, int* selected, int columns = 1);
 bool collapsing_header(const char* label, bool* open = nullptr);
 bool side_menu(const char* label, const char* const* items, int count, int* selected);
+bool side_menu_drawer(const char* label, const char* const* items, int count, int* selected, float width = 260.0f);
 
 // Horizontal tab bar. Returns true when selected changes.
 bool tabs(const char* const* labels, int count, int* selected);
@@ -594,6 +595,19 @@ struct DropdownOverlayState {
     std::vector<std::string> labels;
 };
 
+struct SideDrawerState {
+    bool active = false;
+    bool open = false;
+    int  owner = 0;
+    int  selected = 0;
+    int  count = 0;
+    float width = 260.0f;
+    float progress = 0.0f;
+    float item_h = 34.0f;
+    std::string title;
+    std::vector<std::string> labels;
+};
+
 struct ColorOverrideEntry {
     ColorRole role = ColorRole::Text;
     Color color = {};
@@ -660,6 +674,7 @@ static NextLayoutState g_next_layout;
 static TooltipState g_tooltip;
 static DropdownOverlayState g_dropdown_overlay;
 static DropdownOverlayState g_dropdown_overlay_prev;
+static SideDrawerState g_side_drawer;
 static ToastSlot g_toasts[16];
 static MaskData  g_mask_cache[16];
 static ColorOverrideEntry g_color_stack[kColorOverrideStackCap];
@@ -679,6 +694,7 @@ static bool       g_inside_modal = false;
 static bool       g_modal_drawn = false;
 static int        g_dropdown_open_id = 0;
 static bool       g_dropdown_capture_input = false;
+static bool       g_side_drawer_capture_input = false;
 
 // ---- Forward declarations of platform-specific functions -----------
 // (defined in the platform blocks below; used by shared widget code)
@@ -705,6 +721,8 @@ static void        sync_native_window_transparency();
 static void        apply_window_icon_handles(void* icon_big, void* icon_small, bool owned, BuiltinIcon variant);
 static bool        load_mask_from_image(const char* path, MaskData& out);
 static void        draw_toast_overlay();
+static void        draw_side_drawer_overlay(int window_w, int window_h);
+static void        draw_command_overlay(int window_w, int window_h);
 static bool        toasts_active();
 static void        draw_dither_backdrop_panel(Rect r, float opacity);
 
@@ -880,11 +898,7 @@ static float step_anim(float value, float target, float dt, float sharpness) {
 }
 
 static bool effects_enabled() {
-#if FTUI_WINDOWS_EFFECTS
     return g_effects_enabled;
-#else
-    return false;
-#endif
 }
 
 static void reset_draw_fx() {
@@ -903,6 +917,27 @@ static void reset_effect_state(bool enable_effects) {
     g_tab_content_owner = 0;
     g_frame_content_fx = {};
     reset_draw_fx();
+}
+
+static bool effects_need_redraw() {
+    if (!effects_enabled()) return false;
+    if (fabsf(g_scroll_y - g_scroll_target_y) > 0.01f) return true;
+    if (fabsf(g_ta_scroll_y - g_ta_scroll_target_y) > 0.01f) return true;
+    for (const MotionSlot& slot : g_motion_slots) {
+        if (!slot.key) continue;
+        if ((slot.hover > 0.001f && slot.hover < 0.999f) ||
+            (slot.active > 0.001f && slot.active < 0.999f) ||
+            (slot.focus > 0.001f && slot.focus < 0.999f)) {
+            return true;
+        }
+    }
+    for (const TabFxSlot& slot : g_tab_fx_slots) {
+        if (slot.key && slot.switch_t < 1.0f) return true;
+    }
+    for (const CollapseSlot& slot : g_collapse_slots) {
+        if (slot.key && slot.progress > 0.001f && slot.progress < 0.999f) return true;
+    }
+    return false;
 }
 
 static float clampf(float v, float lo, float hi) {
@@ -936,7 +971,8 @@ static bool is_widget_focused(int id) {
 }
 
 static bool widget_interaction_enabled() {
-    return g_disabled_depth == 0 && (!g_modal_open_id || g_inside_modal) && !g_dropdown_capture_input;
+    return g_disabled_depth == 0 && (!g_modal_open_id || g_inside_modal) &&
+           !g_dropdown_capture_input && !g_side_drawer_capture_input;
 }
 
 static void register_focusable(int id) {
@@ -1208,6 +1244,100 @@ static void draw_dropdown_overlay() {
             fill_round_rect(thumb_r, 2.0f, maybe_disabled(ov.scrollbar_thumb));
         }
     }
+}
+
+static void draw_side_drawer_overlay(int window_w, int window_h) {
+    SideDrawerState& drawer = g_side_drawer;
+    if ((!drawer.active && !drawer.open) || drawer.progress <= 0.01f) return;
+
+    float p = drawer.progress * drawer.progress * (3.0f - 2.0f * drawer.progress);
+    float ww = (float)window_w;
+    float wh = (float)window_h;
+    float panel_w = clampf(drawer.width, 180.0f, fmaxf(180.0f, ww - 36.0f));
+    float x = -panel_w + panel_w * p;
+    Rect screen = {0.0f, 0.0f, ww, wh};
+    Rect panel = {x, 0.0f, panel_w, wh};
+
+    Color scrim = {0.0f, 0.0f, 0.0f, 0.34f * p};
+    fill_rect(screen, scrim);
+
+    Color shadow = {0.0f, 0.0f, 0.0f, 0.22f * p};
+    fill_rect({panel.x + panel.w, 0.0f, 18.0f, panel.h}, shadow);
+
+    Color bg = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Background), 0.08f);
+    bg.a = 0.98f;
+    fill_rect(panel, bg);
+
+    Color accent = resolve_color(ColorRole::Accent);
+    Color border = resolve_color(ColorRole::Border);
+    border.a = 0.70f * p;
+    fill_rect({panel.x + panel.w - 1.0f, 0.0f, 1.0f, panel.h}, border);
+    fill_rect({panel.x, 0.0f, 4.0f, panel.h}, with_alpha(accent, 0.55f * p));
+
+    push_clip(panel);
+    float pad = 18.0f;
+    float title_h = text_line_height() + 22.0f;
+    Rect title_r = {panel.x + pad, 14.0f, panel.w - pad * 2.0f, title_h};
+    draw_text_utf8(drawer.title.empty() ? "Navigation" : drawer.title.c_str(), title_r,
+                   with_alpha(resolve_color(ColorRole::Text), p));
+    fill_rect({panel.x + pad, title_r.y + title_h - 7.0f, panel.w - pad * 2.0f, 1.0f},
+              with_alpha(border, 0.55f * p));
+
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color button = resolve_color(ColorRole::Button);
+    Color button_hover = resolve_color(ColorRole::ButtonHover);
+    Color selected_bg = lerp_color(resolve_color(ColorRole::ButtonActive), accent, 0.18f);
+    selected_bg.a = 0.92f * p;
+
+    float y = 72.0f;
+    for (int i = 0; i < drawer.count && i < (int)drawer.labels.size(); ++i) {
+        Rect ir = {panel.x + 10.0f, y + i * drawer.item_h, panel.w - 20.0f, drawer.item_h - 5.0f};
+        bool hov = drawer.open && rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
+        bool sel = i == drawer.selected;
+        if (sel) {
+            fill_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), selected_bg);
+            fill_round_rect({ir.x + 6.0f, ir.y + 7.0f, 4.0f, ir.h - 14.0f}, 2.0f, with_alpha(accent, 0.95f * p));
+        } else if (hov) {
+            Color hover = lerp_color(button, button_hover, 0.75f);
+            hover.a = 0.80f * p;
+            fill_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), hover);
+        }
+        Rect tr = {ir.x + 20.0f, ir.y, ir.w - 30.0f, ir.h};
+        draw_text_utf8(drawer.labels[i].c_str(), tr,
+                       with_alpha(lerp_color(text_dim, text, sel ? 0.78f : (hov ? 0.35f : 0.0f)), p));
+    }
+    pop_clip();
+}
+
+static void draw_command_overlay(int window_w, int window_h) {
+    if (!g_cmd.active) return;
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), ":%s_", g_cmd.buf);
+    const char* hint = ":td :tc :tn :tg :to :th :q";
+    float lh = text_line_height();
+    float pad_x = 12.0f;
+    float pad_y = 8.0f;
+    float cmd_w = measure_text_width(cmd);
+    float hint_w = measure_text_width(hint);
+    float max_w = fmaxf(220.0f, (float)window_w - g_style.window_padding * 2.0f);
+    float w = fminf(max_w, fmaxf(280.0f, cmd_w + hint_w + pad_x * 4.0f + 12.0f));
+    float h = lh + pad_y * 2.0f;
+    Rect r = {g_style.window_padding, (float)window_h - g_style.window_padding - h, w, h};
+
+    Color bg = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Background), 0.18f);
+    bg.a = 0.98f;
+    Color border = resolve_color(ColorRole::Border);
+    Color accent = resolve_color(ColorRole::Accent);
+    draw_widget_chrome(r, fmaxf(6.0f, g_style.rounding), bg, border, 0.0f, 0.0f, 1.0f);
+    fill_round_rect({r.x + 7.0f, r.y + 7.0f, 4.0f, r.h - 14.0f}, 2.0f, accent);
+
+    Rect cmd_r = {r.x + pad_x + 10.0f, r.y + pad_y, cmd_w + 16.0f, lh};
+    draw_text_utf8(cmd, cmd_r, resolve_color(ColorRole::Text));
+
+    Rect hint_r = {r.x + r.w - hint_w - pad_x, r.y + pad_y, hint_w, lh};
+    draw_text_utf8(hint, hint_r, resolve_color(ColorRole::TextDim));
 }
 
 static float widget_label_height(const char* vis) {
@@ -2656,27 +2786,6 @@ static void wake_event_loop() {
     if (g_platform.hwnd) PostMessageW(g_platform.hwnd, WM_NULL, 0, 0);
 }
 
-static bool effects_need_redraw() {
-    if (!effects_enabled()) return false;
-    if (fabsf(g_scroll_y - g_scroll_target_y) > 0.01f) return true;
-    if (fabsf(g_ta_scroll_y - g_ta_scroll_target_y) > 0.01f) return true;
-    for (const MotionSlot& slot : g_motion_slots) {
-        if (!slot.key) continue;
-        if ((slot.hover > 0.001f && slot.hover < 0.999f) ||
-            (slot.active > 0.001f && slot.active < 0.999f) ||
-            (slot.focus > 0.001f && slot.focus < 0.999f)) {
-            return true;
-        }
-    }
-    for (const TabFxSlot& slot : g_tab_fx_slots) {
-        if (slot.key && slot.switch_t < 1.0f) return true;
-    }
-    for (const CollapseSlot& slot : g_collapse_slots) {
-        if (slot.key && slot.progress > 0.001f && slot.progress < 0.999f) return true;
-    }
-    return false;
-}
-
 static void execute_command() {
     if (strcmp(g_cmd.buf,"q")==0) PostQuitMessage(0);
     else apply_cmd_theme();
@@ -2862,6 +2971,8 @@ void begin() {
     g_pending_collapse_start_y = 0.0f;
     g_dropdown_capture_input = g_dropdown_overlay_prev.active;
     g_dropdown_overlay = {};
+    g_side_drawer.active = false;
+    g_side_drawer_capture_input = g_side_drawer.open || g_side_drawer.progress > 0.01f;
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
@@ -2982,12 +3093,8 @@ void end() {
         char buf[128]; snprintf(buf,sizeof(buf),"hot=%d active=%d focused=%d",g_ctx.hot_id,g_ctx.active_id,g_ctx.focused_widget_id);
         float lh=text_line_height(),oy=g_debug.show_fps?lh+6:4; Rect r={4,oy,360,lh}; fill_rect(r,{0,0,0,.6f}); draw_text_utf8(buf,r,g_style.text_dim);
     }
-    if(g_cmd.active){
-        char buf[32]; snprintf(buf,sizeof(buf),":%s_",g_cmd.buf);
-        float lh=text_line_height(),oy=(float)g_platform.height-g_style.window_padding-lh;
-        Rect r={g_style.window_padding,oy,200,lh};
-        fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
-    }
+    draw_side_drawer_overlay(g_platform.width, g_platform.height);
+    draw_command_overlay(g_platform.width, g_platform.height);
     draw_dropdown_overlay();
     finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
@@ -2998,7 +3105,8 @@ void end() {
     bool keep_redrawing = g_redraw_requested || g_debug.show_fps ||
                           g_debug.show_hovered_id || g_debug.show_active_id ||
                           g_input.mouse_down || g_sb_dragging ||
-                          g_cmd.active || g_tooltip.requested || g_tooltip.active ||
+                          g_cmd.active || g_side_drawer.open || g_side_drawer.progress > 0.01f ||
+                          g_tooltip.requested || g_tooltip.active ||
                           toasts_active() ||
                           g_dropdown_overlay.active || g_dropdown_overlay_prev.active ||
                           effects_need_redraw() || hr==D2DERR_RECREATE_TARGET;
@@ -3128,7 +3236,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_active_widget_color_depth = s.active_widget_color_depth;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     g_dropdown_capture_input=false;
-    reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
+    reset_effect_state(cfg.enable_effects);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false;
 
     DWORD ws=WS_OVERLAPPEDWINDOW; if(!cfg.resizable)ws&=~(WS_THICKFRAME|WS_MAXIMIZEBOX);
@@ -3629,9 +3737,11 @@ static void handle_xevent(XEvent& ev) {
             g_input.mouse_x=(float)ev.xbutton.x; g_input.mouse_y=(float)ev.xbutton.y;
             if (g_cmd.active) cmd_clear();
         } else if (ev.xbutton.button==Button4) {
-            g_scroll_y-=80; if(g_scroll_y<0)g_scroll_y=0;
+            if (effects_enabled()) g_input.wheel_y += 80.0f;
+            else { g_scroll_y-=80; if(g_scroll_y<0)g_scroll_y=0; g_scroll_target_y = g_scroll_y; }
         } else if (ev.xbutton.button==Button5) {
-            g_scroll_y+=80;
+            if (effects_enabled()) g_input.wheel_y -= 80.0f;
+            else { g_scroll_y+=80; g_scroll_target_y = g_scroll_y; }
         }
         break;
     case ButtonRelease:
@@ -3736,7 +3846,7 @@ bool create_window(const Config& cfg) {
     g_window_opacity = clampf(cfg.window_opacity, 0.20f, 1.0f);
     g_scroll_y = g_scroll_target_y = 0;
     g_ta_scroll_y = g_ta_scroll_target_y = 0;
-    reset_effect_state(false);
+    reset_effect_state(cfg.enable_effects);
     if (!init_cairo()) return false;
     sync_native_window_transparency();
     clock_gettime(CLOCK_MONOTONIC,&g_last_time);
@@ -3771,6 +3881,8 @@ void begin() {
     g_pending_collapse_start_y = 0.0f;
     g_dropdown_capture_input = g_dropdown_overlay_prev.active;
     g_dropdown_overlay = {};
+    g_side_drawer.active = false;
+    g_side_drawer_capture_input = g_side_drawer.open || g_side_drawer.progress > 0.01f;
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
@@ -3797,7 +3909,14 @@ void begin() {
     g_dt=(now.tv_sec-g_last_time.tv_sec)+(now.tv_nsec-g_last_time.tv_nsec)*1e-9f;
     g_last_time=now; g_fps_accum+=g_dt; g_fps_frames++;
     if(g_fps_accum>=0.5f){g_fps=(float)g_fps_frames/g_fps_accum;g_fps_frames=0;g_fps_accum=0;}
-    if(!nsb){g_scroll_y=0; g_scroll_target_y=0;} else g_scroll_target_y = g_scroll_y;
+    if(!nsb) {
+        g_scroll_y=0; g_scroll_target_y=0;
+    } else if (effects_enabled()) {
+        g_scroll_target_y=g_scroll_target_y<0?0:(g_scroll_target_y>ms?ms:g_scroll_target_y);
+        g_scroll_y = step_anim(g_scroll_y, g_scroll_target_y, g_dt, 16.0f);
+    } else {
+        g_scroll_target_y = g_scroll_y;
+    }
     g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
     if(nsb)g_ctx.content_region.w-=kSW+pad;
     g_ctx.cursor_y=g_ctx.content_region.y-g_scroll_y;
@@ -3827,6 +3946,15 @@ void end() {
         bool nsb=g_content_height>vh+1;
         if(nsb){
             float ms=g_content_height-vh;
+            if (effects_enabled() && g_input.wheel_y != 0.0f) {
+                g_scroll_target_y -= g_input.wheel_y;
+                g_input.wheel_y = 0.0f;
+            } else if (!effects_enabled() && g_input.wheel_y != 0.0f) {
+                g_scroll_y -= g_input.wheel_y;
+                g_scroll_target_y = g_scroll_y;
+                g_input.wheel_y = 0.0f;
+            }
+            g_scroll_target_y=g_scroll_target_y<0?0:(g_scroll_target_y>ms?ms:g_scroll_target_y);
             float tx=g_ctx.content_region.x+g_ctx.content_region.w+g_style.window_padding;
             Rect track={tx,g_ctx.content_region.y,kSW,vh};
             float th=fmaxf(20,(vh/g_content_height)*vh);
@@ -3837,12 +3965,25 @@ void end() {
             bool trhov=rect_contains(track,g_input.mouse_x,g_input.mouse_y);
             if(g_input.mouse_pressed&&thov){g_sb_dragging=true;g_sb_drag_mouse_y=g_input.mouse_y;g_sb_drag_scroll0=g_scroll_y;}
             if(g_sb_dragging){
-                if(g_input.mouse_down||g_input.mouse_released){float sc=ms/fmaxf(1,vh-th);g_scroll_y=g_sb_drag_scroll0+(g_input.mouse_y-g_sb_drag_mouse_y)*sc;g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);}
+                if(g_input.mouse_down||g_input.mouse_released){float sc=ms/fmaxf(1,vh-th);g_scroll_y=g_sb_drag_scroll0+(g_input.mouse_y-g_sb_drag_mouse_y)*sc;g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);g_scroll_target_y=g_scroll_y;}
                 if(g_input.mouse_released)g_sb_dragging=false;
             }
-            if(g_input.mouse_pressed&&trhov&&!thov){g_scroll_y+=(g_input.mouse_y<ty2?-vh:vh);g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);}
+            if(g_input.mouse_pressed&&trhov&&!thov){
+                if (effects_enabled()) {
+                    g_scroll_target_y+=(g_input.mouse_y<ty2?-vh:vh);
+                    g_scroll_target_y=g_scroll_target_y<0?0:(g_scroll_target_y>ms?ms:g_scroll_target_y);
+                } else {
+                    g_scroll_y+=(g_input.mouse_y<ty2?-vh:vh);
+                    g_scroll_target_y = g_scroll_y;
+                    g_scroll_y=g_scroll_y<0?0:(g_scroll_y>ms?ms:g_scroll_y);
+                }
+            }
             fill_round_rect(track,6,g_style.input_bg);
             fill_round_rect(thumb,6,g_sb_dragging?g_style.input_focus:thov?g_style.button_hover:g_style.border);
+        }
+        else if (effects_enabled() && g_input.wheel_y != 0.0f) {
+            g_scroll_target_y = 0;
+            g_input.wheel_y = 0.0f;
         }
         g_content_height=new_ch;
     }
@@ -3854,12 +3995,8 @@ void end() {
         char buf[128]; snprintf(buf,sizeof(buf),"hot=%d active=%d focused=%d",g_ctx.hot_id,g_ctx.active_id,g_ctx.focused_widget_id);
         float lh=text_line_height(),oy=g_debug.show_fps?lh+6:4; Rect r={4,oy,360,lh}; fill_rect(r,{0,0,0,.6f}); draw_text_utf8(buf,r,g_style.text_dim);
     }
-    if(g_cmd.active){
-        char buf[32]; snprintf(buf,sizeof(buf),":%s_",g_cmd.buf);
-        float lh=text_line_height(),oy=(float)g_platform.height-g_style.window_padding-lh;
-        Rect r={g_style.window_padding,oy,200,lh};
-        fill_rect({r.x-4,r.y-2,r.w+8,r.h+4},{0,0,0,.75f}); draw_text_utf8(buf,r,g_style.text);
-    }
+    draw_side_drawer_overlay(g_platform.width, g_platform.height);
+    draw_command_overlay(g_platform.width, g_platform.height);
     draw_dropdown_overlay();
     finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
@@ -3869,9 +4006,11 @@ void end() {
     swap_buffers();
     bool keep_redrawing = g_redraw_requested || g_debug.show_fps ||
                           g_input.mouse_down || g_sb_dragging ||
-                          g_cmd.active || g_tooltip.requested || g_tooltip.active ||
+                          g_cmd.active || g_side_drawer.open || g_side_drawer.progress > 0.01f ||
+                          g_tooltip.requested || g_tooltip.active ||
                           toasts_active() ||
-                          g_dropdown_overlay.active || g_dropdown_overlay_prev.active;
+                          g_dropdown_overlay.active || g_dropdown_overlay_prev.active ||
+                          effects_need_redraw();
     wait_frame_limit();
     g_redraw_requested = keep_redrawing;
     g_dropdown_overlay_prev = g_dropdown_overlay;
@@ -3982,7 +4121,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_active_widget_color_depth = s.active_widget_color_depth;
     g_modal_open_id=0; g_modal_request_id=0; g_dropdown_open_id=0; g_inside_modal=false; g_modal_drawn=false;
     g_dropdown_capture_input=false;
-    reset_effect_state(false);
+    reset_effect_state(cfg.enable_effects);
     g_shortcuts_enabled=s.shortcuts; g_drawing=false; g_clipboard_buf=s.cb;
     g_xim=nullptr; g_xic=nullptr;
     int screen=DefaultScreen(dpy); int cx=0,cy=0;
@@ -4361,6 +4500,90 @@ bool side_menu(const char* label, const char* const* items, int count, int* sele
     *selected = current;
     mark_last_item(last_id, last_rect, last_hov, last_focus);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.2f,0.8f,1.0f,0.4f});
+    return changed;
+}
+
+bool side_menu_drawer(const char* label, const char* const* items, int count, int* selected, float width) {
+    if (!g_drawing || !items || count <= 0 || !selected) return false;
+    WidgetColorScope color_scope;
+    char vis[128]; const char* hs;
+    split_label(label ? label : "Navigation", vis, sizeof(vis), &hs);
+    int id = (hash_str(hs) ^ 0x6d31) & 0x7fffffff;
+    if (!id) id = 0x6d31;
+
+    SideDrawerState& drawer = g_side_drawer;
+    if (drawer.owner != id) {
+        drawer = {};
+        drawer.owner = id;
+    }
+
+    bool changed = false;
+    bool drawer_visible = drawer.open || drawer.progress > 0.01f;
+    bool clicked = false;
+    if (drawer_visible) {
+        begin_disabled();
+        button(label ? label : "Navigation");
+        end_disabled();
+    } else {
+        clicked = button(label ? label : "Navigation");
+    }
+    if (clicked) drawer.open = !drawer.open;
+
+    drawer.active = true;
+    drawer.title = vis[0] ? vis : "Navigation";
+    drawer.count = count;
+    drawer.selected = *selected < 0 ? 0 : (*selected >= count ? count - 1 : *selected);
+    drawer.width = clampf(width, 180.0f, 420.0f);
+    drawer.item_h = fmaxf(34.0f, g_style.item_height - 2.0f);
+    drawer.labels.clear();
+    drawer.labels.reserve((size_t)count);
+    for (int i = 0; i < count; ++i) drawer.labels.push_back(items[i] ? items[i] : "");
+
+    float target = drawer.open ? 1.0f : 0.0f;
+    if (effects_enabled()) drawer.progress = step_anim(drawer.progress, target, g_dt, 16.0f);
+    else drawer.progress = target;
+    if (fabsf(drawer.progress - target) > 0.01f) g_redraw_requested = true;
+
+    float p = drawer.progress * drawer.progress * (3.0f - 2.0f * drawer.progress);
+    float window_h = g_ctx.content_region.y + g_ctx.content_region.h + g_style.window_padding;
+    float panel_w = drawer.width;
+    Rect panel = {-panel_w + panel_w * p, 0.0f, panel_w, window_h};
+
+    if (drawer.open) {
+        if (g_input.key_escape) drawer.open = false;
+        if (g_input.key_up) {
+            int next = drawer.selected > 0 ? drawer.selected - 1 : 0;
+            if (next != drawer.selected) { drawer.selected = next; changed = true; }
+        }
+        if (g_input.key_down) {
+            int next = drawer.selected + 1 < count ? drawer.selected + 1 : count - 1;
+            if (next != drawer.selected) { drawer.selected = next; changed = true; }
+        }
+        if (g_input.key_enter || g_input.key_space) drawer.open = false;
+
+        if (g_input.mouse_pressed) {
+            bool inside_panel = rect_contains(panel, g_input.mouse_x, g_input.mouse_y);
+            if (!inside_panel && drawer.progress > 0.55f) {
+                drawer.open = false;
+            } else if (inside_panel && drawer.progress > 0.80f) {
+                float y = 72.0f;
+                for (int i = 0; i < count; ++i) {
+                    Rect ir = {panel.x + 10.0f, y + i * drawer.item_h, panel.w - 20.0f, drawer.item_h - 5.0f};
+                    if (rect_contains(ir, g_input.mouse_x, g_input.mouse_y)) {
+                        if (drawer.selected != i) { drawer.selected = i; changed = true; }
+                        drawer.open = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    *selected = drawer.selected;
+    if (drawer.open || drawer.progress > 0.01f) {
+        g_side_drawer_capture_input = true;
+        g_redraw_requested = true;
+    }
     return changed;
 }
 
@@ -5208,10 +5431,10 @@ static void draw_masked_progress(Rect r, float progress, const ProgressStyle& st
     ghost.a = 0.16f;
     Color filled = fill;
     filled.a = 0.92f;
-    Color glint = {1.0f, 1.0f, 1.0f, 0.30f};
     float p = clamp01(progress);
-    float phase = (float)g_ctx.frame_index * 0.06f;
     if (style.wave_front || style.glint) g_redraw_requested = true;
+    float fill_px = p * inner.w;
+    float phase = (float)g_ctx.frame_index * 0.085f;
 
     for (int my = 0; my < mask->h; ++my) {
         float sy0 = inner.y + inner.h * ((float)my / (float)mask->h);
@@ -5221,7 +5444,6 @@ static void draw_masked_progress(Rect r, float progress, const ProgressStyle& st
         for (int mx = 0; mx <= mask->w; ++mx) {
             bool on = mx < mask->w && mask->bits[(size_t)my * (size_t)mask->w + (size_t)mx] > 0;
             float front = p * (float)mask->w;
-            if (style.wave_front) front += sinf((float)my * 0.35f + phase) * 2.5f;
             bool fill_on = on && (float)mx <= front;
             if (on && run_start < 0) { run_start = mx; run_fill = fill_on; }
             bool boundary = !on || fill_on != run_fill;
@@ -5235,10 +5457,26 @@ static void draw_masked_progress(Rect r, float progress, const ProgressStyle& st
         }
     }
 
+    if (style.wave_front && p > 0.02f && p < 0.995f) {
+        push_clip({inner.x, inner.y, fill_px, inner.h});
+        float fx = inner.x + fill_px;
+        int strips = 9;
+        for (int i = 0; i < strips; ++i) {
+            float y0 = inner.y + inner.h * ((float)i / (float)strips);
+            float y1 = inner.y + inner.h * ((float)(i + 1) / (float)strips);
+            float dx = sinf((float)i * 0.95f + phase) * 1.4f;
+            Color c = with_alpha(fill, 0.22f);
+            fill_rect({fx - 3.0f + dx, y0, 3.0f, y1 - y0 + 0.5f}, maybe_disabled(c));
+        }
+        pop_clip();
+    }
+
     if (style.glint && p > 0.03f) {
-        float gx = inner.x + fmodf((float)g_ctx.frame_index * 2.2f, inner.w + 80.0f) - 60.0f;
-        push_clip({inner.x, inner.y, inner.w * p, inner.h});
-        draw_line(gx, inner.y + inner.h, gx + 42.0f, inner.y, 8.0f, maybe_disabled(glint));
+        float gx = inner.x + fmodf((float)g_ctx.frame_index * 1.35f, inner.w + 90.0f) - 45.0f;
+        push_clip({inner.x, inner.y, fill_px, inner.h});
+        fill_rect({gx, inner.y, 3.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.07f}));
+        fill_rect({gx + 4.0f, inner.y, 2.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.14f}));
+        fill_rect({gx + 7.0f, inner.y, 3.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.06f}));
         pop_clip();
     }
 }
@@ -5284,23 +5522,27 @@ void progress_bar(float progress, const ProgressStyle& style) {
         Rect inner = {r.x + 3.0f, r.y + 3.0f, r.w - 6.0f, r.h - 6.0f};
         if (inner.w > 0.0f && inner.h > 0.0f && p > 0.0f) {
             float fill_w = inner.w * p;
-            if (style.wave_front) {
-                int strips = 18;
+            fill_round_rect({inner.x, inner.y, fill_w, inner.h}, fmaxf(2.0f, g_style.rounding * 0.4f), maybe_disabled(fill));
+            if (style.wave_front && p < 0.995f) {
+                int strips = 8;
+                float fx = inner.x + fill_w;
+                push_clip({inner.x, inner.y, fill_w, inner.h});
                 for (int i = 0; i < strips; ++i) {
                     float y0 = inner.y + inner.h * ((float)i / (float)strips);
                     float y1 = inner.y + inner.h * ((float)(i + 1) / (float)strips);
-                    float wave = sinf((float)i * 0.65f + (float)g_ctx.frame_index * 0.08f) * 3.0f;
-                    fill_round_rect({inner.x, y0, clampf(fill_w + wave, 0.0f, inner.w), y1 - y0 + 0.5f}, 2.0f, maybe_disabled(fill));
+                    float dx = sinf((float)i * 0.90f + (float)g_ctx.frame_index * 0.085f) * 1.2f;
+                    fill_rect({fx - 3.0f + dx, y0, 3.0f, y1 - y0 + 0.5f}, maybe_disabled(with_alpha(fill, 0.24f)));
                 }
+                pop_clip();
                 g_redraw_requested = true;
-            } else {
-                fill_round_rect({inner.x, inner.y, fill_w, inner.h}, fmaxf(2.0f, g_style.rounding * 0.4f), maybe_disabled(fill));
             }
             if (style.glint) {
                 g_redraw_requested = true;
-                float gx = inner.x + fmodf((float)g_ctx.frame_index * 2.0f, inner.w + 70.0f) - 50.0f;
+                float gx = inner.x + fmodf((float)g_ctx.frame_index * 1.30f, inner.w + 80.0f) - 40.0f;
                 push_clip({inner.x, inner.y, fill_w, inner.h});
-                draw_line(gx, inner.y + inner.h, gx + 38.0f, inner.y, 7.0f, {1.0f,1.0f,1.0f,0.26f});
+                fill_rect({gx, inner.y, 3.0f, inner.h}, Color{1.0f, 1.0f, 1.0f, 0.07f});
+                fill_rect({gx + 4.0f, inner.y, 2.0f, inner.h}, Color{1.0f, 1.0f, 1.0f, 0.14f});
+                fill_rect({gx + 7.0f, inner.y, 3.0f, inner.h}, Color{1.0f, 1.0f, 1.0f, 0.06f});
                 pop_clip();
             }
         }
@@ -5309,6 +5551,19 @@ void progress_bar(float progress, const ProgressStyle& style) {
     if (style.show_percent) {
         char pct[32];
         snprintf(pct, sizeof(pct), "%.0f%%", p * 100.0f);
+        float text_w = measure_text_width(pct);
+        float lh = text_line_height();
+        Rect chip = {
+            r.x + r.w * 0.5f - text_w * 0.5f - 8.0f,
+            r.y + r.h * 0.5f - lh * 0.5f - 1.0f,
+            text_w + 16.0f,
+            lh + 2.0f
+        };
+        Color chip_bg = lerp_color(resolve_color(ColorRole::Background), resolve_color(ColorRole::Panel), 0.35f);
+        chip_bg.a = 0.56f;
+        fill_round_rect(chip, fmaxf(3.0f, g_style.rounding * 0.45f), maybe_disabled(chip_bg));
+        Rect shadow_r = {r.x + 1.0f, r.y + 1.0f, r.w, r.h};
+        draw_text_utf8_centered(pct, shadow_r, Color{0.0f, 0.0f, 0.0f, 0.40f});
         draw_text_utf8_centered(pct, r, maybe_disabled(resolve_color(ColorRole::Text)));
     }
     if (cfx.clip_active) pop_clip();

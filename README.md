@@ -153,6 +153,16 @@ New windows start with the style configured near the top of `ftui.hpp`:
 
 If the application developer does not define `FTUI_DEFAULT_STYLE`, FTUI also checks `FTUI_THEME` at startup. Vim-style theme commands such as `:to`, `:tn`, and `:th` update `FTUI_THEME` for the current process, so child windows and later windows can reuse the selected theme. A developer-defined `FTUI_DEFAULT_STYLE` always takes precedence.
 
+Vim-style commands:
+
+- `:td` default dark
+- `:tc` Catppuccin Mocha
+- `:tn` Nord
+- `:tg` Gruvbox dark
+- `:to` One Dark
+- `:th` Ghostty green
+- `:q` quit
+
 Built-in presets:
 
 ```cpp
@@ -248,6 +258,20 @@ ftui::button("Open##folder");
 
 ### Side menus
 
+Drawer-style navigation:
+
+```cpp
+static const char* pages[] = {"Dashboard", "Network", "Services", "Logs", "Settings"};
+int page = 0;
+
+ftui::side_menu_drawer("Navigation", pages, 5, &page);
+
+if (page == 0) ftui::text("Dashboard");
+else if (page == 1) ftui::text("Network");
+```
+
+Embedded sidebar navigation:
+
 ```cpp
 static const char* pages[] = {"Dashboard", "Network", "Services", "Logs", "Settings"};
 int page = 0;
@@ -261,7 +285,7 @@ ftui::side_layout(220.0f, [&]() {
 });
 ```
 
-Use `split({220.0f, 1.0f}, ...)` directly when you want more control. Values `>= 16` are fixed pixel columns; smaller values are flexible weights.
+Use `side_menu_drawer(...)` when you want an app-style slide-out sidebar. Use `side_layout(...)` or `split({220.0f, 1.0f}, ...)` directly when you want a persistent sidebar. Values `>= 16` are fixed pixel columns; smaller values are flexible weights.
 
 ### Toasts
 

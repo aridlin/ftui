@@ -137,42 +137,38 @@ int main() {
             "and layout helpers while keeping the basic flow the same: begin, draw widgets, end.");
         ftui::separator();
 
-        ftui::split({220.0f, 1.0f}, [&]() {
-            ftui::side_menu("New features", side_pages, 3, &side_page);
-            ftui::content([&]() {
-                if (side_page == 0) {
-                    ftui::text("Side menu navigation");
-                    ftui::text_wrapped("Side menus are a denser navigation option for utility apps that have grown past a small tab strip.");
-                    ftui::progress_bar(transfer_progress, "Inline status");
-                } else if (side_page == 1) {
-                    ftui::text("Toast notifications");
-                    ftui::row(4, [&]() {
-                        if (ftui::button("Info")) ftui::toast_info("Background sync complete");
-                        if (ftui::button("Saved")) ftui::toast_success("Configuration saved");
-                        if (ftui::button("Warn")) ftui::toast_warning("High CPU usage");
-                        if (ftui::button("Error")) ftui::toast_error("Connection failed");
-                    });
-                } else {
-                    ftui::text("Masked progress");
-                    ftui::ProgressStyle battery;
-                    battery.label = "Embedded SVG mask";
-                    battery.mask_svg = embedded_battery_svg;
-                    battery.height = 52.0f;
-                    battery.wave_front = true;
-                    battery.glint = true;
-                    ftui::progress_bar(transfer_progress, battery);
-
-                    ftui::ProgressStyle pill;
-                    pill.label = "Built-in pill mask";
-                    pill.mask_shape = "pill";
-                    pill.height = 42.0f;
-                    pill.glint = true;
-                    ftui::progress_bar(transfer_progress, pill);
-
-                    ftui::slider_float("Progress", &transfer_progress, 0.0f, 1.0f);
-                }
+        ftui::side_menu_drawer("Feature menu", side_pages, 3, &side_page, 240.0f);
+        if (side_page == 0) {
+            ftui::text("Side menu navigation");
+            ftui::text_wrapped("The drawer-style side menu is a denser navigation option for utility apps that have grown past a small tab strip.");
+            ftui::progress_bar(transfer_progress, "Inline status");
+        } else if (side_page == 1) {
+            ftui::text("Toast notifications");
+            ftui::row(4, [&]() {
+                if (ftui::button("Info")) ftui::toast_info("Background sync complete");
+                if (ftui::button("Saved")) ftui::toast_success("Configuration saved");
+                if (ftui::button("Warn")) ftui::toast_warning("High CPU usage");
+                if (ftui::button("Error")) ftui::toast_error("Connection failed");
             });
-        });
+        } else {
+            ftui::text("Masked progress");
+            ftui::ProgressStyle battery;
+            battery.label = "Embedded SVG mask";
+            battery.mask_svg = embedded_battery_svg;
+            battery.height = 52.0f;
+            battery.wave_front = true;
+            battery.glint = true;
+            ftui::progress_bar(transfer_progress, battery);
+
+            ftui::ProgressStyle pill;
+            pill.label = "Built-in pill mask";
+            pill.mask_shape = "pill";
+            pill.height = 42.0f;
+            pill.glint = true;
+            ftui::progress_bar(transfer_progress, pill);
+
+            ftui::slider_float("Progress", &transfer_progress, 0.0f, 1.0f);
+        }
 
         ftui::separator();
 
