@@ -1,6 +1,12 @@
 #define FTUI_IMPLEMENTATION
 #include "../ftui.hpp"
 
+static const char* kBatteryMaskSvg =
+    "<svg width='160' height='64' viewBox='0 0 160 64' xmlns='http://www.w3.org/2000/svg'>"
+    "<rect x='4' y='12' width='132' height='40' rx='6' ry='6' fill='white'/>"
+    "<rect x='140' y='24' width='16' height='16' rx='3' ry='3' fill='white'/>"
+    "</svg>";
+
 int main() {
     ftui::Config cfg;
     cfg.title = "FTUI Navigation + Status";
@@ -38,7 +44,7 @@ int main() {
 
                     ftui::ProgressStyle battery;
                     battery.label = "Battery mask";
-                    battery.mask_path = "examples/battery.svg";
+                    battery.mask_svg = kBatteryMaskSvg;
                     battery.height = 54.0f;
                     battery.wave_front = true;
                     battery.glint = true;

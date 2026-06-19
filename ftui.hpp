@@ -20,7 +20,9 @@
 
 // Global startup theme. Change this line to another built-in preset if you
 // want a different default across all new FTUI windows.
-#ifndef FTUI_DEFAULT_STYLE
+#ifdef FTUI_DEFAULT_STYLE
+#define FTUI_DEFAULT_STYLE_EXPLICIT 1
+#else
 #define FTUI_DEFAULT_STYLE ftui::one_dark_style
 #endif
 
@@ -48,6 +50,7 @@
 #include <fstream>
 #include <sstream>
 #include <cctype>
+#include <cstdlib>
 
 // ============================================================
 // Public API
@@ -103,6 +106,9 @@ Style nord_style();
 Style gruvbox_dark_style();
 Style one_dark_style();
 Style ghostty_green_style();
+Style style_from_name(const char* name);
+const char* style_name(const Style& style);
+const char* current_style_name();
 
 void         set_style(const Style& s);
 const Style& get_style();
@@ -122,6 +128,13 @@ enum class BackdropEffect {
     BayerDither,
 };
 
+enum class WindowTransparency {
+    Opaque,
+    Plain,
+    BayerDither,
+    Blur,
+};
+
 struct Config {
     const char* title         = "FTUI App"; // UTF-8; converted internally on Windows
     int         width         = 960;
@@ -133,6 +146,8 @@ struct Config {
     bool        enable_effects = true;      // Windows-only visual effects layer
     BackdropEffect backdrop_effect = BackdropEffect::Blur; // Windows effects panels
     int         dither_size   = 4;          // BayerDither cell size in pixels
+    WindowTransparency window_transparency = WindowTransparency::Opaque;
+    float       window_opacity = 0.92f;     // Plain/Blur whole-window opacity
 };
 
 bool create_window(const Config& cfg = {});
@@ -146,6 +161,8 @@ void set_fps_limit(int fps);
 int  get_fps_limit();
 void set_backdrop_effect(BackdropEffect effect);
 void set_dither_size(int px);
+void set_window_transparency(WindowTransparency mode);
+void set_window_opacity(float opacity);
 void set_window_icon(void* native_icon);
 void set_window_icon_builtin(BuiltinIcon variant = BuiltinIcon::Symbol);
 
@@ -265,6 +282,8 @@ void clear_toasts();
 struct ProgressStyle {
     const char* label = nullptr;
     const char* mask_path = nullptr;
+    const char* mask_svg = nullptr;
+    const char* mask_shape = nullptr;
     ColorRole   fill_role = ColorRole::Accent;
     Color       fill_color = {-1.0f, -1.0f, -1.0f, -1.0f};
     float       height = 22.0f;
@@ -364,7 +383,13 @@ namespace internal {
 // ---- Shared utilities -----------------------------------------------
 
 static Style startup_style() {
+#ifdef FTUI_DEFAULT_STYLE_EXPLICIT
     return FTUI_DEFAULT_STYLE();
+#else
+    const char* env_theme = getenv("FTUI_THEME");
+    if (env_theme && env_theme[0]) return style_from_name(env_theme);
+    return FTUI_DEFAULT_STYLE();
+#endif
 }
 
 static const Style& fallback_style() {
@@ -600,6 +625,7 @@ static InputState g_input;
 static UIContext  g_ctx;
 static DebugState g_debug;
 static Style      g_style;
+static std::string g_style_name;
 static float      g_fps = 0, g_fps_accum = 0;
 static int        g_fps_frames = 0;
 static int        g_frame_limit_fps = 60;
@@ -610,6 +636,8 @@ static float      g_dt = 1.0f / 60.0f;
 static bool       g_effects_enabled = false;
 static BackdropEffect g_backdrop_effect = BackdropEffect::Blur;
 static int        g_dither_size = 4;
+static WindowTransparency g_window_transparency = WindowTransparency::Opaque;
+static float      g_window_opacity = 0.92f;
 static float      g_scroll_y = 0, g_content_height = 0;
 static float      g_scroll_target_y = 0;
 static bool       g_sb_dragging = false;
@@ -673,6 +701,7 @@ static void        pop_clip();
 static void        wait_frame_limit();
 static void        wake_event_loop();
 static void        sync_native_window_chrome();
+static void        sync_native_window_transparency();
 static void        apply_window_icon_handles(void* icon_big, void* icon_small, bool owned, BuiltinIcon variant);
 static bool        load_mask_from_image(const char* path, MaskData& out);
 static void        draw_toast_overlay();
@@ -1405,13 +1434,31 @@ static Rect next_rect(float height) {
 
 static void cmd_clear() { g_cmd.active = false; g_cmd.len = 0; g_cmd.buf[0] = '\0'; }
 
+static void set_theme_env(const char* name) {
+    if (!name || !name[0]) return;
+#ifdef _WIN32
+    _putenv_s("FTUI_THEME", name);
+#else
+    setenv("FTUI_THEME", name, 1);
+#endif
+}
+
+static void apply_named_theme(const char* name, bool persist) {
+    g_style = style_from_name(name);
+    g_style_name = style_name(g_style);
+    if (persist) set_theme_env(g_style_name.c_str());
+    g_redraw_requested = true;
+    wake_event_loop();
+    sync_native_window_chrome();
+}
+
 static void apply_cmd_theme() {
-    if      (strcmp(g_cmd.buf, "td") == 0) g_style = default_dark_style();
-    else if (strcmp(g_cmd.buf, "tc") == 0) g_style = catppuccin_mocha_style();
-    else if (strcmp(g_cmd.buf, "tn") == 0) g_style = nord_style();
-    else if (strcmp(g_cmd.buf, "tg") == 0) g_style = gruvbox_dark_style();
-    else if (strcmp(g_cmd.buf, "to") == 0) g_style = one_dark_style();
-    else if (strcmp(g_cmd.buf, "th") == 0) g_style = ghostty_green_style();
+    if      (strcmp(g_cmd.buf, "td") == 0) apply_named_theme("default-dark", true);
+    else if (strcmp(g_cmd.buf, "tc") == 0) apply_named_theme("catppuccin-mocha", true);
+    else if (strcmp(g_cmd.buf, "tn") == 0) apply_named_theme("nord", true);
+    else if (strcmp(g_cmd.buf, "tg") == 0) apply_named_theme("gruvbox-dark", true);
+    else if (strcmp(g_cmd.buf, "to") == 0) apply_named_theme("one-dark", true);
+    else if (strcmp(g_cmd.buf, "th") == 0) apply_named_theme("ghostty-green", true);
 }
 
 static bool has_ext(const char* path, const char* ext) {
@@ -1588,12 +1635,7 @@ static void fill_svg_path(MaskData& m, const std::string& d) {
     if (poly.size() >= 3) fill_mask_polygon(m, poly);
 }
 
-static bool load_mask_from_svg(const char* path, MaskData& out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return false;
-    std::stringstream ss; ss << in.rdbuf();
-    std::string s = ss.str();
-
+static bool load_mask_from_svg_text(const char* key, const std::string& s, MaskData& out) {
     float w = 0.0f, h = 0.0f;
     size_t svg_p = s.find("<svg");
     if (svg_p != std::string::npos) {
@@ -1641,24 +1683,99 @@ static bool load_mask_from_svg(const char* path, MaskData& out) {
         if (!d.empty()) fill_svg_path(out, d);
     }
     out.loaded = true;
-    out.path = path;
+    out.path = key ? key : "";
     return true;
 }
 
-static MaskData* mask_for_path(const char* path) {
-    if (!path || !path[0]) return nullptr;
+static bool load_mask_from_svg(const char* path, MaskData& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::stringstream ss; ss << in.rdbuf();
+    return load_mask_from_svg_text(path, ss.str(), out);
+}
+
+static bool is_builtin_mask_shape(const char* shape) {
+    return shape &&
+           (strcmp(shape, "battery") == 0 || strcmp(shape, "tank") == 0 ||
+            strcmp(shape, "pill") == 0 || strcmp(shape, "circle") == 0 ||
+            strcmp(shape, "logo") == 0);
+}
+
+static bool load_builtin_mask_shape(const char* shape, MaskData& out) {
+    if (!shape) return false;
+    out.w = 160;
+    out.h = 64;
+    out.bits.assign((size_t)out.w * (size_t)out.h, 0);
+    if (strcmp(shape, "battery") == 0) {
+        fill_mask_rect(out, 4, 12, 136, 52);
+        fill_mask_rect(out, 140, 24, 156, 40);
+    } else if (strcmp(shape, "tank") == 0) {
+        fill_mask_rect(out, 8, 16, 152, 54);
+        fill_mask_rect(out, 24, 8, 136, 20);
+    } else if (strcmp(shape, "pill") == 0) {
+        fill_mask_rect(out, 32, 8, 128, 56);
+        fill_mask_ellipse(out, 32, 32, 24, 24);
+        fill_mask_ellipse(out, 128, 32, 24, 24);
+    } else if (strcmp(shape, "circle") == 0) {
+        out.w = 96; out.h = 96; out.bits.assign((size_t)out.w * (size_t)out.h, 0);
+        fill_mask_ellipse(out, 48, 48, 44, 44);
+    } else if (strcmp(shape, "logo") == 0) {
+        std::vector<MaskPoint> tri = {{80, 4}, {156, 58}, {4, 58}};
+        fill_mask_polygon(out, tri);
+        fill_mask_rect(out, 68, 22, 92, 60);
+    } else {
+        return false;
+    }
+    out.loaded = true;
+    out.path = std::string("shape:") + shape;
+    return true;
+}
+
+static MaskData* mask_for_key(const char* key) {
+    if (!key || !key[0]) return nullptr;
     for (MaskData& m : g_mask_cache) {
-        if (m.loaded && m.path == path) return &m;
+        if (m.loaded && m.path == key) return &m;
     }
     MaskData* slot = &g_mask_cache[0];
     for (MaskData& m : g_mask_cache) {
         if (!m.loaded) { slot = &m; break; }
     }
+    return slot;
+}
+
+static MaskData* mask_for_path(const char* path) {
+    MaskData* slot = mask_for_key(path);
+    if (!slot) return nullptr;
+    if (slot->loaded) return slot;
     *slot = {};
     bool ok = has_ext(path, ".svg") ? load_mask_from_svg(path, *slot) : load_mask_from_image(path, *slot);
     if (!ok || slot->bits.empty()) { *slot = {}; return nullptr; }
     slot->path = path;
     slot->loaded = true;
+    return slot;
+}
+
+static MaskData* mask_for_svg(const char* svg) {
+    if (!svg || !svg[0]) return nullptr;
+    std::string key = std::string("svg:") + svg;
+    MaskData* slot = mask_for_key(key.c_str());
+    if (!slot) return nullptr;
+    if (slot->loaded) return slot;
+    *slot = {};
+    bool ok = load_mask_from_svg_text(key.c_str(), svg, *slot);
+    if (!ok || slot->bits.empty()) { *slot = {}; return nullptr; }
+    return slot;
+}
+
+static MaskData* mask_for_shape(const char* shape) {
+    if (!shape || !shape[0]) return nullptr;
+    std::string key = std::string("shape:") + shape;
+    MaskData* slot = mask_for_key(key.c_str());
+    if (!slot) return nullptr;
+    if (slot->loaded) return slot;
+    *slot = {};
+    bool ok = load_builtin_mask_shape(shape, *slot);
+    if (!ok || slot->bits.empty()) { *slot = {}; return nullptr; }
     return slot;
 }
 
@@ -1784,8 +1901,26 @@ void set_dither_size(int px) {
     internal::g_redraw_requested = true;
     internal::wake_event_loop();
 }
+void set_window_transparency(WindowTransparency mode) {
+    internal::g_window_transparency = mode;
+    internal::sync_native_window_transparency();
+    internal::g_redraw_requested = true;
+    internal::wake_event_loop();
+}
+void set_window_opacity(float opacity) {
+    internal::g_window_opacity = internal::clampf(opacity, 0.20f, 1.0f);
+    internal::sync_native_window_transparency();
+    internal::g_redraw_requested = true;
+    internal::wake_event_loop();
+}
 void request_redraw() { internal::g_redraw_requested = true; internal::wake_event_loop(); }
-void set_style(const Style& s)  { internal::g_style = s; internal::g_redraw_requested = true; internal::wake_event_loop(); internal::sync_native_window_chrome(); }
+void set_style(const Style& s)  {
+    internal::g_style = s;
+    internal::g_style_name = style_name(s);
+    internal::g_redraw_requested = true;
+    internal::wake_event_loop();
+    internal::sync_native_window_chrome();
+}
 const Style& get_style()         { return internal::g_style; }
 Color color_from_hex(const char* hex) { return internal::parse_hex_color(hex ? std::string_view(hex) : std::string_view{}); }
 Color color_from_hex(std::string_view hex) { return internal::parse_hex_color(hex); }
@@ -1956,6 +2091,48 @@ Style ghostty_green_style() {
     s.accent = {0.451f,0.878f,0.529f,1}; s.warning = {0.918f,0.698f,0.353f,1}; s.success = {0.420f,0.831f,0.514f,1};
     s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=5; s.border_width=1; s.font_size=16;
     return s;
+}
+
+static bool style_eq(Color a, Color b) {
+    return fabsf(a.r - b.r) < 0.0001f && fabsf(a.g - b.g) < 0.0001f &&
+           fabsf(a.b - b.b) < 0.0001f && fabsf(a.a - b.a) < 0.0001f;
+}
+
+const char* style_name(const Style& style) {
+    struct NamedStyle { const char* name; Style (*fn)(); };
+    static NamedStyle styles[] = {
+        {"default-dark", default_dark_style},
+        {"catppuccin-mocha", catppuccin_mocha_style},
+        {"nord", nord_style},
+        {"gruvbox-dark", gruvbox_dark_style},
+        {"one-dark", one_dark_style},
+        {"ghostty-green", ghostty_green_style},
+    };
+    for (const NamedStyle& ns : styles) {
+        Style s = ns.fn();
+        if (style_eq(style.background, s.background) && style_eq(style.panel, s.panel) &&
+            style_eq(style.text, s.text) && style_eq(style.accent, s.accent) &&
+            fabsf(style.rounding - s.rounding) < 0.0001f) {
+            return ns.name;
+        }
+    }
+    return "custom";
+}
+
+Style style_from_name(const char* name) {
+    if (!name || !name[0]) return FTUI_DEFAULT_STYLE();
+    if (strcmp(name, "default-dark") == 0 || strcmp(name, "dark") == 0 || strcmp(name, "td") == 0) return default_dark_style();
+    if (strcmp(name, "catppuccin-mocha") == 0 || strcmp(name, "catppuccin") == 0 || strcmp(name, "tc") == 0) return catppuccin_mocha_style();
+    if (strcmp(name, "nord") == 0 || strcmp(name, "tn") == 0) return nord_style();
+    if (strcmp(name, "gruvbox-dark") == 0 || strcmp(name, "gruvbox") == 0 || strcmp(name, "tg") == 0) return gruvbox_dark_style();
+    if (strcmp(name, "one-dark") == 0 || strcmp(name, "onedark") == 0 || strcmp(name, "to") == 0) return one_dark_style();
+    if (strcmp(name, "ghostty-green") == 0 || strcmp(name, "ghostty") == 0 || strcmp(name, "green") == 0 || strcmp(name, "th") == 0) return ghostty_green_style();
+    return FTUI_DEFAULT_STYLE();
+}
+
+const char* current_style_name() {
+    if (!internal::g_style_name.empty()) return internal::g_style_name.c_str();
+    return style_name(internal::g_style);
 }
 
 
@@ -2409,6 +2586,42 @@ static void sync_native_window_chrome() {
     FreeLibrary(dwm);
 }
 
+static void sync_native_window_transparency() {
+    if (!g_platform.hwnd) return;
+
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (dwm) {
+        struct DwmBlurBehind {
+            DWORD dwFlags;
+            BOOL fEnable;
+            HRGN hRgnBlur;
+            BOOL fTransitionOnMaximized;
+        };
+        using DwmEnableBlurBehindWindowFn = HRESULT (WINAPI*)(HWND, const DwmBlurBehind*);
+        auto blur_fn = (DwmEnableBlurBehindWindowFn)GetProcAddress(dwm, "DwmEnableBlurBehindWindow");
+        if (blur_fn) {
+            DwmBlurBehind bb{};
+            bb.dwFlags = 0x00000001;
+            bb.fEnable = (g_window_transparency == WindowTransparency::Blur) ? TRUE : FALSE;
+            blur_fn(g_platform.hwnd, &bb);
+        }
+        FreeLibrary(dwm);
+    }
+
+    LONG_PTR ex = GetWindowLongPtrW(g_platform.hwnd, GWL_EXSTYLE);
+    bool alpha_mode = g_window_transparency == WindowTransparency::Plain ||
+                      g_window_transparency == WindowTransparency::BayerDither ||
+                      g_window_transparency == WindowTransparency::Blur;
+    if (alpha_mode) {
+        SetWindowLongPtrW(g_platform.hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        BYTE alpha = (BYTE)(clampf(g_window_opacity, 0.20f, 1.0f) * 255.0f + 0.5f);
+        SetLayeredWindowAttributes(g_platform.hwnd, 0, alpha, LWA_ALPHA);
+    } else if (ex & WS_EX_LAYERED) {
+        SetLayeredWindowAttributes(g_platform.hwnd, 0, 255, LWA_ALPHA);
+        SetWindowLongPtrW(g_platform.hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+    }
+}
+
 static void release_render_target() {
     if (g_renderer.rendering_params){g_renderer.rendering_params->Release();g_renderer.rendering_params=nullptr;}
     if (g_renderer.brush){g_renderer.brush->Release();g_renderer.brush=nullptr;}
@@ -2568,10 +2781,13 @@ bool create_window(const Config& cfg) {
     g_renderer.com_inited = (hr==S_OK||hr==S_FALSE);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_style = startup_style();
+    g_style_name = style_name(g_style);
     g_frame_limit_fps = cfg.fps_limit;
     g_redraw_requested = true;
     g_backdrop_effect = cfg.backdrop_effect;
     g_dither_size = cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
+    g_window_transparency = cfg.window_transparency;
+    g_window_opacity = clampf(cfg.window_opacity, 0.20f, 1.0f);
     g_scroll_y = g_scroll_target_y = 0;
     g_ta_scroll_y = g_ta_scroll_target_y = 0;
     reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
@@ -2611,6 +2827,7 @@ bool create_window(const Config& cfg) {
     else
         apply_window_icon_handles(nullptr, nullptr, true, g_platform.icon_variant);
     sync_native_window_chrome();
+    sync_native_window_transparency();
     ShowWindow(g_platform.hwnd,SW_SHOW); UpdateWindow(g_platform.hwnd);
     QueryPerformanceFrequency(&g_freq); QueryPerformanceCounter(&g_last_time);
     return true;
@@ -2686,6 +2903,9 @@ void begin() {
     if(!g_renderer.target) return;
     g_renderer.target->BeginDraw(); g_drawing=true;
     clear_bg(g_style.background);
+    if (g_window_transparency == WindowTransparency::BayerDither) {
+        draw_dither_backdrop_panel({0.0f, 0.0f, (float)g_platform.width, (float)g_platform.height}, 1.0f);
+    }
     D2D1_RECT_F cr={0,g_ctx.content_region.y,(float)g_platform.width,g_ctx.content_region.y+vh};
     g_renderer.target->PushAxisAlignedClip(cr,D2D1_ANTIALIAS_MODE_ALIASED);
 }
@@ -2804,12 +3024,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     using namespace internal;
     if(!g_platform.hwnd) return;
     struct Snap {
-        PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; DebugState dbg;
+        PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; std::string sty_name; DebugState dbg;
         float sc,sct,ch,sbmy,sbms0; bool sbd;
         CmdState cmd; float fps,fpsa; int fpsf, frame_limit_fps; bool redraw_requested;
         LARGE_INTEGER lt;
-        int tci,tc,tsa,taci,tac,taas,dither_size; float tasc,tasct,dt;
-        BackdropEffect backdrop_effect;
+        int tci,tc,tsa,taci,tac,taas,dither_size; float tasc,tasct,dt,window_opacity;
+        BackdropEffect backdrop_effect; WindowTransparency window_transparency;
         bool effects;
         MotionSlot motion[256];
         TabFxSlot tab_fx[32];
@@ -2836,11 +3056,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         bool inside_modal, modal_drawn, dropdown_capture_input;
         bool shortcuts,drawing;
     } s;
-    s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
+    s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.sty_name=g_style_name;s.dbg=g_debug;
     s.sc=g_scroll_y;s.sct=g_scroll_target_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
     s.cmd=g_cmd;s.fps=g_fps;s.fpsa=g_fps_accum;s.fpsf=g_fps_frames;s.lt=g_last_time;
     s.frame_limit_fps=g_frame_limit_fps;s.redraw_requested=g_redraw_requested;
-    s.backdrop_effect=g_backdrop_effect;s.dither_size=g_dither_size;
+    s.backdrop_effect=g_backdrop_effect;s.dither_size=g_dither_size;s.window_transparency=g_window_transparency;s.window_opacity=g_window_opacity;
     s.tci=g_text_cursor_id;s.tc=g_text_cursor;s.tsa=g_text_sel_anchor;
     s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;s.tasct=g_ta_scroll_target_y;s.dt=g_dt;
     s.effects=g_effects_enabled;
@@ -2885,11 +3105,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
 
     g_platform={}; g_platform.instance=inst;
     g_renderer={}; g_renderer.d2d_factory=d2d; g_renderer.dwrite_factory=(IDWriteFactory*)dw; g_renderer.wic_factory=(IWICImagingFactory*)wic; g_renderer.dpi_scale=1;
-    g_input={}; g_ctx={}; g_style=s.sty; g_debug=s.dbg;
+    g_input={}; g_ctx={}; g_style=s.sty; g_style_name=s.sty_name; g_debug=s.dbg;
     g_scroll_y=g_content_height=0; g_sb_dragging=false; g_cmd={};
     g_fps=g_fps_accum=0; g_fps_frames=0;
     g_frame_limit_fps=cfg.fps_limit; g_redraw_requested=true;
     g_backdrop_effect=cfg.backdrop_effect; g_dither_size=cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
+    g_window_transparency=cfg.window_transparency; g_window_opacity=clampf(cfg.window_opacity, 0.20f, 1.0f);
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
     g_prev_frame_bitmap=nullptr; g_prev_frame_pixels.clear(); g_prev_frame_w=0; g_prev_frame_h=0;
@@ -2930,6 +3151,7 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
             else
                 apply_window_icon_handles(nullptr, nullptr, true, s.p.icon_variant);
             sync_native_window_chrome();
+            sync_native_window_transparency();
             ShowWindow(g_platform.hwnd,SW_SHOW); UpdateWindow(g_platform.hwnd);
             while(pump()){begin();fn();end();}
         }
@@ -2939,11 +3161,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         if(g_platform.hwnd){DestroyWindow(g_platform.hwnd);g_platform.hwnd=nullptr;}
     }
     destroy_owned_icons();
-    g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_debug=s.dbg;
+    g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_style_name=s.sty_name;g_debug=s.dbg;
     g_scroll_y=s.sc;g_scroll_target_y=s.sct;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
     g_cmd=s.cmd;g_fps=s.fps;g_fps_accum=s.fpsa;g_fps_frames=s.fpsf;g_last_time=s.lt;
     g_frame_limit_fps=s.frame_limit_fps;g_redraw_requested=s.redraw_requested;
-    g_backdrop_effect=s.backdrop_effect;g_dither_size=s.dither_size;
+    g_backdrop_effect=s.backdrop_effect;g_dither_size=s.dither_size;g_window_transparency=s.window_transparency;g_window_opacity=s.window_opacity;
     g_text_cursor_id=s.tci;g_text_cursor=s.tc;g_text_sel_anchor=s.tsa;
     g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;g_ta_scroll_target_y=s.tasct;g_dt=s.dt;
     g_effects_enabled=s.effects;
@@ -3110,6 +3332,19 @@ static void dbg(const char* fmt, ...) {
 
 static void set_color(Color c) { cairo_set_source_rgba(g_renderer.cr,c.r,c.g,c.b,c.a); }
 static void sync_native_window_chrome() {}
+static void sync_native_window_transparency() {
+    if (!g_platform.display || !g_platform.window) return;
+    Atom opacity = XInternAtom(g_platform.display, "_NET_WM_WINDOW_OPACITY", False);
+    if (g_window_transparency == WindowTransparency::Plain ||
+        g_window_transparency == WindowTransparency::BayerDither) {
+        unsigned long value = (unsigned long)(clampf(g_window_opacity, 0.20f, 1.0f) * 4294967295.0f + 0.5f);
+        XChangeProperty(g_platform.display, g_platform.window, opacity, XA_CARDINAL, 32,
+                        PropModeReplace, (unsigned char*)&value, 1);
+    } else {
+        XDeleteProperty(g_platform.display, g_platform.window, opacity);
+    }
+    XFlush(g_platform.display);
+}
 static void apply_window_icon_handles(void*, void*, bool, BuiltinIcon) {}
 
 static void rrect_path(cairo_t* cr, float x, float y, float w, float h, float r) {
@@ -3492,14 +3727,18 @@ bool create_window(const Config& cfg) {
     XMapWindow(dpy,g_platform.window); XFlush(dpy);
     g_platform.width=cfg.width; g_platform.height=cfg.height; g_platform.running=true;
     g_style=startup_style();
+    g_style_name=style_name(g_style);
     g_frame_limit_fps = cfg.fps_limit;
     g_redraw_requested = true;
     g_backdrop_effect = cfg.backdrop_effect;
     g_dither_size = cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
+    g_window_transparency = cfg.window_transparency;
+    g_window_opacity = clampf(cfg.window_opacity, 0.20f, 1.0f);
     g_scroll_y = g_scroll_target_y = 0;
     g_ta_scroll_y = g_ta_scroll_target_y = 0;
     reset_effect_state(false);
     if (!init_cairo()) return false;
+    sync_native_window_transparency();
     clock_gettime(CLOCK_MONOTONIC,&g_last_time);
     return true;
 }
@@ -3566,6 +3805,9 @@ void begin() {
     apply_font();
     // clear
     set_color(g_style.background); cairo_paint(g_renderer.cr);
+    if (g_window_transparency == WindowTransparency::BayerDither) {
+        draw_dither_backdrop_panel({0.0f, 0.0f, (float)g_platform.width, (float)g_platform.height}, 1.0f);
+    }
     // content clip
     cairo_save(g_renderer.cr);
     cairo_rectangle(g_renderer.cr,0,g_ctx.content_region.y,(float)g_platform.width,vh);
@@ -3649,12 +3891,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     using namespace internal;
     if(!g_platform.display) return;
     struct Snap {
-        PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; DebugState dbg;
+        PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; std::string sty_name; DebugState dbg;
         float sc,sct,ch,sbmy,sbms0; bool sbd;
         CmdState cmd; float fps,fpsa; int fpsf, frame_limit_fps; bool redraw_requested;
         struct timespec lt;
-        int tci,tc,tsa,taci,tac,taas,dither_size; float tasc,tasct,dt;
-        BackdropEffect backdrop_effect;
+        int tci,tc,tsa,taci,tac,taas,dither_size; float tasc,tasct,dt,window_opacity;
+        BackdropEffect backdrop_effect; WindowTransparency window_transparency;
         bool effects;
         MotionSlot motion[256];
         TabFxSlot tab_fx[32];
@@ -3679,11 +3921,11 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
         bool shortcuts,drawing;
         XIM xim; XIC xic; std::string cb;
     } s;
-    s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
+    s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.sty_name=g_style_name;s.dbg=g_debug;
     s.sc=g_scroll_y;s.sct=g_scroll_target_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
     s.cmd=g_cmd;s.fps=g_fps;s.fpsa=g_fps_accum;s.fpsf=g_fps_frames;s.lt=g_last_time;
     s.frame_limit_fps=g_frame_limit_fps;s.redraw_requested=g_redraw_requested;
-    s.backdrop_effect=g_backdrop_effect;s.dither_size=g_dither_size;
+    s.backdrop_effect=g_backdrop_effect;s.dither_size=g_dither_size;s.window_transparency=g_window_transparency;s.window_opacity=g_window_opacity;
     s.tci=g_text_cursor_id;s.tc=g_text_cursor;s.tsa=g_text_sel_anchor;
     s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;s.tasct=g_ta_scroll_target_y;s.dt=g_dt;
     s.effects=g_effects_enabled;
@@ -3718,11 +3960,12 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.shortcuts=g_shortcuts_enabled;s.drawing=g_drawing;s.xim=g_xim;s.xic=g_xic;s.cb=g_clipboard_buf;
     Display* dpy=g_platform.display; Window parent=g_platform.window;
     g_platform={}; g_platform.display=dpy;
-    g_renderer={}; g_input={}; g_ctx={}; g_style=s.sty; g_debug=s.dbg;
+    g_renderer={}; g_input={}; g_ctx={}; g_style=s.sty; g_style_name=s.sty_name; g_debug=s.dbg;
     g_scroll_y=g_content_height=0; g_sb_dragging=false; g_cmd={};
     g_fps=g_fps_accum=0; g_fps_frames=0;
     g_frame_limit_fps=cfg.fps_limit; g_redraw_requested=true;
     g_backdrop_effect=cfg.backdrop_effect; g_dither_size=cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
+    g_window_transparency=cfg.window_transparency; g_window_opacity=clampf(cfg.window_opacity, 0.20f, 1.0f);
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
     memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
@@ -3758,16 +4001,16 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_platform.width=cfg.width;g_platform.height=cfg.height;g_platform.running=true;
     XMapWindow(dpy,g_platform.window); XFlush(dpy);
     g_renderer.dpi_scale=s.r.dpi_scale;
-    if(init_cairo()){clock_gettime(CLOCK_MONOTONIC,&g_last_time);while(pump()){begin();fn();end();}}
+    if(init_cairo()){sync_native_window_transparency();clock_gettime(CLOCK_MONOTONIC,&g_last_time);while(pump()){begin();fn();end();}}
     teardown_cairo();
     if(g_xic){XDestroyIC(g_xic);g_xic=nullptr;}
     if(g_xim){XCloseIM(g_xim);g_xim=nullptr;}
     if(g_platform.window){XDestroyWindow(dpy,g_platform.window);g_platform.window=0;} XFlush(dpy);
-    g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_debug=s.dbg;
+    g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_style_name=s.sty_name;g_debug=s.dbg;
     g_scroll_y=s.sc;g_scroll_target_y=s.sct;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
     g_cmd=s.cmd;g_fps=s.fps;g_fps_accum=s.fpsa;g_fps_frames=s.fpsf;g_last_time=s.lt;
     g_frame_limit_fps=s.frame_limit_fps;g_redraw_requested=s.redraw_requested;
-    g_backdrop_effect=s.backdrop_effect;g_dither_size=s.dither_size;
+    g_backdrop_effect=s.backdrop_effect;g_dither_size=s.dither_size;g_window_transparency=s.window_transparency;g_window_opacity=s.window_opacity;
     g_text_cursor_id=s.tci;g_text_cursor=s.tc;g_text_sel_anchor=s.tsa;
     g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;g_ta_scroll_target_y=s.tasct;g_dt=s.dt;
     g_effects_enabled=s.effects;
@@ -4950,7 +5193,9 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
 }
 
 static void draw_masked_progress(Rect r, float progress, const ProgressStyle& style, Color fill) {
-    MaskData* mask = mask_for_path(style.mask_path);
+    MaskData* mask = style.mask_svg && style.mask_svg[0] ? mask_for_svg(style.mask_svg) :
+                     style.mask_shape && style.mask_shape[0] ? mask_for_shape(style.mask_shape) :
+                     mask_for_path(style.mask_path);
     if (!mask || mask->w <= 0 || mask->h <= 0) return;
 
     Color base = resolve_color(ColorRole::InputBg);
@@ -5005,7 +5250,8 @@ void progress_bar(float progress) {
 
 void progress_bar(float progress, const char* label_or_mask_path) {
     ProgressStyle style;
-    if (label_or_mask_path && looks_like_mask_path(label_or_mask_path)) style.mask_path = label_or_mask_path;
+    if (label_or_mask_path && is_builtin_mask_shape(label_or_mask_path)) style.mask_shape = label_or_mask_path;
+    else if (label_or_mask_path && looks_like_mask_path(label_or_mask_path)) style.mask_path = label_or_mask_path;
     else style.label = label_or_mask_path;
     progress_bar(progress, style);
 }
@@ -5027,7 +5273,9 @@ void progress_bar(float progress, const ProgressStyle& style) {
     if (cfx.clip_active) push_clip(cfx.clip);
     if (label && label[0]) draw_widget_label(label, outer, false);
 
-    if (style.mask_path && style.mask_path[0]) {
+    if ((style.mask_path && style.mask_path[0]) ||
+        (style.mask_svg && style.mask_svg[0]) ||
+        (style.mask_shape && style.mask_shape[0])) {
         draw_masked_progress(r, p, style, fill);
     } else {
         Color track = resolve_color(ColorRole::InputBg);

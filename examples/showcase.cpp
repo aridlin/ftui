@@ -56,15 +56,26 @@ int main() {
     bool safe_mode = false;
     bool advanced_enabled = true;
     float blend = 0.45f;
+    float transfer_progress = 0.73f;
+    float window_opacity = 0.92f;
+    float dither_size = 4.0f;
 
     static const char* tabs[] = { "Workspace", "Logs", "Settings" };
     int tab_sel = 0;
+    static const char* side_pages[] = { "Overview", "Toasts", "Progress" };
+    int side_page = 0;
 
     static const char* env_items[] = { "Local", "Staging", "Production" };
     static const char* profile_items[] = { "Admin", "Observer", "Maintainer", "Support" };
     static const char* shell_items[] = { "Powershell", "Bash", "Cmd" };
     static const char* theme_names[] = {
         "Default Dark", "Catppuccin Mocha", "Nord", "Gruvbox Dark", "One Dark", "Ghostty Green"
+    };
+    static const char* theme_keys[] = {
+        "default-dark", "catppuccin-mocha", "nord", "gruvbox-dark", "one-dark", "ghostty-green"
+    };
+    static const char* transparency_names[] = {
+        "Opaque", "Plain transparency", "Bayer dither", "Windows blur"
     };
     static const char* icon_names[] = {
         "Symbol", "Symbol + text"
@@ -83,13 +94,19 @@ int main() {
     int shell_sel = 0;
     int theme_idx = 0;
     int icon_idx = 0;
+    int transparency_idx = 0;
     for (int i = 0; i < 6; ++i) {
-        if (theme_fns[i] == FTUI_DEFAULT_STYLE) {
+        if (strcmp(theme_keys[i], ftui::current_style_name()) == 0) {
             theme_idx = i;
             break;
         }
     }
-    ftui::set_style(theme_fns[theme_idx]());
+
+    static const char* embedded_battery_svg =
+        "<svg width='160' height='64' viewBox='0 0 160 64' xmlns='http://www.w3.org/2000/svg'>"
+        "<rect x='4' y='12' width='132' height='40' rx='6' ry='6' fill='white'/>"
+        "<rect x='140' y='24' width='16' height='16' rx='3' ry='3' fill='white'/>"
+        "</svg>";
 
     bool general_open = true;
     bool layout_open = true;
@@ -118,6 +135,45 @@ int main() {
         ftui::text_wrapped(
             "Tiny immediate-mode GUI for utility apps. This demo focuses on the higher-value widgets "
             "and layout helpers while keeping the basic flow the same: begin, draw widgets, end.");
+        ftui::separator();
+
+        ftui::split({220.0f, 1.0f}, [&]() {
+            ftui::side_menu("New features", side_pages, 3, &side_page);
+            ftui::content([&]() {
+                if (side_page == 0) {
+                    ftui::text("Side menu navigation");
+                    ftui::text_wrapped("Side menus are a denser navigation option for utility apps that have grown past a small tab strip.");
+                    ftui::progress_bar(transfer_progress, "Inline status");
+                } else if (side_page == 1) {
+                    ftui::text("Toast notifications");
+                    ftui::row(4, [&]() {
+                        if (ftui::button("Info")) ftui::toast_info("Background sync complete");
+                        if (ftui::button("Saved")) ftui::toast_success("Configuration saved");
+                        if (ftui::button("Warn")) ftui::toast_warning("High CPU usage");
+                        if (ftui::button("Error")) ftui::toast_error("Connection failed");
+                    });
+                } else {
+                    ftui::text("Masked progress");
+                    ftui::ProgressStyle battery;
+                    battery.label = "Embedded SVG mask";
+                    battery.mask_svg = embedded_battery_svg;
+                    battery.height = 52.0f;
+                    battery.wave_front = true;
+                    battery.glint = true;
+                    ftui::progress_bar(transfer_progress, battery);
+
+                    ftui::ProgressStyle pill;
+                    pill.label = "Built-in pill mask";
+                    pill.mask_shape = "pill";
+                    pill.height = 42.0f;
+                    pill.glint = true;
+                    ftui::progress_bar(transfer_progress, pill);
+
+                    ftui::slider_float("Progress", &transfer_progress, 0.0f, 1.0f);
+                }
+            });
+        });
+
         ftui::separator();
 
         ftui::tabs(tabs, 3, &tab_sel);
@@ -301,11 +357,34 @@ int main() {
                  click_count, safe_mode ? "on" : "off", blend, shell_items[shell_sel]);
         ftui::text(summary);
 
+        for (int i = 0; i < 6; ++i) {
+            if (strcmp(theme_keys[i], ftui::current_style_name()) == 0) {
+                theme_idx = i;
+                break;
+            }
+        }
         if (ftui::dropdown("Theme", theme_names, 6, &theme_idx, 6)) {
             ftui::set_style(theme_fns[theme_idx]());
             append_line(logs, sizeof(logs), "[Settings] Theme changed.");
         }
         ftui::tooltip("Dropdowns are opt-in single-call pickers.");
+
+        if (ftui::dropdown("Window transparency", transparency_names, 4, &transparency_idx, 4)) {
+            ftui::WindowTransparency mode = ftui::WindowTransparency::Opaque;
+            if (transparency_idx == 1) mode = ftui::WindowTransparency::Plain;
+            else if (transparency_idx == 2) mode = ftui::WindowTransparency::BayerDither;
+            else if (transparency_idx == 3) mode = ftui::WindowTransparency::Blur;
+            ftui::set_window_transparency(mode);
+            append_line(logs, sizeof(logs), "[Settings] Window transparency changed.");
+        }
+        ftui::row(2, [&]() {
+            if (ftui::slider_float("Window opacity", &window_opacity, 0.25f, 1.0f)) {
+                ftui::set_window_opacity(window_opacity);
+            }
+            if (ftui::slider_float("Dither cell size", &dither_size, 1.0f, 16.0f)) {
+                ftui::set_dither_size((int)(dither_size + 0.5f));
+            }
+        });
 
         if (ftui::dropdown("Window icon", icon_names, 2, &icon_idx, 2)) {
             ftui::set_window_icon_builtin(icon_idx == 0

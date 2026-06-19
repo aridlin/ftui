@@ -85,6 +85,15 @@ cfg.backdrop_effect = ftui::BackdropEffect::BayerDither;
 cfg.dither_size = 5;
 ```
 
+Window-level transparency is separate:
+
+```cpp
+cfg.window_transparency = ftui::WindowTransparency::Plain;
+cfg.window_opacity = 0.88f;
+```
+
+Windows supports `Opaque`, `Plain`, `BayerDither`, and `Blur`. Linux supports `Opaque`, `Plain`, and `BayerDither`; plain opacity uses the compositor `_NET_WM_WINDOW_OPACITY` property.
+
 ## Build
 
 Windows with `clang++`:
@@ -141,6 +150,8 @@ New windows start with the style configured near the top of `ftui.hpp`:
 #define FTUI_DEFAULT_STYLE ftui::one_dark_style
 #endif
 ```
+
+If the application developer does not define `FTUI_DEFAULT_STYLE`, FTUI also checks `FTUI_THEME` at startup. Vim-style theme commands such as `:to`, `:tn`, and `:th` update `FTUI_THEME` for the current process, so child windows and later windows can reuse the selected theme. A developer-defined `FTUI_DEFAULT_STYLE` always takes precedence.
 
 Built-in presets:
 
@@ -280,14 +291,35 @@ ftui::progress_bar(progress);
 ftui::progress_bar(progress, "Loading assets");
 ```
 
-Masked progress bars fill the white/opaque area of an SVG or image from left to right:
+Masked progress bars fill the white/opaque area of an SVG, PNG, or image from left to right:
 
 ```cpp
 ftui::ProgressStyle style;
-style.mask_path = "battery.svg";
+style.mask_path = "battery.png";
 style.wave_front = true;
 style.glint = true;
 ftui::progress_bar(progress, style);
+```
+
+For single-binary examples, embed SVG text directly:
+
+```cpp
+ftui::ProgressStyle battery;
+battery.mask_svg = "<svg width='160' height='64' viewBox='0 0 160 64'>"
+                   "<rect x='4' y='12' width='132' height='40' fill='white'/>"
+                   "<rect x='140' y='24' width='16' height='16' fill='white'/>"
+                   "</svg>";
+ftui::progress_bar(progress, battery);
+```
+
+Built-in masks are available by name:
+
+```cpp
+ftui::progress_bar(progress, "battery");
+
+ftui::ProgressStyle pill;
+pill.mask_shape = "pill"; // battery, tank, pill, circle, logo
+ftui::progress_bar(progress, pill);
 ```
 
 ### Single-line input
