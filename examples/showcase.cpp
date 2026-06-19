@@ -75,7 +75,7 @@ int main() {
         "default-dark", "catppuccin-mocha", "nord", "gruvbox-dark", "one-dark", "ghostty-green"
     };
     static const char* transparency_names[] = {
-        "Opaque", "Plain transparency", "Bayer dither", "Windows blur"
+        "Opaque", "Plain transparency", "Soft dither", "Windows blur"
     };
     static const char* icon_names[] = {
         "Symbol", "Symbol + text"
@@ -377,7 +377,7 @@ int main() {
             if (ftui::slider_float("Window opacity", &window_opacity, 0.25f, 1.0f)) {
                 ftui::set_window_opacity(window_opacity);
             }
-            if (ftui::slider_float("Dither cell size", &dither_size, 1.0f, 16.0f)) {
+            if (ftui::slider_float("Dither motif size", &dither_size, 1.0f, 16.0f)) {
                 ftui::set_dither_size((int)(dither_size + 0.5f));
             }
         });

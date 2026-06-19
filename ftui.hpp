@@ -145,7 +145,7 @@ struct Config {
     void*       icon          = nullptr;    // HICON on Windows; ignored on Linux
     bool        enable_effects = true;      // Smooth scrolling and widget animations
     BackdropEffect backdrop_effect = BackdropEffect::Blur; // Blur is Windows-only; dither is cross-platform
-    int         dither_size   = 4;          // BayerDither cell size in pixels
+    int         dither_size   = 4;          // Soft dither motif size in pixels
     WindowTransparency window_transparency = WindowTransparency::Opaque;
     float       window_opacity = 0.92f;     // Plain/Blur whole-window opacity
 };
@@ -604,6 +604,9 @@ struct SideDrawerState {
     float width = 260.0f;
     float progress = 0.0f;
     float item_h = 34.0f;
+    Rect launcher_rect = {};
+    float launcher_hover = 0.0f;
+    float launcher_active = 0.0f;
     std::string title;
     std::vector<std::string> labels;
 };
@@ -725,6 +728,7 @@ static void        draw_side_drawer_overlay(int window_w, int window_h);
 static void        draw_command_overlay(int window_w, int window_h);
 static bool        toasts_active();
 static void        draw_dither_backdrop_panel(Rect r, float opacity);
+static void        draw_dither_pattern(Rect r, float opacity);
 
 #if FTUI_WINDOWS_EFFECTS
 static void        draw_previous_frame_overlay(Rect clip_r, float dx, float opacity);
@@ -1248,7 +1252,7 @@ static void draw_dropdown_overlay() {
 
 static void draw_side_drawer_overlay(int window_w, int window_h) {
     SideDrawerState& drawer = g_side_drawer;
-    if ((!drawer.active && !drawer.open) || drawer.progress <= 0.01f) return;
+    if (!drawer.active && !drawer.open && drawer.progress <= 0.01f) return;
 
     float p = drawer.progress * drawer.progress * (3.0f - 2.0f * drawer.progress);
     float ww = (float)window_w;
@@ -1258,56 +1262,79 @@ static void draw_side_drawer_overlay(int window_w, int window_h) {
     Rect screen = {0.0f, 0.0f, ww, wh};
     Rect panel = {x, 0.0f, panel_w, wh};
 
-    Color scrim = {0.0f, 0.0f, 0.0f, 0.34f * p};
-    fill_rect(screen, scrim);
+    if (p > 0.01f) {
+        Color scrim = {0.0f, 0.0f, 0.0f, 0.34f * p};
+        fill_rect(screen, scrim);
 
-    Color shadow = {0.0f, 0.0f, 0.0f, 0.22f * p};
-    fill_rect({panel.x + panel.w, 0.0f, 18.0f, panel.h}, shadow);
+        Color shadow = {0.0f, 0.0f, 0.0f, 0.22f * p};
+        fill_rect({panel.x + panel.w, 0.0f, 18.0f, panel.h}, shadow);
 
-    Color bg = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Background), 0.08f);
-    bg.a = 0.98f;
-    fill_rect(panel, bg);
+        Color bg = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Background), 0.08f);
+        bg.a = 0.98f;
+        fill_rect(panel, bg);
+    }
 
     Color accent = resolve_color(ColorRole::Accent);
     Color border = resolve_color(ColorRole::Border);
-    border.a = 0.70f * p;
-    fill_rect({panel.x + panel.w - 1.0f, 0.0f, 1.0f, panel.h}, border);
-    fill_rect({panel.x, 0.0f, 4.0f, panel.h}, with_alpha(accent, 0.55f * p));
+    if (p > 0.01f) {
+        border.a = 0.70f * p;
+        fill_rect({panel.x + panel.w - 1.0f, 0.0f, 1.0f, panel.h}, border);
+        fill_rect({panel.x, 0.0f, 4.0f, panel.h}, with_alpha(accent, 0.55f * p));
 
-    push_clip(panel);
-    float pad = 18.0f;
-    float title_h = text_line_height() + 22.0f;
-    Rect title_r = {panel.x + pad, 14.0f, panel.w - pad * 2.0f, title_h};
-    draw_text_utf8(drawer.title.empty() ? "Navigation" : drawer.title.c_str(), title_r,
-                   with_alpha(resolve_color(ColorRole::Text), p));
-    fill_rect({panel.x + pad, title_r.y + title_h - 7.0f, panel.w - pad * 2.0f, 1.0f},
-              with_alpha(border, 0.55f * p));
+        push_clip(panel);
+        float pad = 18.0f;
+        float title_h = text_line_height() + 22.0f;
+        Rect title_r = {panel.x + 62.0f, 14.0f, panel.w - 80.0f, title_h};
+        draw_text_utf8(drawer.title.empty() ? "Navigation" : drawer.title.c_str(), title_r,
+                       with_alpha(resolve_color(ColorRole::Text), p));
+        fill_rect({panel.x + pad, title_r.y + title_h - 7.0f, panel.w - pad * 2.0f, 1.0f},
+                  with_alpha(border, 0.55f * p));
 
-    Color text = resolve_color(ColorRole::Text);
-    Color text_dim = resolve_color(ColorRole::TextDim);
-    Color button = resolve_color(ColorRole::Button);
-    Color button_hover = resolve_color(ColorRole::ButtonHover);
-    Color selected_bg = lerp_color(resolve_color(ColorRole::ButtonActive), accent, 0.18f);
-    selected_bg.a = 0.92f * p;
+        Color text = resolve_color(ColorRole::Text);
+        Color text_dim = resolve_color(ColorRole::TextDim);
+        Color button = resolve_color(ColorRole::Button);
+        Color button_hover = resolve_color(ColorRole::ButtonHover);
+        Color selected_bg = lerp_color(resolve_color(ColorRole::ButtonActive), accent, 0.18f);
+        selected_bg.a = 0.92f * p;
 
-    float y = 72.0f;
-    for (int i = 0; i < drawer.count && i < (int)drawer.labels.size(); ++i) {
-        Rect ir = {panel.x + 10.0f, y + i * drawer.item_h, panel.w - 20.0f, drawer.item_h - 5.0f};
-        bool hov = drawer.open && rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
-        bool sel = i == drawer.selected;
-        if (sel) {
-            fill_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), selected_bg);
-            fill_round_rect({ir.x + 6.0f, ir.y + 7.0f, 4.0f, ir.h - 14.0f}, 2.0f, with_alpha(accent, 0.95f * p));
-        } else if (hov) {
-            Color hover = lerp_color(button, button_hover, 0.75f);
-            hover.a = 0.80f * p;
-            fill_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), hover);
+        float y = 72.0f;
+        for (int i = 0; i < drawer.count && i < (int)drawer.labels.size(); ++i) {
+            Rect ir = {panel.x + 10.0f, y + i * drawer.item_h, panel.w - 20.0f, drawer.item_h - 5.0f};
+            bool hov = drawer.open && rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
+            bool sel = i == drawer.selected;
+            if (sel) {
+                fill_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), selected_bg);
+                fill_round_rect({ir.x + 6.0f, ir.y + 7.0f, 4.0f, ir.h - 14.0f}, 2.0f, with_alpha(accent, 0.95f * p));
+            } else if (hov) {
+                Color hover = lerp_color(button, button_hover, 0.75f);
+                hover.a = 0.80f * p;
+                fill_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), hover);
+            }
+            Rect tr = {ir.x + 20.0f, ir.y, ir.w - 30.0f, ir.h};
+            draw_text_utf8(drawer.labels[i].c_str(), tr,
+                           with_alpha(lerp_color(text_dim, text, sel ? 0.78f : (hov ? 0.35f : 0.0f)), p));
         }
-        Rect tr = {ir.x + 20.0f, ir.y, ir.w - 30.0f, ir.h};
-        draw_text_utf8(drawer.labels[i].c_str(), tr,
-                       with_alpha(lerp_color(text_dim, text, sel ? 0.78f : (hov ? 0.35f : 0.0f)), p));
+        pop_clip();
     }
-    pop_clip();
+
+    Rect lr = drawer.launcher_rect;
+    if (lr.w <= 0.0f || lr.h <= 0.0f) lr = {12.0f, 12.0f, 40.0f, 40.0f};
+    Color lb = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Button), 0.32f);
+    lb = lerp_color(lb, resolve_color(ColorRole::ButtonHover), drawer.launcher_hover * 0.55f);
+    lb = lerp_color(lb, resolve_color(ColorRole::ButtonActive), drawer.launcher_active * 0.55f);
+    Color lborder = lerp_color(resolve_color(ColorRole::Border), accent, 0.20f + drawer.launcher_hover * 0.22f);
+    draw_widget_chrome(lr, fmaxf(8.0f, g_style.rounding), lb, lborder,
+                       drawer.launcher_hover, drawer.launcher_active, drawer.open ? 1.0f : 0.0f);
+    Color icon = lerp_color(resolve_color(ColorRole::TextDim), resolve_color(ColorRole::Text), 0.60f + drawer.launcher_hover * 0.28f);
+    if (drawer.open) {
+        draw_line(lr.x + 13.0f, lr.y + 13.0f, lr.x + lr.w - 13.0f, lr.y + lr.h - 13.0f, 2.0f, icon);
+        draw_line(lr.x + lr.w - 13.0f, lr.y + 13.0f, lr.x + 13.0f, lr.y + lr.h - 13.0f, 2.0f, icon);
+    } else {
+        float x0 = lr.x + 12.0f, x1 = lr.x + lr.w - 12.0f;
+        draw_line(x0, lr.y + 13.0f, x1, lr.y + 13.0f, 2.0f, icon);
+        draw_line(x0, lr.y + 20.0f, x1, lr.y + 20.0f, 2.0f, icon);
+        draw_line(x0, lr.y + 27.0f, x1, lr.y + 27.0f, 2.0f, icon);
+    }
 }
 
 static void draw_command_overlay(int window_w, int window_h) {
@@ -1919,37 +1946,75 @@ static Color toast_accent(ToastType type) {
     return resolve_color(ColorRole::Accent);
 }
 
-static void draw_dither_backdrop_panel(Rect r, float opacity) {
-    if (opacity <= 0.001f) return;
-    int cell = g_dither_size < 1 ? 1 : (g_dither_size > 32 ? 32 : g_dither_size);
-    static const int bayer4[16] = {
-        0,  8,  2, 10,
-        12, 4, 14,  6,
-        3, 11,  1,  9,
-        15, 7, 13,  5
-    };
-    Color bg = lerp_color(resolve_color(ColorRole::Background), resolve_color(ColorRole::Panel), 0.45f);
+static unsigned soft_dither_hash(unsigned x, unsigned y) {
+    unsigned h = x * 0x8da6b343u ^ y * 0xd8163841u ^ 0x9e3779b9u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+static unsigned char byte01(float v) {
+    v = clamp01(v);
+    return (unsigned char)(v * 255.0f + 0.5f);
+}
+
+static void write_premul_bgra(std::vector<unsigned char>& px, int w, int h, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    c.a = clamp01(c.a);
+    size_t p = ((size_t)y * (size_t)w + (size_t)x) * 4u;
+    px[p + 0] = byte01(c.b * c.a);
+    px[p + 1] = byte01(c.g * c.a);
+    px[p + 2] = byte01(c.r * c.a);
+    px[p + 3] = byte01(c.a);
+}
+
+static void build_soft_dither_tile(int cell, std::vector<unsigned char>& px, int& tile_w, int& tile_h) {
+    cell = cell < 1 ? 1 : (cell > 32 ? 32 : cell);
+    const int cells = 16;
+    tile_w = cell * cells;
+    tile_h = tile_w;
+    px.assign((size_t)tile_w * (size_t)tile_h * 4u, 0);
+
     Color accent = resolve_color(ColorRole::Accent);
     Color dim = resolve_color(ColorRole::TextDim);
-    bg.a = 0.56f * opacity;
-    fill_round_rect(r, g_style.rounding, bg);
+    for (int gy = 0; gy < cells; ++gy) {
+        for (int gx = 0; gx < cells; ++gx) {
+            unsigned h = soft_dither_hash((unsigned)gx, (unsigned)gy);
+            float t = (float)(h & 255u) / 255.0f;
+            Color c = lerp_color(dim, accent, 0.24f + t * 0.56f);
+            c.a = 0.030f + t * 0.050f;
 
-    push_clip(r);
-    int x0 = (int)floorf(r.x);
-    int y0 = (int)floorf(r.y);
-    int x1 = (int)ceilf(r.x + r.w);
-    int y1 = (int)ceilf(r.y + r.h);
-    for (int y = y0; y < y1; y += cell) {
-        for (int x = x0; x < x1; x += cell) {
-            int bx = ((x - x0) / cell) & 3;
-            int by = ((y - y0) / cell) & 3;
-            int threshold = bayer4[by * 4 + bx];
-            float t = (float)threshold / 15.0f;
-            Color c = lerp_color(dim, accent, t * 0.72f);
-            c.a = (0.045f + t * 0.105f) * opacity;
-            fill_rect({(float)x, (float)y, (float)cell, (float)cell}, c);
+            int sx = gx * cell + (int)((h >> 8) % (unsigned)cell);
+            int sy = gy * cell + (int)((h >> 13) % (unsigned)cell);
+            int len = cell <= 2 ? 1 : (cell * 3) / 4;
+            for (int k = 0; k < len; ++k) {
+                int x = gx * cell + ((sx - gx * cell + k) % cell);
+                int y = gy * cell + ((sy - gy * cell + (k / 2)) % cell);
+                write_premul_bgra(px, tile_w, tile_h, x, y, c);
+                if (cell >= 7 && (k & 1) == 0) write_premul_bgra(px, tile_w, tile_h, x + 1, y, with_alpha(c, c.a * 0.55f));
+            }
+
+            if (((h >> 21) & 3u) == 0u) {
+                Color dot = lerp_color(dim, accent, 0.72f);
+                dot.a = 0.055f + t * 0.030f;
+                int dx = gx * cell + (int)((h >> 24) % (unsigned)cell);
+                int dy = gy * cell + (int)((h >> 28) % (unsigned)cell);
+                write_premul_bgra(px, tile_w, tile_h, dx, dy, dot);
+            }
         }
     }
+}
+
+static void draw_dither_backdrop_panel(Rect r, float opacity) {
+    if (opacity <= 0.001f) return;
+    Color bg = lerp_color(resolve_color(ColorRole::Background), resolve_color(ColorRole::Panel), 0.45f);
+    bg.a = 0.56f * opacity;
+    fill_round_rect(r, g_style.rounding, bg);
+    push_clip(r);
+    draw_dither_pattern(r, opacity);
     pop_clip();
 }
 
@@ -2307,6 +2372,11 @@ static LARGE_INTEGER  g_freq, g_last_time;
 static ID2D1Bitmap*   g_prev_frame_bitmap = nullptr;
 static std::vector<BYTE> g_prev_frame_pixels;
 static UINT           g_prev_frame_w = 0, g_prev_frame_h = 0;
+static ID2D1Bitmap*      g_dither_bitmap = nullptr;
+static ID2D1BitmapBrush* g_dither_brush = nullptr;
+static int               g_dither_cache_cell = 0;
+static Color             g_dither_cache_accent = {};
+static Color             g_dither_cache_dim = {};
 
 static void dbg(const char* fmt, ...) {
     char buf[512]; va_list a; va_start(a, fmt); vsnprintf(buf, sizeof(buf), fmt, a); va_end(a);
@@ -2343,6 +2413,51 @@ static void fill_rect(Rect r, Color c) {
     set_brush(c);
     D2D1_RECT_F rc = {r.x, r.y, r.x+r.w, r.y+r.h};
     g_renderer.target->FillRectangle(rc, g_renderer.brush);
+}
+static void release_dither_cache() {
+    if (g_dither_brush) { g_dither_brush->Release(); g_dither_brush = nullptr; }
+    if (g_dither_bitmap) { g_dither_bitmap->Release(); g_dither_bitmap = nullptr; }
+    g_dither_cache_cell = 0;
+    g_dither_cache_accent = {};
+    g_dither_cache_dim = {};
+}
+static bool ensure_dither_brush() {
+    if (!g_renderer.target) return false;
+    int cell = g_dither_size < 1 ? 1 : (g_dither_size > 32 ? 32 : g_dither_size);
+    Color accent = resolve_color(ColorRole::Accent);
+    Color dim = resolve_color(ColorRole::TextDim);
+    if (g_dither_brush && g_dither_bitmap && g_dither_cache_cell == cell &&
+        style_eq(g_dither_cache_accent, accent) && style_eq(g_dither_cache_dim, dim)) {
+        return true;
+    }
+    release_dither_cache();
+    std::vector<unsigned char> px;
+    int tw = 0, th = 0;
+    build_soft_dither_tile(cell, px, tw, th);
+    if (px.empty() || tw <= 0 || th <= 0) return false;
+
+    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f, 96.0f);
+    HRESULT hr = g_renderer.target->CreateBitmap(D2D1::SizeU((UINT32)tw, (UINT32)th),
+                                                 px.data(), (UINT32)tw * 4u,
+                                                 props, &g_dither_bitmap);
+    if (FAILED(hr) || !g_dither_bitmap) { release_dither_cache(); return false; }
+    D2D1_BITMAP_BRUSH_PROPERTIES bp = D2D1::BitmapBrushProperties(
+        D2D1_EXTEND_MODE_WRAP, D2D1_EXTEND_MODE_WRAP, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    hr = g_renderer.target->CreateBitmapBrush(g_dither_bitmap, bp, &g_dither_brush);
+    if (FAILED(hr) || !g_dither_brush) { release_dither_cache(); return false; }
+    g_dither_cache_cell = cell;
+    g_dither_cache_accent = accent;
+    g_dither_cache_dim = dim;
+    return true;
+}
+static void draw_dither_pattern(Rect r, float opacity) {
+    if (opacity <= 0.001f || !ensure_dither_brush()) return;
+    r = apply_draw_rect(r);
+    g_dither_brush->SetOpacity(clamp01(opacity));
+    D2D1_RECT_F rc = {r.x, r.y, r.x + r.w, r.y + r.h};
+    g_renderer.target->FillRectangle(rc, g_dither_brush);
 }
 static void fill_triangle(Rect r, int dir, Color c) {
     r = apply_draw_rect(r);
@@ -2753,6 +2868,7 @@ static void sync_native_window_transparency() {
 }
 
 static void release_render_target() {
+    release_dither_cache();
     if (g_renderer.rendering_params){g_renderer.rendering_params->Release();g_renderer.rendering_params=nullptr;}
     if (g_renderer.brush){g_renderer.brush->Release();g_renderer.brush=nullptr;}
     if (g_renderer.target){g_renderer.target->Release();g_renderer.target=nullptr;}
@@ -2971,8 +3087,9 @@ void begin() {
     g_pending_collapse_start_y = 0.0f;
     g_dropdown_capture_input = g_dropdown_overlay_prev.active;
     g_dropdown_overlay = {};
+    g_side_drawer_capture_input = g_side_drawer.open || g_side_drawer.progress > 0.01f ||
+                                  (g_side_drawer.active && rect_contains(g_side_drawer.launcher_rect, g_input.mouse_x, g_input.mouse_y));
     g_side_drawer.active = false;
-    g_side_drawer_capture_input = g_side_drawer.open || g_side_drawer.progress > 0.01f;
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
@@ -3432,6 +3549,11 @@ static struct timespec g_last_time;
 static XIM  g_xim = nullptr;
 static XIC  g_xic = nullptr;
 static std::string g_clipboard_buf;
+static cairo_surface_t* g_dither_surface = nullptr;
+static cairo_pattern_t* g_dither_pattern = nullptr;
+static int             g_dither_cache_cell = 0;
+static Color           g_dither_cache_accent = {};
+static Color           g_dither_cache_dim = {};
 
 static void dbg(const char* fmt, ...) {
     char buf[512]; va_list a; va_start(a,fmt); vsnprintf(buf,sizeof(buf),fmt,a); va_end(a);
@@ -3476,6 +3598,59 @@ static void stroke_round_rect(Rect r, float rad, float thick, Color c) {
 }
 static void fill_rect(Rect r, Color c) {
     set_color(c); cairo_rectangle(g_renderer.cr,r.x,r.y,r.w,r.h); cairo_fill(g_renderer.cr);
+}
+static void release_dither_cache() {
+    if (g_dither_pattern) { cairo_pattern_destroy(g_dither_pattern); g_dither_pattern = nullptr; }
+    if (g_dither_surface) { cairo_surface_destroy(g_dither_surface); g_dither_surface = nullptr; }
+    g_dither_cache_cell = 0;
+    g_dither_cache_accent = {};
+    g_dither_cache_dim = {};
+}
+static bool ensure_dither_pattern() {
+    int cell = g_dither_size < 1 ? 1 : (g_dither_size > 32 ? 32 : g_dither_size);
+    Color accent = resolve_color(ColorRole::Accent);
+    Color dim = resolve_color(ColorRole::TextDim);
+    if (g_dither_pattern && g_dither_surface && g_dither_cache_cell == cell &&
+        style_eq(g_dither_cache_accent, accent) && style_eq(g_dither_cache_dim, dim)) {
+        return true;
+    }
+    release_dither_cache();
+    std::vector<unsigned char> px;
+    int tw = 0, th = 0;
+    build_soft_dither_tile(cell, px, tw, th);
+    if (px.empty() || tw <= 0 || th <= 0) return false;
+    g_dither_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, tw, th);
+    if (!g_dither_surface || cairo_surface_status(g_dither_surface) != CAIRO_STATUS_SUCCESS) {
+        release_dither_cache();
+        return false;
+    }
+    unsigned char* data = cairo_image_surface_get_data(g_dither_surface);
+    int stride = cairo_image_surface_get_stride(g_dither_surface);
+    for (int y = 0; y < th; ++y) {
+        memcpy(data + (size_t)y * (size_t)stride, px.data() + (size_t)y * (size_t)tw * 4u, (size_t)tw * 4u);
+    }
+    cairo_surface_mark_dirty(g_dither_surface);
+    g_dither_pattern = cairo_pattern_create_for_surface(g_dither_surface);
+    if (!g_dither_pattern || cairo_pattern_status(g_dither_pattern) != CAIRO_STATUS_SUCCESS) {
+        release_dither_cache();
+        return false;
+    }
+    cairo_pattern_set_extend(g_dither_pattern, CAIRO_EXTEND_REPEAT);
+    cairo_pattern_set_filter(g_dither_pattern, CAIRO_FILTER_NEAREST);
+    g_dither_cache_cell = cell;
+    g_dither_cache_accent = accent;
+    g_dither_cache_dim = dim;
+    return true;
+}
+static void draw_dither_pattern(Rect r, float opacity) {
+    if (opacity <= 0.001f || !ensure_dither_pattern()) return;
+    cairo_t* cr = g_renderer.cr;
+    cairo_save(cr);
+    cairo_rectangle(cr, r.x, r.y, r.w, r.h);
+    cairo_clip(cr);
+    cairo_set_source(cr, g_dither_pattern);
+    cairo_paint_with_alpha(cr, clamp01(opacity));
+    cairo_restore(cr);
 }
 static void fill_triangle(Rect r, int dir, Color c) {
     set_color(c);
@@ -3618,6 +3793,7 @@ static bool init_cairo() {
 }
 
 static void teardown_cairo() {
+    release_dither_cache();
     if (g_renderer.cr)       { cairo_destroy(g_renderer.cr);          g_renderer.cr=nullptr; }
     if (g_renderer.back_surf){ cairo_surface_destroy(g_renderer.back_surf); g_renderer.back_surf=nullptr; }
     if (g_renderer.back_px&&g_platform.display){ XFreePixmap(g_platform.display,g_renderer.back_px); g_renderer.back_px=0; }
@@ -3881,8 +4057,9 @@ void begin() {
     g_pending_collapse_start_y = 0.0f;
     g_dropdown_capture_input = g_dropdown_overlay_prev.active;
     g_dropdown_overlay = {};
+    g_side_drawer_capture_input = g_side_drawer.open || g_side_drawer.progress > 0.01f ||
+                                  (g_side_drawer.active && rect_contains(g_side_drawer.launcher_rect, g_input.mouse_x, g_input.mouse_y));
     g_side_drawer.active = false;
-    g_side_drawer_capture_input = g_side_drawer.open || g_side_drawer.progress > 0.01f;
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
@@ -4517,18 +4694,6 @@ bool side_menu_drawer(const char* label, const char* const* items, int count, in
         drawer.owner = id;
     }
 
-    bool changed = false;
-    bool drawer_visible = drawer.open || drawer.progress > 0.01f;
-    bool clicked = false;
-    if (drawer_visible) {
-        begin_disabled();
-        button(label ? label : "Navigation");
-        end_disabled();
-    } else {
-        clicked = button(label ? label : "Navigation");
-    }
-    if (clicked) drawer.open = !drawer.open;
-
     drawer.active = true;
     drawer.title = vis[0] ? vis : "Navigation";
     drawer.count = count;
@@ -4538,6 +4703,28 @@ bool side_menu_drawer(const char* label, const char* const* items, int count, in
     drawer.labels.clear();
     drawer.labels.reserve((size_t)count);
     for (int i = 0; i < count; ++i) drawer.labels.push_back(items[i] ? items[i] : "");
+
+    bool changed = false;
+    int launcher_id = id ^ 0x5151;
+    float btn = fmaxf(38.0f, fminf(44.0f, g_style.item_height + 4.0f));
+    drawer.launcher_rect = {12.0f, 12.0f, btn, btn};
+    bool launcher_hov = rect_contains(drawer.launcher_rect, g_input.mouse_x, g_input.mouse_y);
+    if (launcher_hov && g_input.mouse_pressed) {
+        g_ctx.active_id = launcher_id;
+        g_side_drawer_capture_input = true;
+    }
+    if (g_ctx.active_id == launcher_id && g_input.mouse_released) {
+        if (launcher_hov) drawer.open = !drawer.open;
+        g_ctx.active_id = 0;
+    }
+    if (launcher_hov) {
+        g_ctx.hot_id = launcher_id;
+        g_side_drawer_capture_input = true;
+    }
+    MotionSlot& launcher_motion = motion_slot_for(launcher_id);
+    update_motion_slot(launcher_motion, launcher_hov, g_ctx.active_id == launcher_id, drawer.open);
+    drawer.launcher_hover = launcher_motion.hover;
+    drawer.launcher_active = launcher_motion.active;
 
     float target = drawer.open ? 1.0f : 0.0f;
     if (effects_enabled()) drawer.progress = step_anim(drawer.progress, target, g_dt, 16.0f);
@@ -5435,6 +5622,11 @@ static void draw_masked_progress(Rect r, float progress, const ProgressStyle& st
     if (style.wave_front || style.glint) g_redraw_requested = true;
     float fill_px = p * inner.w;
     float phase = (float)g_ctx.frame_index * 0.085f;
+    float wave_amp_mask = 0.0f;
+    if (style.wave_front && p > 0.02f && p < 0.995f) {
+        float amp_px = fminf(5.0f, fmaxf(1.5f, inner.h * 0.16f));
+        wave_amp_mask = (amp_px / fmaxf(1.0f, inner.w)) * (float)mask->w;
+    }
 
     for (int my = 0; my < mask->h; ++my) {
         float sy0 = inner.y + inner.h * ((float)my / (float)mask->h);
@@ -5444,6 +5636,8 @@ static void draw_masked_progress(Rect r, float progress, const ProgressStyle& st
         for (int mx = 0; mx <= mask->w; ++mx) {
             bool on = mx < mask->w && mask->bits[(size_t)my * (size_t)mask->w + (size_t)mx] > 0;
             float front = p * (float)mask->w;
+            if (wave_amp_mask > 0.0f) front += sinf((float)my * 0.42f + phase) * wave_amp_mask;
+            front = clampf(front, 0.0f, (float)mask->w);
             bool fill_on = on && (float)mx <= front;
             if (on && run_start < 0) { run_start = mx; run_fill = fill_on; }
             bool boundary = !on || fill_on != run_fill;
@@ -5457,26 +5651,12 @@ static void draw_masked_progress(Rect r, float progress, const ProgressStyle& st
         }
     }
 
-    if (style.wave_front && p > 0.02f && p < 0.995f) {
-        push_clip({inner.x, inner.y, fill_px, inner.h});
-        float fx = inner.x + fill_px;
-        int strips = 9;
-        for (int i = 0; i < strips; ++i) {
-            float y0 = inner.y + inner.h * ((float)i / (float)strips);
-            float y1 = inner.y + inner.h * ((float)(i + 1) / (float)strips);
-            float dx = sinf((float)i * 0.95f + phase) * 1.4f;
-            Color c = with_alpha(fill, 0.22f);
-            fill_rect({fx - 3.0f + dx, y0, 3.0f, y1 - y0 + 0.5f}, maybe_disabled(c));
-        }
-        pop_clip();
-    }
-
     if (style.glint && p > 0.03f) {
-        float gx = inner.x + fmodf((float)g_ctx.frame_index * 1.35f, inner.w + 90.0f) - 45.0f;
         push_clip({inner.x, inner.y, fill_px, inner.h});
-        fill_rect({gx, inner.y, 3.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.07f}));
-        fill_rect({gx + 4.0f, inner.y, 2.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.14f}));
-        fill_rect({gx + 7.0f, inner.y, 3.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.06f}));
+        fill_rect({inner.x + 4.0f, inner.y + 3.0f, fmaxf(0.0f, fill_px - 8.0f), 1.0f},
+                  maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.10f}));
+        float gx = inner.x + fmodf((float)g_ctx.frame_index * 0.85f, inner.w + 120.0f) - 60.0f;
+        fill_rect({gx, inner.y, 10.0f, inner.h}, maybe_disabled(Color{1.0f, 1.0f, 1.0f, 0.035f}));
         pop_clip();
     }
 }
@@ -5522,27 +5702,34 @@ void progress_bar(float progress, const ProgressStyle& style) {
         Rect inner = {r.x + 3.0f, r.y + 3.0f, r.w - 6.0f, r.h - 6.0f};
         if (inner.w > 0.0f && inner.h > 0.0f && p > 0.0f) {
             float fill_w = inner.w * p;
-            fill_round_rect({inner.x, inner.y, fill_w, inner.h}, fmaxf(2.0f, g_style.rounding * 0.4f), maybe_disabled(fill));
             if (style.wave_front && p < 0.995f) {
-                int strips = 8;
-                float fx = inner.x + fill_w;
-                push_clip({inner.x, inner.y, fill_w, inner.h});
+                float amp = fminf(5.0f, fmaxf(1.5f, inner.h * 0.18f));
+                float core_w = clampf(fill_w - amp - 1.0f, 0.0f, inner.w);
+                if (core_w > 0.0f) {
+                    fill_round_rect({inner.x, inner.y, core_w, inner.h}, fmaxf(2.0f, g_style.rounding * 0.4f), maybe_disabled(fill));
+                }
+                int strips = (int)fminf(32.0f, fmaxf(8.0f, inner.h));
+                float phase = (float)g_ctx.frame_index * 0.085f;
+                push_clip(inner);
                 for (int i = 0; i < strips; ++i) {
                     float y0 = inner.y + inner.h * ((float)i / (float)strips);
                     float y1 = inner.y + inner.h * ((float)(i + 1) / (float)strips);
-                    float dx = sinf((float)i * 0.90f + (float)g_ctx.frame_index * 0.085f) * 1.2f;
-                    fill_rect({fx - 3.0f + dx, y0, 3.0f, y1 - y0 + 0.5f}, maybe_disabled(with_alpha(fill, 0.24f)));
+                    float front = clampf(fill_w + sinf((float)i * 0.42f + phase) * amp, 0.0f, inner.w);
+                    if (front > core_w) {
+                        fill_rect({inner.x + core_w, y0, front - core_w, y1 - y0 + 0.5f}, maybe_disabled(fill));
+                    }
                 }
                 pop_clip();
                 g_redraw_requested = true;
+            } else {
+                fill_round_rect({inner.x, inner.y, fill_w, inner.h}, fmaxf(2.0f, g_style.rounding * 0.4f), maybe_disabled(fill));
             }
             if (style.glint) {
                 g_redraw_requested = true;
-                float gx = inner.x + fmodf((float)g_ctx.frame_index * 1.30f, inner.w + 80.0f) - 40.0f;
                 push_clip({inner.x, inner.y, fill_w, inner.h});
-                fill_rect({gx, inner.y, 3.0f, inner.h}, Color{1.0f, 1.0f, 1.0f, 0.07f});
-                fill_rect({gx + 4.0f, inner.y, 2.0f, inner.h}, Color{1.0f, 1.0f, 1.0f, 0.14f});
-                fill_rect({gx + 7.0f, inner.y, 3.0f, inner.h}, Color{1.0f, 1.0f, 1.0f, 0.06f});
+                fill_rect({inner.x + 4.0f, inner.y + 2.0f, fmaxf(0.0f, fill_w - 8.0f), 1.0f}, Color{1.0f, 1.0f, 1.0f, 0.10f});
+                float gx = inner.x + fmodf((float)g_ctx.frame_index * 0.85f, inner.w + 110.0f) - 55.0f;
+                fill_rect({gx, inner.y, 10.0f, inner.h}, Color{1.0f, 1.0f, 1.0f, 0.035f});
                 pop_clip();
             }
         }

@@ -77,7 +77,7 @@ ftui::request_redraw();
 
 The Linux backend renders into an X11 pixmap back buffer and swaps it to the window.
 
-Effects backdrops can use the default blur-style panel on Windows, or a theme-colored Bayer dither pattern on both Windows and Linux:
+Effects backdrops can use the default blur-style panel on Windows, or a cached theme-colored soft dither texture on both Windows and Linux:
 
 ```cpp
 ftui::Config cfg;
@@ -92,7 +92,7 @@ cfg.window_transparency = ftui::WindowTransparency::Plain;
 cfg.window_opacity = 0.88f;
 ```
 
-Windows supports `Opaque`, `Plain`, `BayerDither`, and `Blur`. Linux supports `Opaque`, `Plain`, and `BayerDither`; plain opacity uses the compositor `_NET_WM_WINDOW_OPACITY` property.
+Windows supports `Opaque`, `Plain`, `BayerDither`, and `Blur`. Linux supports `Opaque`, `Plain`, and `BayerDither`; the `BayerDither` compatibility name now renders FTUI's softer cached dither texture. Plain opacity uses the compositor `_NET_WM_WINDOW_OPACITY` property.
 
 ## Build
 
