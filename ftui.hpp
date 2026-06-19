@@ -12,6 +12,11 @@
 //   FTUI_KEEP_CONSOLE    — keep console window on Windows
 //   FTUI_LINUX_FONT "x"  — override default "sans-serif" on Linux
 //   FTUI_DISABLE_EFFECTS — strip the Windows effects layer entirely
+//
+// Frame pacing:
+//   Config::fps_limit defaults to 60. Set it to 0 for uncapped rendering.
+//   On Linux, idle windows sleep until X11 reports an event or request_redraw()
+//   asks for another frame.
 
 // Global startup theme. Change this line to another built-in preset if you
 // want a different default across all new FTUI windows.
@@ -40,6 +45,9 @@
 #include <vector>
 #include <functional>
 #include <cassert>
+#include <fstream>
+#include <sstream>
+#include <cctype>
 
 // ============================================================
 // Public API
@@ -94,6 +102,7 @@ Style catppuccin_mocha_style();
 Style nord_style();
 Style gruvbox_dark_style();
 Style one_dark_style();
+Style ghostty_green_style();
 
 void         set_style(const Style& s);
 const Style& get_style();
@@ -108,14 +117,22 @@ enum class BuiltinIcon {
     SymbolWithText,
 };
 
+enum class BackdropEffect {
+    Blur,
+    BayerDither,
+};
+
 struct Config {
     const char* title         = "FTUI App"; // UTF-8; converted internally on Windows
     int         width         = 960;
     int         height        = 640;
+    int         fps_limit     = 60;         // 0 or below disables frame limiting
     bool        resizable     = true;
     bool        center_window = true;
     void*       icon          = nullptr;    // HICON on Windows; ignored on Linux
     bool        enable_effects = true;      // Windows-only visual effects layer
+    BackdropEffect backdrop_effect = BackdropEffect::Blur; // Windows effects panels
+    int         dither_size   = 4;          // BayerDither cell size in pixels
 };
 
 bool create_window(const Config& cfg = {});
@@ -123,7 +140,12 @@ bool pump();
 void begin();
 void end();
 void shutdown();
+void request_redraw();
 void set_quit_on_ctrl_q(bool enabled);
+void set_fps_limit(int fps);
+int  get_fps_limit();
+void set_backdrop_effect(BackdropEffect effect);
+void set_dither_size(int px);
 void set_window_icon(void* native_icon);
 void set_window_icon_builtin(BuiltinIcon variant = BuiltinIcon::Symbol);
 
@@ -192,12 +214,16 @@ bool dropdown(const char* label, const char* const* items, int count, int* selec
 bool listbox(const char* label, const char* const* items, int count, int* selected, int visible_rows = 6);
 bool radio_group(const char* label, const char* const* items, int count, int* selected, int columns = 1);
 bool collapsing_header(const char* label, bool* open = nullptr);
+bool side_menu(const char* label, const char* const* items, int count, int* selected);
 
 // Horizontal tab bar. Returns true when selected changes.
 bool tabs(const char* const* labels, int count, int* selected);
 
 void row(int cols, std::function<void()> fn);
 void row(std::initializer_list<float> weights, std::function<void()> fn);
+void split(std::initializer_list<float> columns, std::function<void()> fn);
+void side_layout(float side_width, std::function<void()> fn);
+void content(std::function<void()> fn);
 void scroll_area(const char* label, float height, std::function<void()> fn);
 void set_next_width(float px);
 void set_next_fill();
@@ -213,6 +239,43 @@ void tooltip(const char* text);
 void request_focus(const char* label);
 float calc_text_width(const char* text);
 float calc_text_height(const char* text, float wrap_width);
+
+enum class ToastType {
+    Info,
+    Success,
+    Warning,
+    Error,
+};
+
+struct Toast {
+    const char* message = "";
+    ToastType   type = ToastType::Info;
+    int         duration_ms = 3500;
+    bool        dismissible = true;
+};
+
+void toast(const Toast& toast);
+void toast(const char* message);
+void toast_info(const char* message);
+void toast_success(const char* message);
+void toast_warning(const char* message);
+void toast_error(const char* message);
+void clear_toasts();
+
+struct ProgressStyle {
+    const char* label = nullptr;
+    const char* mask_path = nullptr;
+    ColorRole   fill_role = ColorRole::Accent;
+    Color       fill_color = {-1.0f, -1.0f, -1.0f, -1.0f};
+    float       height = 22.0f;
+    bool        show_percent = true;
+    bool        wave_front = false;
+    bool        glint = false;
+};
+
+void progress_bar(float progress);
+void progress_bar(float progress, const char* label_or_mask_path);
+void progress_bar(float progress, const ProgressStyle& style);
 
 // Opaque image handle — platform-specific payload in _impl.
 struct ImageHandle { void* _impl = nullptr; };
@@ -280,8 +343,16 @@ DebugState& debug();
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/Xresource.h>
+#ifdef InputFocus
+#undef InputFocus
+#endif
+#ifdef Success
+#undef Success
+#endif
 #include <cairo/cairo.h>
 #include <cairo/cairo-xlib.h>
+#include <errno.h>
+#include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -363,9 +434,11 @@ struct InputState {
 struct RowContext {
     bool  active = false;
     bool  weighted = false;
+    bool  split = false;
     int   cols = 0;
     float cell_w = 0, gap = 0, start_x = 0, start_y = 0;
     float total_w = 0, used_x = 0, total_weight = 0;
+    float fixed_total = 0, flex_total = 0;
     const float* weights = nullptr;
     int   col_index = 0;
     float row_height = 0;
@@ -501,6 +574,21 @@ struct ColorOverrideEntry {
     Color color = {};
 };
 
+struct ToastSlot {
+    bool active = false;
+    Toast toast = {};
+    std::string message;
+    float elapsed = 0.0f;
+};
+
+struct MaskData {
+    std::string path;
+    int w = 0;
+    int h = 0;
+    std::vector<unsigned char> bits;
+    bool loaded = false;
+};
+
 struct ColorOverrideTable {
     bool used[kColorRoleCount] = {};
     Color colors[kColorRoleCount] = {};
@@ -514,10 +602,14 @@ static DebugState g_debug;
 static Style      g_style;
 static float      g_fps = 0, g_fps_accum = 0;
 static int        g_fps_frames = 0;
+static int        g_frame_limit_fps = 60;
+static bool       g_redraw_requested = true;
 static bool       g_shortcuts_enabled = true;
 static CmdState   g_cmd;
 static float      g_dt = 1.0f / 60.0f;
 static bool       g_effects_enabled = false;
+static BackdropEffect g_backdrop_effect = BackdropEffect::Blur;
+static int        g_dither_size = 4;
 static float      g_scroll_y = 0, g_content_height = 0;
 static float      g_scroll_target_y = 0;
 static bool       g_sb_dragging = false;
@@ -540,6 +632,8 @@ static NextLayoutState g_next_layout;
 static TooltipState g_tooltip;
 static DropdownOverlayState g_dropdown_overlay;
 static DropdownOverlayState g_dropdown_overlay_prev;
+static ToastSlot g_toasts[16];
+static MaskData  g_mask_cache[16];
 static ColorOverrideEntry g_color_stack[kColorOverrideStackCap];
 static int        g_color_stack_count = 0;
 static ColorOverrideTable g_next_color_pending;
@@ -576,8 +670,14 @@ static void        clipboard_set(const char* utf8);
 static std::string clipboard_get();
 static void        push_clip(Rect r);
 static void        pop_clip();
+static void        wait_frame_limit();
+static void        wake_event_loop();
 static void        sync_native_window_chrome();
 static void        apply_window_icon_handles(void* icon_big, void* icon_small, bool owned, BuiltinIcon variant);
+static bool        load_mask_from_image(const char* path, MaskData& out);
+static void        draw_toast_overlay();
+static bool        toasts_active();
+static void        draw_dither_backdrop_panel(Rect r, float opacity);
 
 #if FTUI_WINDOWS_EFFECTS
 static void        draw_previous_frame_overlay(Rect clip_r, float dx, float opacity);
@@ -1039,10 +1139,13 @@ static void draw_dropdown_overlay() {
 
     const DropdownOverlayState& ov = g_dropdown_overlay;
 #if FTUI_WINDOWS_EFFECTS
-    if (effects_enabled()) {
+    if (effects_enabled() && g_backdrop_effect == BackdropEffect::Blur) {
         draw_previous_frame_blur_panel(ov.popup_r, ov.popup_p);
     }
 #endif
+    if (g_backdrop_effect == BackdropEffect::BayerDither) {
+        draw_dither_backdrop_panel(ov.popup_r, ov.popup_p);
+    }
     draw_widget_chrome(ov.popup_r, g_style.rounding, maybe_disabled(ov.popup_fill), maybe_disabled(ov.popup_border), 0.0f, 0.0f, 0.0f);
 
     Rect clip_r = {ov.popup_r.x + 2.0f, ov.popup_r.y + 2.0f, ov.popup_r.w - 4.0f, ov.popup_r.h - 4.0f};
@@ -1252,9 +1355,20 @@ static Rect next_rect(float height) {
         int row_index = rc.col_index < rc.cols ? rc.col_index : (rc.cols - 1);
         region_x = rc.start_x + rc.used_x;
         region_y = rc.start_y;
-        region_w = rc.weighted && rc.weights
+        if (rc.split && rc.weights) {
+            float spec = rc.weights[row_index];
+            if (spec >= 16.0f) {
+                region_w = spec;
+            } else {
+                float available = rc.total_w - rc.gap * (rc.cols - 1) - rc.fixed_total;
+                if (available < 0.0f) available = 0.0f;
+                region_w = available * ((spec > 0.0f ? spec : 1.0f) / rc.flex_total);
+            }
+        } else {
+            region_w = rc.weighted && rc.weights
             ? (rc.total_w - rc.gap * (rc.cols - 1)) * (rc.weights[row_index] / rc.total_weight)
             : rc.cell_w;
+        }
         rc.used_x += region_w + (rc.col_index + 1 < rc.cols ? rc.gap : 0.0f);
         rc.col_index++;
         if (height > rc.row_height) rc.row_height = height;
@@ -1297,6 +1411,364 @@ static void apply_cmd_theme() {
     else if (strcmp(g_cmd.buf, "tn") == 0) g_style = nord_style();
     else if (strcmp(g_cmd.buf, "tg") == 0) g_style = gruvbox_dark_style();
     else if (strcmp(g_cmd.buf, "to") == 0) g_style = one_dark_style();
+    else if (strcmp(g_cmd.buf, "th") == 0) g_style = ghostty_green_style();
+}
+
+static bool has_ext(const char* path, const char* ext) {
+    if (!path || !ext) return false;
+    size_t lp = strlen(path), le = strlen(ext);
+    if (lp < le) return false;
+    const char* p = path + lp - le;
+    for (size_t i = 0; i < le; ++i) {
+        char a = (char)tolower((unsigned char)p[i]);
+        char b = (char)tolower((unsigned char)ext[i]);
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static bool looks_like_mask_path(const char* s) {
+    return has_ext(s, ".svg") || has_ext(s, ".png") || has_ext(s, ".jpg") ||
+           has_ext(s, ".jpeg") || has_ext(s, ".bmp");
+}
+
+static float attr_float(const std::string& tag, const char* name, float fallback) {
+    std::string key(name);
+    size_t p = tag.find(key);
+    while (p != std::string::npos) {
+        size_t q = p + key.size();
+        while (q < tag.size() && isspace((unsigned char)tag[q])) q++;
+        if (q < tag.size() && tag[q] == '=') {
+            q++;
+            while (q < tag.size() && isspace((unsigned char)tag[q])) q++;
+            if (q < tag.size() && (tag[q] == '"' || tag[q] == '\'')) q++;
+            return (float)strtod(tag.c_str() + q, nullptr);
+        }
+        p = tag.find(key, p + key.size());
+    }
+    return fallback;
+}
+
+static std::string attr_string(const std::string& tag, const char* name) {
+    std::string key(name);
+    size_t p = tag.find(key);
+    while (p != std::string::npos) {
+        size_t q = p + key.size();
+        while (q < tag.size() && isspace((unsigned char)tag[q])) q++;
+        if (q < tag.size() && tag[q] == '=') {
+            q++;
+            while (q < tag.size() && isspace((unsigned char)tag[q])) q++;
+            if (q >= tag.size()) return "";
+            char quote = tag[q];
+            if (quote != '"' && quote != '\'') return "";
+            q++;
+            size_t e = tag.find(quote, q);
+            if (e == std::string::npos) return "";
+            return tag.substr(q, e - q);
+        }
+        p = tag.find(key, p + key.size());
+    }
+    return "";
+}
+
+struct MaskPoint { float x = 0.0f, y = 0.0f; };
+
+static void fill_mask_rect(MaskData& m, int x0, int y0, int x1, int y1) {
+    if (m.w <= 0 || m.h <= 0) return;
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+    x0 = x0 < 0 ? 0 : (x0 > m.w ? m.w : x0);
+    x1 = x1 < 0 ? 0 : (x1 > m.w ? m.w : x1);
+    y0 = y0 < 0 ? 0 : (y0 > m.h ? m.h : y0);
+    y1 = y1 < 0 ? 0 : (y1 > m.h ? m.h : y1);
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x)
+            m.bits[(size_t)y * (size_t)m.w + (size_t)x] = 255;
+}
+
+static void fill_mask_ellipse(MaskData& m, float cx, float cy, float rx, float ry) {
+    if (rx <= 0.0f || ry <= 0.0f) return;
+    int x0 = (int)floorf(cx - rx), x1 = (int)ceilf(cx + rx);
+    int y0 = (int)floorf(cy - ry), y1 = (int)ceilf(cy + ry);
+    for (int y = y0; y <= y1; ++y) {
+        if (y < 0 || y >= m.h) continue;
+        for (int x = x0; x <= x1; ++x) {
+            if (x < 0 || x >= m.w) continue;
+            float dx = ((float)x + 0.5f - cx) / rx;
+            float dy = ((float)y + 0.5f - cy) / ry;
+            if (dx * dx + dy * dy <= 1.0f) m.bits[(size_t)y * (size_t)m.w + (size_t)x] = 255;
+        }
+    }
+}
+
+static void fill_mask_polygon(MaskData& m, const std::vector<MaskPoint>& pts) {
+    if (pts.size() < 3 || m.w <= 0 || m.h <= 0) return;
+    float min_y = pts[0].y, max_y = pts[0].y;
+    for (const MaskPoint& p : pts) { if (p.y < min_y) min_y = p.y; if (p.y > max_y) max_y = p.y; }
+    int y0 = (int)floorf(min_y), y1 = (int)ceilf(max_y);
+    for (int y = y0; y <= y1; ++y) {
+        if (y < 0 || y >= m.h) continue;
+        float scan = (float)y + 0.5f;
+        std::vector<float> xs;
+        for (size_t i = 0, j = pts.size() - 1; i < pts.size(); j = i++) {
+            const MaskPoint& a = pts[j];
+            const MaskPoint& b = pts[i];
+            if ((a.y > scan) != (b.y > scan)) {
+                float t = (scan - a.y) / (b.y - a.y);
+                xs.push_back(a.x + t * (b.x - a.x));
+            }
+        }
+        for (size_t i = 0; i + 1 < xs.size(); i += 2) {
+            for (size_t j = i + 1; j < xs.size(); ++j) {
+                if (xs[j] < xs[i]) { float t = xs[i]; xs[i] = xs[j]; xs[j] = t; }
+            }
+            int x0 = (int)floorf(xs[i]), x1 = (int)ceilf(xs[i + 1]);
+            if (x0 < 0) x0 = 0;
+            if (x1 > m.w) x1 = m.w;
+            for (int x = x0; x < x1; ++x) m.bits[(size_t)y * (size_t)m.w + (size_t)x] = 255;
+        }
+    }
+}
+
+static const char* skip_svg_sep(const char* p) {
+    while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+    return p;
+}
+
+static bool parse_svg_number(const char*& p, float& out) {
+    p = skip_svg_sep(p);
+    if (!*p) return false;
+    char* end = nullptr;
+    out = (float)strtod(p, &end);
+    if (end == p) return false;
+    p = end;
+    return true;
+}
+
+static void fill_svg_path(MaskData& m, const std::string& d) {
+    const char* p = d.c_str();
+    char cmd = 0;
+    MaskPoint cur = {}, start = {};
+    std::vector<MaskPoint> poly;
+    while (*p) {
+        p = skip_svg_sep(p);
+        if (!*p) break;
+        if (isalpha((unsigned char)*p)) cmd = *p++;
+        bool rel = cmd >= 'a' && cmd <= 'z';
+        char c = (char)tolower((unsigned char)cmd);
+        if (c == 'z') {
+            if (poly.size() >= 3) fill_mask_polygon(m, poly);
+            poly.clear(); cur = start; cmd = 0; continue;
+        }
+        if (c == 'm' || c == 'l') {
+            float x = 0, y = 0;
+            if (!parse_svg_number(p, x) || !parse_svg_number(p, y)) break;
+            if (rel) { x += cur.x; y += cur.y; }
+            cur = {x, y};
+            if (c == 'm') { if (poly.size() >= 3) fill_mask_polygon(m, poly); poly.clear(); start = cur; cmd = rel ? 'l' : 'L'; }
+            poly.push_back(cur);
+        } else if (c == 'h') {
+            float x = 0; if (!parse_svg_number(p, x)) break;
+            cur.x = rel ? cur.x + x : x; poly.push_back(cur);
+        } else if (c == 'v') {
+            float y = 0; if (!parse_svg_number(p, y)) break;
+            cur.y = rel ? cur.y + y : y; poly.push_back(cur);
+        } else if (c == 'c' || c == 'q' || c == 's' || c == 't') {
+            int pairs = c == 'c' ? 3 : c == 's' || c == 'q' ? 2 : 1;
+            float x = cur.x, y = cur.y;
+            for (int i = 0; i < pairs; ++i) {
+                if (!parse_svg_number(p, x) || !parse_svg_number(p, y)) break;
+            }
+            if (rel) { x += cur.x; y += cur.y; }
+            cur = {x, y}; poly.push_back(cur);
+        } else {
+            p++;
+        }
+    }
+    if (poly.size() >= 3) fill_mask_polygon(m, poly);
+}
+
+static bool load_mask_from_svg(const char* path, MaskData& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::stringstream ss; ss << in.rdbuf();
+    std::string s = ss.str();
+
+    float w = 0.0f, h = 0.0f;
+    size_t svg_p = s.find("<svg");
+    if (svg_p != std::string::npos) {
+        size_t svg_e = s.find('>', svg_p);
+        std::string tag = s.substr(svg_p, svg_e == std::string::npos ? 256 : svg_e - svg_p + 1);
+        w = attr_float(tag, "width", 0.0f);
+        h = attr_float(tag, "height", 0.0f);
+        std::string vb = attr_string(tag, "viewBox");
+        if ((w <= 0.0f || h <= 0.0f) && !vb.empty()) {
+            std::stringstream vs(vb);
+            float x0, y0, vw, vh;
+            if (vs >> x0 >> y0 >> vw >> vh) { w = vw; h = vh; }
+        }
+    }
+    if (w <= 0.0f) w = 128.0f;
+    if (h <= 0.0f) h = 32.0f;
+    out.w = (int)clampf(w, 8.0f, 512.0f);
+    out.h = (int)clampf(h, 8.0f, 512.0f);
+    out.bits.assign((size_t)out.w * (size_t)out.h, 0);
+
+    for (size_t p = 0; (p = s.find("<rect", p)) != std::string::npos; ++p) {
+        size_t e = s.find('>', p); if (e == std::string::npos) break;
+        std::string tag = s.substr(p, e - p + 1);
+        float x = attr_float(tag, "x", 0), y = attr_float(tag, "y", 0);
+        float rw = attr_float(tag, "width", (float)out.w), rh = attr_float(tag, "height", (float)out.h);
+        fill_mask_rect(out, (int)x, (int)y, (int)(x + rw), (int)(y + rh));
+    }
+    for (size_t p = 0; (p = s.find("<circle", p)) != std::string::npos; ++p) {
+        size_t e = s.find('>', p); if (e == std::string::npos) break;
+        std::string tag = s.substr(p, e - p + 1);
+        float cx = attr_float(tag, "cx", out.w * 0.5f), cy = attr_float(tag, "cy", out.h * 0.5f);
+        float r = attr_float(tag, "r", fminf(out.w, out.h) * 0.5f);
+        fill_mask_ellipse(out, cx, cy, r, r);
+    }
+    for (size_t p = 0; (p = s.find("<ellipse", p)) != std::string::npos; ++p) {
+        size_t e = s.find('>', p); if (e == std::string::npos) break;
+        std::string tag = s.substr(p, e - p + 1);
+        fill_mask_ellipse(out, attr_float(tag, "cx", out.w * 0.5f), attr_float(tag, "cy", out.h * 0.5f),
+                          attr_float(tag, "rx", out.w * 0.5f), attr_float(tag, "ry", out.h * 0.5f));
+    }
+    for (size_t p = 0; (p = s.find("<path", p)) != std::string::npos; ++p) {
+        size_t e = s.find('>', p); if (e == std::string::npos) break;
+        std::string tag = s.substr(p, e - p + 1);
+        std::string d = attr_string(tag, "d");
+        if (!d.empty()) fill_svg_path(out, d);
+    }
+    out.loaded = true;
+    out.path = path;
+    return true;
+}
+
+static MaskData* mask_for_path(const char* path) {
+    if (!path || !path[0]) return nullptr;
+    for (MaskData& m : g_mask_cache) {
+        if (m.loaded && m.path == path) return &m;
+    }
+    MaskData* slot = &g_mask_cache[0];
+    for (MaskData& m : g_mask_cache) {
+        if (!m.loaded) { slot = &m; break; }
+    }
+    *slot = {};
+    bool ok = has_ext(path, ".svg") ? load_mask_from_svg(path, *slot) : load_mask_from_image(path, *slot);
+    if (!ok || slot->bits.empty()) { *slot = {}; return nullptr; }
+    slot->path = path;
+    slot->loaded = true;
+    return slot;
+}
+
+static Color toast_accent(ToastType type) {
+    switch (type) {
+        case ToastType::Success: return resolve_color(ColorRole::Success);
+        case ToastType::Warning: return resolve_color(ColorRole::Warning);
+        case ToastType::Error:   return {0.941f, 0.267f, 0.267f, 1.0f};
+        case ToastType::Info:    return resolve_color(ColorRole::Accent);
+    }
+    return resolve_color(ColorRole::Accent);
+}
+
+static void draw_dither_backdrop_panel(Rect r, float opacity) {
+    if (opacity <= 0.001f) return;
+    int cell = g_dither_size < 1 ? 1 : (g_dither_size > 32 ? 32 : g_dither_size);
+    static const int bayer4[16] = {
+        0,  8,  2, 10,
+        12, 4, 14,  6,
+        3, 11,  1,  9,
+        15, 7, 13,  5
+    };
+    Color bg = lerp_color(resolve_color(ColorRole::Background), resolve_color(ColorRole::Panel), 0.45f);
+    Color accent = resolve_color(ColorRole::Accent);
+    Color dim = resolve_color(ColorRole::TextDim);
+    bg.a = 0.56f * opacity;
+    fill_round_rect(r, g_style.rounding, bg);
+
+    push_clip(r);
+    int x0 = (int)floorf(r.x);
+    int y0 = (int)floorf(r.y);
+    int x1 = (int)ceilf(r.x + r.w);
+    int y1 = (int)ceilf(r.y + r.h);
+    for (int y = y0; y < y1; y += cell) {
+        for (int x = x0; x < x1; x += cell) {
+            int bx = ((x - x0) / cell) & 3;
+            int by = ((y - y0) / cell) & 3;
+            int threshold = bayer4[by * 4 + bx];
+            float t = (float)threshold / 15.0f;
+            Color c = lerp_color(dim, accent, t * 0.72f);
+            c.a = (0.045f + t * 0.105f) * opacity;
+            fill_rect({(float)x, (float)y, (float)cell, (float)cell}, c);
+        }
+    }
+    pop_clip();
+}
+
+static bool toasts_active() {
+    for (const ToastSlot& s : g_toasts) if (s.active) return true;
+    return false;
+}
+
+static void draw_toast_overlay() {
+    if (!g_drawing) return;
+    float margin = 18.0f;
+    float max_w = fminf(380.0f, fmaxf(240.0f, g_ctx.content_region.w * 0.42f));
+    float y = g_ctx.content_region.y + margin;
+
+    for (ToastSlot& slot : g_toasts) {
+        if (!slot.active) continue;
+        slot.elapsed += g_dt;
+        float duration = slot.toast.duration_ms > 0 ? (float)slot.toast.duration_ms / 1000.0f : 999999.0f;
+        float in_t = clamp01(slot.elapsed / 0.18f);
+        float out_t = slot.elapsed > duration ? clamp01((slot.elapsed - duration) / 0.22f) : 0.0f;
+        float alpha = ease_smooth(in_t) * (1.0f - ease_smooth(out_t));
+        if (alpha <= 0.01f && slot.elapsed > duration) {
+            slot.active = false;
+            continue;
+        }
+
+        std::vector<TextRange> lines;
+        compute_wrapped_ranges(slot.message.c_str(), max_w - 54.0f, true, lines);
+        float lh = text_line_height();
+        float h = fmaxf(48.0f, 18.0f + (float)lines.size() * lh);
+        Rect r = {
+            g_ctx.content_region.x + g_ctx.content_region.w - max_w - margin + (1.0f - in_t) * 18.0f,
+            y,
+            max_w,
+            h
+        };
+        y += h + 10.0f;
+
+        Color panel = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Background), 0.12f);
+        Color border = resolve_color(ColorRole::Border);
+        Color accent = toast_accent(slot.toast.type);
+        panel.a = 0.96f * alpha;
+        border = lerp_color(border, accent, 0.35f);
+        border.a *= alpha;
+        accent.a *= alpha;
+        draw_widget_chrome(r, fmaxf(6.0f, g_style.rounding), panel, border, 0.0f, 0.0f, 0.0f);
+        fill_round_rect({r.x + 8.0f, r.y + 9.0f, 5.0f, r.h - 18.0f}, 2.5f, accent);
+
+        Color text = resolve_color(ColorRole::Text); text.a *= alpha;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            TextRange tr = lines[i];
+            std::string line(slot.message.c_str() + tr.start, slot.message.c_str() + tr.end);
+            Rect lr = {r.x + 24.0f, r.y + 9.0f + (float)i * lh, r.w - 58.0f, lh};
+            draw_text_utf8(line.c_str(), lr, text);
+        }
+
+        if (slot.toast.dismissible) {
+            Rect xr = {r.x + r.w - 30.0f, r.y + 9.0f, 20.0f, 20.0f};
+            bool hov = rect_contains(xr, g_input.mouse_x, g_input.mouse_y);
+            Color xcol = lerp_color(resolve_color(ColorRole::TextDim), resolve_color(ColorRole::Text), hov ? 0.8f : 0.0f);
+            xcol.a *= alpha;
+            draw_line(xr.x + 6.0f, xr.y + 6.0f, xr.x + xr.w - 6.0f, xr.y + xr.h - 6.0f, 1.6f, xcol);
+            draw_line(xr.x + xr.w - 6.0f, xr.y + 6.0f, xr.x + 6.0f, xr.y + xr.h - 6.0f, 1.6f, xcol);
+            if (hov && g_input.mouse_pressed) slot.elapsed = duration + 0.25f;
+        }
+    }
 }
 
 } // namespace internal
@@ -1304,7 +1776,16 @@ static void apply_cmd_theme() {
 // ---- Public helpers (before platform split) -------------------------
 
 void set_quit_on_ctrl_q(bool e) { internal::g_shortcuts_enabled = e; }
-void set_style(const Style& s)  { internal::g_style = s; internal::sync_native_window_chrome(); }
+void set_fps_limit(int fps) { internal::g_frame_limit_fps = fps; }
+int  get_fps_limit() { return internal::g_frame_limit_fps; }
+void set_backdrop_effect(BackdropEffect effect) { internal::g_backdrop_effect = effect; internal::g_redraw_requested = true; internal::wake_event_loop(); }
+void set_dither_size(int px) {
+    internal::g_dither_size = px < 1 ? 1 : (px > 32 ? 32 : px);
+    internal::g_redraw_requested = true;
+    internal::wake_event_loop();
+}
+void request_redraw() { internal::g_redraw_requested = true; internal::wake_event_loop(); }
+void set_style(const Style& s)  { internal::g_style = s; internal::g_redraw_requested = true; internal::wake_event_loop(); internal::sync_native_window_chrome(); }
 const Style& get_style()         { return internal::g_style; }
 Color color_from_hex(const char* hex) { return internal::parse_hex_color(hex ? std::string_view(hex) : std::string_view{}); }
 Color color_from_hex(std::string_view hex) { return internal::parse_hex_color(hex); }
@@ -1377,6 +1858,34 @@ void tooltip(const char* text) {
     internal::g_tooltip.request_anchor = internal::g_ctx.last_item_rect;
     internal::g_tooltip.request_text = text;
 }
+void toast(const Toast& t) {
+    if (!t.message || !t.message[0]) return;
+    internal::ToastSlot* slot = nullptr;
+    for (internal::ToastSlot& s : internal::g_toasts) {
+        if (!s.active) { slot = &s; break; }
+    }
+    if (!slot) {
+        slot = &internal::g_toasts[0];
+        for (int i = 1; i < 16; ++i) internal::g_toasts[i - 1] = internal::g_toasts[i];
+        slot = &internal::g_toasts[15];
+    }
+    slot->active = true;
+    slot->toast = t;
+    slot->message = t.message;
+    slot->elapsed = 0.0f;
+    internal::g_redraw_requested = true;
+    internal::wake_event_loop();
+}
+void toast(const char* message) { Toast t; t.message = message; toast(t); }
+void toast_info(const char* message) { toast(message); }
+void toast_success(const char* message) { Toast t; t.message = message; t.type = ToastType::Success; toast(t); }
+void toast_warning(const char* message) { Toast t; t.message = message; t.type = ToastType::Warning; toast(t); }
+void toast_error(const char* message) { Toast t; t.message = message; t.type = ToastType::Error; toast(t); }
+void clear_toasts() {
+    for (internal::ToastSlot& s : internal::g_toasts) s = {};
+    internal::g_redraw_requested = true;
+    internal::wake_event_loop();
+}
 
 // ============================================================
 // Themes
@@ -1435,6 +1944,17 @@ Style one_dark_style() {
     s.input_bg = {0.145f,0.161f,0.192f,1}; s.input_focus = {0.380f,0.686f,0.937f,1};
     s.accent = s.input_focus; s.warning = {0.878f,0.423f,0.458f,1}; s.success = {0.596f,0.757f,0.420f,1};
     s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=6; s.border_width=1; s.font_size=16;
+    return s;
+}
+Style ghostty_green_style() {
+    Style s;
+    s.background = {0.027f,0.035f,0.031f,1}; s.panel = {0.055f,0.071f,0.063f,1};
+    s.text = {0.850f,0.925f,0.860f,1}; s.text_dim = {0.533f,0.643f,0.561f,1};
+    s.border = {0.129f,0.204f,0.157f,1}; s.button = {0.066f,0.090f,0.078f,1};
+    s.button_hover = {0.102f,0.145f,0.122f,1}; s.button_active = {0.145f,0.216f,0.176f,1};
+    s.input_bg = {0.035f,0.047f,0.043f,1}; s.input_focus = {0.392f,0.820f,0.514f,1};
+    s.accent = {0.451f,0.878f,0.529f,1}; s.warning = {0.918f,0.698f,0.353f,1}; s.success = {0.420f,0.831f,0.514f,1};
+    s.window_padding=20; s.item_spacing=10; s.item_height=36; s.rounding=5; s.border_width=1; s.font_size=16;
     return s;
 }
 
@@ -1896,6 +2416,54 @@ static void release_render_target() {
     release_frame_snapshot();
 }
 
+static void wait_frame_limit() {
+    if (g_frame_limit_fps <= 0 || g_freq.QuadPart <= 0) return;
+    const double target = 1.0 / (double)g_frame_limit_fps;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed = (double)(now.QuadPart - g_last_time.QuadPart) / (double)g_freq.QuadPart;
+    double remaining = target - elapsed;
+    if (remaining <= 0.0) return;
+
+    DWORD ms = (DWORD)(remaining * 1000.0);
+    if (ms > 1) Sleep(ms - 1);
+    do {
+        Sleep(0);
+        QueryPerformanceCounter(&now);
+        elapsed = (double)(now.QuadPart - g_last_time.QuadPart) / (double)g_freq.QuadPart;
+    } while (elapsed < target);
+}
+
+static void wait_for_win32_event() {
+    if (!g_platform.running) return;
+    WaitMessage();
+}
+
+static void wake_event_loop() {
+    if (g_platform.hwnd) PostMessageW(g_platform.hwnd, WM_NULL, 0, 0);
+}
+
+static bool effects_need_redraw() {
+    if (!effects_enabled()) return false;
+    if (fabsf(g_scroll_y - g_scroll_target_y) > 0.01f) return true;
+    if (fabsf(g_ta_scroll_y - g_ta_scroll_target_y) > 0.01f) return true;
+    for (const MotionSlot& slot : g_motion_slots) {
+        if (!slot.key) continue;
+        if ((slot.hover > 0.001f && slot.hover < 0.999f) ||
+            (slot.active > 0.001f && slot.active < 0.999f) ||
+            (slot.focus > 0.001f && slot.focus < 0.999f)) {
+            return true;
+        }
+    }
+    for (const TabFxSlot& slot : g_tab_fx_slots) {
+        if (slot.key && slot.switch_t < 1.0f) return true;
+    }
+    for (const CollapseSlot& slot : g_collapse_slots) {
+        if (slot.key && slot.progress > 0.001f && slot.progress < 0.999f) return true;
+    }
+    return false;
+}
+
 static void execute_command() {
     if (strcmp(g_cmd.buf,"q")==0) PostQuitMessage(0);
     else apply_cmd_theme();
@@ -2000,6 +2568,10 @@ bool create_window(const Config& cfg) {
     g_renderer.com_inited = (hr==S_OK||hr==S_FALSE);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_style = startup_style();
+    g_frame_limit_fps = cfg.fps_limit;
+    g_redraw_requested = true;
+    g_backdrop_effect = cfg.backdrop_effect;
+    g_dither_size = cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
     g_scroll_y = g_scroll_target_y = 0;
     g_ta_scroll_y = g_ta_scroll_target_y = 0;
     reset_effect_state(cfg.enable_effects && FTUI_WINDOWS_EFFECTS);
@@ -2052,11 +2624,15 @@ bool pump() {
     g_input.key_left=g_input.key_right=g_input.key_up=g_input.key_down=false;
     g_input.key_ctrl_c=g_input.key_ctrl_v=false;
     g_input.text_input_count=0; memset(g_input.text_input,0,sizeof(g_input.text_input));
+    if (!g_redraw_requested) wait_for_win32_event();
+    bool saw_event = false;
     MSG msg;
     while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){
+        saw_event = true;
         if(msg.message==WM_QUIT){g_platform.running=false;return false;}
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
+    if (saw_event) g_redraw_requested = true;
     return g_platform.running;
 }
 
@@ -2072,6 +2648,7 @@ void begin() {
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
+    g_redraw_requested = false;
     if((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()){
         auto& stops=g_ctx.tab_stops_prev;
         int cur=g_ctx.focused_widget_id,idx=-1;
@@ -2195,8 +2772,18 @@ void end() {
     finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
     draw_tooltip_overlay();
+    draw_toast_overlay();
     HRESULT hr=g_renderer.target->EndDraw(); g_drawing=false;
     if(hr==D2DERR_RECREATE_TARGET){release_render_target();create_render_target();}
+    bool keep_redrawing = g_redraw_requested || g_debug.show_fps ||
+                          g_debug.show_hovered_id || g_debug.show_active_id ||
+                          g_input.mouse_down || g_sb_dragging ||
+                          g_cmd.active || g_tooltip.requested || g_tooltip.active ||
+                          toasts_active() ||
+                          g_dropdown_overlay.active || g_dropdown_overlay_prev.active ||
+                          effects_need_redraw() || hr==D2DERR_RECREATE_TARGET;
+    wait_frame_limit();
+    g_redraw_requested = keep_redrawing;
     g_dropdown_overlay_prev = g_dropdown_overlay;
     g_ctx.tab_stops_prev=g_ctx.tab_stops; g_ctx.frame_index++;
 }
@@ -2219,9 +2806,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     struct Snap {
         PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; DebugState dbg;
         float sc,sct,ch,sbmy,sbms0; bool sbd;
-        CmdState cmd; float fps,fpsa; int fpsf;
+        CmdState cmd; float fps,fpsa; int fpsf, frame_limit_fps; bool redraw_requested;
         LARGE_INTEGER lt;
-        int tci,tc,tsa,taci,tac,taas; float tasc,tasct,dt;
+        int tci,tc,tsa,taci,tac,taas,dither_size; float tasc,tasct,dt;
+        BackdropEffect backdrop_effect;
         bool effects;
         MotionSlot motion[256];
         TabFxSlot tab_fx[32];
@@ -2251,6 +2839,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
     s.sc=g_scroll_y;s.sct=g_scroll_target_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
     s.cmd=g_cmd;s.fps=g_fps;s.fpsa=g_fps_accum;s.fpsf=g_fps_frames;s.lt=g_last_time;
+    s.frame_limit_fps=g_frame_limit_fps;s.redraw_requested=g_redraw_requested;
+    s.backdrop_effect=g_backdrop_effect;s.dither_size=g_dither_size;
     s.tci=g_text_cursor_id;s.tc=g_text_cursor;s.tsa=g_text_sel_anchor;
     s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;s.tasct=g_ta_scroll_target_y;s.dt=g_dt;
     s.effects=g_effects_enabled;
@@ -2298,6 +2888,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_input={}; g_ctx={}; g_style=s.sty; g_debug=s.dbg;
     g_scroll_y=g_content_height=0; g_sb_dragging=false; g_cmd={};
     g_fps=g_fps_accum=0; g_fps_frames=0;
+    g_frame_limit_fps=cfg.fps_limit; g_redraw_requested=true;
+    g_backdrop_effect=cfg.backdrop_effect; g_dither_size=cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
     g_prev_frame_bitmap=nullptr; g_prev_frame_pixels.clear(); g_prev_frame_w=0; g_prev_frame_h=0;
@@ -2350,6 +2942,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_debug=s.dbg;
     g_scroll_y=s.sc;g_scroll_target_y=s.sct;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
     g_cmd=s.cmd;g_fps=s.fps;g_fps_accum=s.fpsa;g_fps_frames=s.fpsf;g_last_time=s.lt;
+    g_frame_limit_fps=s.frame_limit_fps;g_redraw_requested=s.redraw_requested;
+    g_backdrop_effect=s.backdrop_effect;g_dither_size=s.dither_size;
     g_text_cursor_id=s.tci;g_text_cursor=s.tc;g_text_sel_anchor=s.tsa;
     g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;g_ta_scroll_target_y=s.tasct;g_dt=s.dt;
     g_effects_enabled=s.effects;
@@ -2407,6 +3001,41 @@ ImageHandle* load_image(const char* utf8_path) {
     if(FAILED(hr)) return nullptr;
     ImageHandle* h=new ImageHandle(); h->_impl=bmp; return h;
 }
+namespace internal {
+static bool load_mask_from_image(const char* path, MaskData& out) {
+    if (!path || !path[0]) return false;
+    if (!g_renderer.wic_factory) {
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&g_renderer.wic_factory)))) return false;
+    }
+    std::wstring wp = utf8_to_wide(path);
+    IWICBitmapDecoder* dec = nullptr;
+    if (FAILED(g_renderer.wic_factory->CreateDecoderFromFilename(wp.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &dec))) return false;
+    IWICBitmapFrameDecode* frame = nullptr;
+    HRESULT hr = dec->GetFrame(0, &frame);
+    dec->Release();
+    if (FAILED(hr) || !frame) return false;
+    IWICFormatConverter* conv = nullptr;
+    if (FAILED(g_renderer.wic_factory->CreateFormatConverter(&conv)) || !conv) { frame->Release(); return false; }
+    hr = conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeMedianCut);
+    frame->Release();
+    if (FAILED(hr)) { conv->Release(); return false; }
+    UINT w = 0, h = 0;
+    conv->GetSize(&w, &h);
+    if (w == 0 || h == 0 || w > 2048 || h > 2048) { conv->Release(); return false; }
+    std::vector<unsigned char> px((size_t)w * (size_t)h * 4u);
+    hr = conv->CopyPixels(nullptr, w * 4u, (UINT)px.size(), px.data());
+    conv->Release();
+    if (FAILED(hr)) return false;
+    out.w = (int)w; out.h = (int)h;
+    out.bits.assign((size_t)out.w * (size_t)out.h, 0);
+    for (size_t i = 0, p = 0; i < out.bits.size(); ++i, p += 4) {
+        int lum = ((int)px[p] * 54 + (int)px[p + 1] * 183 + (int)px[p + 2] * 19) / 256;
+        int alpha = px[p + 3];
+        out.bits[i] = (alpha > 32 && lum > 96) ? 255 : 0;
+    }
+    return true;
+}
+} // namespace internal
 void free_image(ImageHandle* img) {
     if(!img) return;
     if(img->_impl){static_cast<ID2D1Bitmap*>(img->_impl)->Release();img->_impl=nullptr;}
@@ -2660,6 +3289,36 @@ static void swap_buffers() {
     XFlush(g_platform.display);
 }
 
+static void wait_frame_limit() {
+    if (g_frame_limit_fps <= 0) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = (double)(now.tv_sec - g_last_time.tv_sec) +
+                     (double)(now.tv_nsec - g_last_time.tv_nsec) * 1e-9;
+    double remaining = (1.0 / (double)g_frame_limit_fps) - elapsed;
+    if (remaining <= 0.0) return;
+
+    struct timespec ts;
+    ts.tv_sec = (time_t)remaining;
+    ts.tv_nsec = (long)((remaining - (double)ts.tv_sec) * 1000000000.0);
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+}
+
+static void wait_for_x_event() {
+    if (!g_platform.display) return;
+    int fd = ConnectionNumber(g_platform.display);
+    while (g_platform.running && !XPending(g_platform.display)) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        int r = select(fd + 1, &fds, nullptr, nullptr, nullptr);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+    }
+}
+
+static void wake_event_loop() {}
+
 static void clipboard_set(const char* utf8) {
     if (!utf8) return;
     g_clipboard_buf=utf8;
@@ -2833,6 +3492,10 @@ bool create_window(const Config& cfg) {
     XMapWindow(dpy,g_platform.window); XFlush(dpy);
     g_platform.width=cfg.width; g_platform.height=cfg.height; g_platform.running=true;
     g_style=startup_style();
+    g_frame_limit_fps = cfg.fps_limit;
+    g_redraw_requested = true;
+    g_backdrop_effect = cfg.backdrop_effect;
+    g_dither_size = cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
     g_scroll_y = g_scroll_target_y = 0;
     g_ta_scroll_y = g_ta_scroll_target_y = 0;
     reset_effect_state(false);
@@ -2849,10 +3512,14 @@ bool pump() {
     g_input.key_left=g_input.key_right=g_input.key_up=g_input.key_down=false;
     g_input.key_ctrl_c=g_input.key_ctrl_v=false;
     g_input.text_input_count=0; memset(g_input.text_input,0,sizeof(g_input.text_input));
+    if (!g_redraw_requested) wait_for_x_event();
+    bool saw_event = false;
     while (XPending(g_platform.display)) {
+        saw_event = true;
         XEvent ev; XNextEvent(g_platform.display,&ev); handle_xevent(ev);
         if (!g_platform.running) return false;
     }
+    if (saw_event) g_redraw_requested = true;
     return g_platform.running;
 }
 
@@ -2868,6 +3535,7 @@ void begin() {
     begin_tooltip_frame();
     g_modal_drawn = false;
     reset_draw_fx();
+    g_redraw_requested = false;
     if ((g_input.key_tab||g_input.key_shift_tab)&&!g_ctx.tab_stops_prev.empty()) {
         auto& stops=g_ctx.tab_stops_prev;
         int cur=g_ctx.focused_widget_id,idx=-1;
@@ -2954,8 +3622,16 @@ void end() {
     finalize_tooltip_frame();
     if (g_modal_open_id && !g_modal_drawn) close_modal();
     draw_tooltip_overlay();
+    draw_toast_overlay();
     g_drawing=false;
     swap_buffers();
+    bool keep_redrawing = g_redraw_requested || g_debug.show_fps ||
+                          g_input.mouse_down || g_sb_dragging ||
+                          g_cmd.active || g_tooltip.requested || g_tooltip.active ||
+                          toasts_active() ||
+                          g_dropdown_overlay.active || g_dropdown_overlay_prev.active;
+    wait_frame_limit();
+    g_redraw_requested = keep_redrawing;
     g_dropdown_overlay_prev = g_dropdown_overlay;
     g_ctx.tab_stops_prev=g_ctx.tab_stops; g_ctx.frame_index++;
 }
@@ -2975,9 +3651,10 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     struct Snap {
         PlatformState p; RendererState r; InputState in; UIContext ctx; Style sty; DebugState dbg;
         float sc,sct,ch,sbmy,sbms0; bool sbd;
-        CmdState cmd; float fps,fpsa; int fpsf;
+        CmdState cmd; float fps,fpsa; int fpsf, frame_limit_fps; bool redraw_requested;
         struct timespec lt;
-        int tci,tc,tsa,taci,tac,taas; float tasc,tasct,dt;
+        int tci,tc,tsa,taci,tac,taas,dither_size; float tasc,tasct,dt;
+        BackdropEffect backdrop_effect;
         bool effects;
         MotionSlot motion[256];
         TabFxSlot tab_fx[32];
@@ -3005,6 +3682,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     s.p=g_platform;s.r=g_renderer;s.in=g_input;s.ctx=g_ctx;s.sty=g_style;s.dbg=g_debug;
     s.sc=g_scroll_y;s.sct=g_scroll_target_y;s.ch=g_content_height;s.sbd=g_sb_dragging;s.sbmy=g_sb_drag_mouse_y;s.sbms0=g_sb_drag_scroll0;
     s.cmd=g_cmd;s.fps=g_fps;s.fpsa=g_fps_accum;s.fpsf=g_fps_frames;s.lt=g_last_time;
+    s.frame_limit_fps=g_frame_limit_fps;s.redraw_requested=g_redraw_requested;
+    s.backdrop_effect=g_backdrop_effect;s.dither_size=g_dither_size;
     s.tci=g_text_cursor_id;s.tc=g_text_cursor;s.tsa=g_text_sel_anchor;
     s.taci=g_ta_cursor_id;s.tac=g_ta_cursor;s.taas=g_ta_sel_anchor;s.tasc=g_ta_scroll_y;s.tasct=g_ta_scroll_target_y;s.dt=g_dt;
     s.effects=g_effects_enabled;
@@ -3042,6 +3721,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_renderer={}; g_input={}; g_ctx={}; g_style=s.sty; g_debug=s.dbg;
     g_scroll_y=g_content_height=0; g_sb_dragging=false; g_cmd={};
     g_fps=g_fps_accum=0; g_fps_frames=0;
+    g_frame_limit_fps=cfg.fps_limit; g_redraw_requested=true;
+    g_backdrop_effect=cfg.backdrop_effect; g_dither_size=cfg.dither_size < 1 ? 1 : (cfg.dither_size > 32 ? 32 : cfg.dither_size);
     g_text_cursor_id=g_text_cursor=g_text_sel_anchor=0;
     g_ta_cursor_id=g_ta_cursor=g_ta_sel_anchor=0; g_ta_scroll_y=0;
     memset(g_scroll_slots, 0, sizeof(g_scroll_slots));
@@ -3085,6 +3766,8 @@ void open_child_window(const Config& cfg, std::function<void()> fn) {
     g_platform=s.p;g_renderer=s.r;g_input=s.in;g_ctx=s.ctx;g_style=s.sty;g_debug=s.dbg;
     g_scroll_y=s.sc;g_scroll_target_y=s.sct;g_content_height=s.ch;g_sb_dragging=s.sbd;g_sb_drag_mouse_y=s.sbmy;g_sb_drag_scroll0=s.sbms0;
     g_cmd=s.cmd;g_fps=s.fps;g_fps_accum=s.fpsa;g_fps_frames=s.fpsf;g_last_time=s.lt;
+    g_frame_limit_fps=s.frame_limit_fps;g_redraw_requested=s.redraw_requested;
+    g_backdrop_effect=s.backdrop_effect;g_dither_size=s.dither_size;
     g_text_cursor_id=s.tci;g_text_cursor=s.tc;g_text_sel_anchor=s.tsa;
     g_ta_cursor_id=s.taci;g_ta_cursor=s.tac;g_ta_sel_anchor=s.taas;g_ta_scroll_y=s.tasc;g_ta_scroll_target_y=s.tasct;g_dt=s.dt;
     g_effects_enabled=s.effects;
@@ -3133,6 +3816,49 @@ ImageHandle* load_image(const char* utf8_path) {
     auto* li=new internal::LinuxImage{surf};
     auto* h=new ImageHandle(); h->_impl=li; return h;
 }
+namespace internal {
+static bool load_mask_from_image(const char* path, MaskData& out) {
+    if (!path || !path[0]) return false;
+    cairo_surface_t* surf = cairo_image_surface_create_from_png(path);
+    if (!surf || cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+        if (surf) cairo_surface_destroy(surf);
+        return false;
+    }
+    cairo_surface_t* img = surf;
+    if (cairo_image_surface_get_format(surf) != CAIRO_FORMAT_ARGB32 &&
+        cairo_image_surface_get_format(surf) != CAIRO_FORMAT_RGB24) {
+        int w0 = cairo_image_surface_get_width(surf);
+        int h0 = cairo_image_surface_get_height(surf);
+        img = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w0, h0);
+        cairo_t* cr = cairo_create(img);
+        cairo_set_source_surface(cr, surf, 0, 0);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        cairo_surface_destroy(surf);
+    }
+    cairo_surface_flush(img);
+    int w = cairo_image_surface_get_width(img);
+    int h = cairo_image_surface_get_height(img);
+    int stride = cairo_image_surface_get_stride(img);
+    if (w <= 0 || h <= 0 || w > 2048 || h > 2048) { cairo_surface_destroy(img); return false; }
+    unsigned char* data = cairo_image_surface_get_data(img);
+    out.w = w; out.h = h;
+    out.bits.assign((size_t)w * (size_t)h, 0);
+    for (int y = 0; y < h; ++y) {
+        unsigned char* row = data + y * stride;
+        for (int x = 0; x < w; ++x) {
+            unsigned char b = row[x * 4 + 0];
+            unsigned char g = row[x * 4 + 1];
+            unsigned char r = row[x * 4 + 2];
+            unsigned char a = row[x * 4 + 3];
+            int lum = ((int)r * 54 + (int)g * 183 + (int)b * 19) / 256;
+            out.bits[(size_t)y * (size_t)w + (size_t)x] = (a > 32 && lum > 96) ? 255 : 0;
+        }
+    }
+    cairo_surface_destroy(img);
+    return true;
+}
+} // namespace internal
 void free_image(ImageHandle* img) {
     if (!img) return;
     if (img->_impl) { auto* li=static_cast<internal::LinuxImage*>(img->_impl); if(li->surface)cairo_surface_destroy(li->surface); delete li; img->_impl=nullptr; }
@@ -3292,6 +4018,107 @@ bool button(const char* label, ColorRole role) {
 
 bool button(const char* label, Color color) {
     return button_impl(label, &color, nullptr);
+}
+
+bool side_menu(const char* label, const char* const* items, int count, int* selected) {
+    if (!g_drawing || !items || count <= 0 || !selected) return false;
+    WidgetColorScope color_scope;
+    char vis[128]; const char* hs;
+    split_label(label ? label : "Navigation", vis, sizeof(vis), &hs);
+    int base_id = hash_str(hs) ^ 0x5195;
+
+    float title_h = vis[0] ? text_line_height() + 12.0f : 8.0f;
+    float item_h = fmaxf(34.0f, g_style.item_height - 2.0f);
+    Rect outer = next_rect(title_h + 10.0f + item_h * count + 12.0f);
+    CollapseRectFx cfx = collapse_rect_fx(outer);
+    outer = cfx.rect;
+    bool enabled = widget_interaction_enabled();
+    bool changed = false;
+    int current = *selected < 0 ? 0 : (*selected >= count ? count - 1 : *selected);
+
+    std::vector<int> ids(count);
+    int focused_idx = -1;
+    for (int i = 0; i < count; ++i) {
+        ids[i] = (hash_str(items[i] ? items[i] : "") ^ base_id ^ (i * 977)) & 0x7fffffff;
+        if (!ids[i]) ids[i] = base_id + i + 1;
+        register_focusable(ids[i]);
+        if (is_widget_focused(ids[i])) focused_idx = i;
+    }
+
+    if (focused_idx >= 0 && enabled) {
+        int next = focused_idx;
+        if (g_input.key_up) next = focused_idx > 0 ? focused_idx - 1 : 0;
+        if (g_input.key_down) next = focused_idx + 1 < count ? focused_idx + 1 : count - 1;
+        if (next != focused_idx) {
+            set_widget_focus(ids[next], false);
+            current = next;
+            changed = true;
+        } else if ((g_input.key_enter || g_input.key_space) && current != focused_idx) {
+            current = focused_idx;
+            changed = true;
+        }
+    }
+
+    if (cfx.clip_active) push_clip(cfx.clip);
+    Color panel = lerp_color(resolve_color(ColorRole::Panel), resolve_color(ColorRole::Background), 0.10f);
+    Color border = resolve_color(ColorRole::Border);
+    Color text = resolve_color(ColorRole::Text);
+    Color text_dim = resolve_color(ColorRole::TextDim);
+    Color accent = resolve_color(ColorRole::Accent);
+    draw_widget_chrome(outer, fmaxf(6.0f, g_style.rounding), maybe_disabled(panel), maybe_disabled(border), 0.0f, 0.0f, 0.0f);
+
+    float y = outer.y + 8.0f;
+    if (vis[0]) {
+        Rect title_r = {outer.x + 14.0f, y, outer.w - 28.0f, title_h - 8.0f};
+        draw_text_utf8(vis, title_r, maybe_disabled(text_dim));
+        y += title_h;
+    }
+
+    Rect last_rect = outer;
+    int last_id = base_id;
+    bool last_hov = false, last_focus = false;
+    for (int i = 0; i < count; ++i) {
+        Rect ir = {outer.x + 8.0f, y + i * item_h, outer.w - 16.0f, item_h - 4.0f};
+        bool raw_hov = rect_contains(ir, g_input.mouse_x, g_input.mouse_y);
+        bool hov = raw_hov && enabled;
+        int id = ids[i];
+        if (hov && g_input.mouse_pressed) {
+            set_widget_focus(id, false);
+            g_ctx.active_id = id;
+        }
+        if (g_ctx.active_id == id && g_input.mouse_released) {
+            if (hov && current != i) { current = i; changed = true; }
+            g_ctx.active_id = 0;
+        }
+        if (hov) g_ctx.hot_id = id;
+        bool focused = is_widget_focused(id);
+        bool sel = current == i;
+        MotionSlot& motion = motion_slot_for(id);
+        update_motion_slot(motion, raw_hov, enabled && g_ctx.active_id == id, focused || sel);
+
+        Color bg = {0,0,0,0};
+        if (sel) {
+            bg = lerp_color(resolve_color(ColorRole::ButtonActive), accent, 0.16f);
+            bg.a = 0.92f;
+        } else if (motion.hover > 0.01f || focused) {
+            bg = lerp_color(resolve_color(ColorRole::Button), resolve_color(ColorRole::ButtonHover), motion.hover);
+            bg.a = 0.78f;
+        }
+        if (bg.a > 0.0f) fill_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), maybe_disabled(bg));
+        if (sel) fill_round_rect({ir.x + 5.0f, ir.y + 7.0f, 4.0f, ir.h - 14.0f}, 2.0f, maybe_disabled(accent));
+
+        Rect tr = {ir.x + 18.0f, ir.y, ir.w - 26.0f, ir.h};
+        draw_text_utf8(items[i] ? items[i] : "", tr,
+                       maybe_disabled(lerp_color(text_dim, text, (sel ? 0.72f : 0.0f) + motion.hover * 0.24f + (focused ? 0.30f : 0.0f))));
+        if (focused) stroke_round_rect(ir, fmaxf(4.0f, g_style.rounding * 0.75f), 1.0f, maybe_disabled(with_alpha(accent, 0.55f)));
+        if (raw_hov || focused || sel) { last_rect = ir; last_id = id; last_hov = raw_hov; last_focus = focused; }
+    }
+    if (cfx.clip_active) pop_clip();
+
+    *selected = current;
+    mark_last_item(last_id, last_rect, last_hov, last_focus);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.2f,0.8f,1.0f,0.4f});
+    return changed;
 }
 
 bool input(const char* label, char* buffer, int buffer_size,
@@ -4120,6 +4947,125 @@ bool slider_float(const char* label, float* value, float min_v, float max_v) {
     mark_last_item(id, outer, raw_hov, focused);
     if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {1,1,0,0.4f});
     return changed;
+}
+
+static void draw_masked_progress(Rect r, float progress, const ProgressStyle& style, Color fill) {
+    MaskData* mask = mask_for_path(style.mask_path);
+    if (!mask || mask->w <= 0 || mask->h <= 0) return;
+
+    Color base = resolve_color(ColorRole::InputBg);
+    Color border = resolve_color(ColorRole::Border);
+    draw_widget_chrome(r, fmaxf(3.0f, g_style.rounding * 0.55f), maybe_disabled(base), maybe_disabled(border), 0.0f, 0.0f, 0.0f);
+    Rect inner = {r.x + 3.0f, r.y + 3.0f, r.w - 6.0f, r.h - 6.0f};
+    if (inner.w <= 0.0f || inner.h <= 0.0f) return;
+
+    Color ghost = fill;
+    ghost.a = 0.16f;
+    Color filled = fill;
+    filled.a = 0.92f;
+    Color glint = {1.0f, 1.0f, 1.0f, 0.30f};
+    float p = clamp01(progress);
+    float phase = (float)g_ctx.frame_index * 0.06f;
+    if (style.wave_front || style.glint) g_redraw_requested = true;
+
+    for (int my = 0; my < mask->h; ++my) {
+        float sy0 = inner.y + inner.h * ((float)my / (float)mask->h);
+        float sy1 = inner.y + inner.h * ((float)(my + 1) / (float)mask->h);
+        int run_start = -1;
+        bool run_fill = false;
+        for (int mx = 0; mx <= mask->w; ++mx) {
+            bool on = mx < mask->w && mask->bits[(size_t)my * (size_t)mask->w + (size_t)mx] > 0;
+            float front = p * (float)mask->w;
+            if (style.wave_front) front += sinf((float)my * 0.35f + phase) * 2.5f;
+            bool fill_on = on && (float)mx <= front;
+            if (on && run_start < 0) { run_start = mx; run_fill = fill_on; }
+            bool boundary = !on || fill_on != run_fill;
+            if (run_start >= 0 && boundary) {
+                float sx0 = inner.x + inner.w * ((float)run_start / (float)mask->w);
+                float sx1 = inner.x + inner.w * ((float)mx / (float)mask->w);
+                fill_rect({sx0, sy0, sx1 - sx0, sy1 - sy0}, maybe_disabled(run_fill ? filled : ghost));
+                run_start = on ? mx : -1;
+                run_fill = fill_on;
+            }
+        }
+    }
+
+    if (style.glint && p > 0.03f) {
+        float gx = inner.x + fmodf((float)g_ctx.frame_index * 2.2f, inner.w + 80.0f) - 60.0f;
+        push_clip({inner.x, inner.y, inner.w * p, inner.h});
+        draw_line(gx, inner.y + inner.h, gx + 42.0f, inner.y, 8.0f, maybe_disabled(glint));
+        pop_clip();
+    }
+}
+
+void progress_bar(float progress) {
+    ProgressStyle style;
+    progress_bar(progress, style);
+}
+
+void progress_bar(float progress, const char* label_or_mask_path) {
+    ProgressStyle style;
+    if (label_or_mask_path && looks_like_mask_path(label_or_mask_path)) style.mask_path = label_or_mask_path;
+    else style.label = label_or_mask_path;
+    progress_bar(progress, style);
+}
+
+void progress_bar(float progress, const ProgressStyle& style) {
+    if (!g_drawing) return;
+    WidgetColorScope color_scope;
+    float p = clamp01(progress);
+    const char* label = style.label;
+    float h = fmaxf(12.0f, style.height);
+    float label_h = label && label[0] ? widget_label_height(label) : 0.0f;
+    Rect outer = next_rect(h + label_h);
+    CollapseRectFx cfx = collapse_rect_fx(outer);
+    outer = cfx.rect;
+    Rect r = {outer.x, outer.y + label_h, outer.w, h};
+    bool raw_hov = rect_contains(outer, g_input.mouse_x, g_input.mouse_y);
+
+    Color fill = style.fill_color.a >= 0.0f ? style.fill_color : resolve_color(style.fill_role);
+    if (cfx.clip_active) push_clip(cfx.clip);
+    if (label && label[0]) draw_widget_label(label, outer, false);
+
+    if (style.mask_path && style.mask_path[0]) {
+        draw_masked_progress(r, p, style, fill);
+    } else {
+        Color track = resolve_color(ColorRole::InputBg);
+        Color border = resolve_color(ColorRole::Border);
+        draw_widget_chrome(r, fmaxf(3.0f, g_style.rounding * 0.55f), maybe_disabled(track), maybe_disabled(border), 0.0f, 0.0f, 0.0f);
+        Rect inner = {r.x + 3.0f, r.y + 3.0f, r.w - 6.0f, r.h - 6.0f};
+        if (inner.w > 0.0f && inner.h > 0.0f && p > 0.0f) {
+            float fill_w = inner.w * p;
+            if (style.wave_front) {
+                int strips = 18;
+                for (int i = 0; i < strips; ++i) {
+                    float y0 = inner.y + inner.h * ((float)i / (float)strips);
+                    float y1 = inner.y + inner.h * ((float)(i + 1) / (float)strips);
+                    float wave = sinf((float)i * 0.65f + (float)g_ctx.frame_index * 0.08f) * 3.0f;
+                    fill_round_rect({inner.x, y0, clampf(fill_w + wave, 0.0f, inner.w), y1 - y0 + 0.5f}, 2.0f, maybe_disabled(fill));
+                }
+                g_redraw_requested = true;
+            } else {
+                fill_round_rect({inner.x, inner.y, fill_w, inner.h}, fmaxf(2.0f, g_style.rounding * 0.4f), maybe_disabled(fill));
+            }
+            if (style.glint) {
+                g_redraw_requested = true;
+                float gx = inner.x + fmodf((float)g_ctx.frame_index * 2.0f, inner.w + 70.0f) - 50.0f;
+                push_clip({inner.x, inner.y, fill_w, inner.h});
+                draw_line(gx, inner.y + inner.h, gx + 38.0f, inner.y, 7.0f, {1.0f,1.0f,1.0f,0.26f});
+                pop_clip();
+            }
+        }
+    }
+
+    if (style.show_percent) {
+        char pct[32];
+        snprintf(pct, sizeof(pct), "%.0f%%", p * 100.0f);
+        draw_text_utf8_centered(pct, r, maybe_disabled(resolve_color(ColorRole::Text)));
+    }
+    if (cfx.clip_active) pop_clip();
+    mark_last_item(0, outer, raw_hov, false);
+    if (g_debug.show_layout_rects) stroke_round_rect(outer, 0, 1, {0.6f,0.8f,1.0f,0.4f});
 }
 
 void image(ImageHandle* img, float width, float height) {
@@ -5002,6 +5948,65 @@ void row(std::initializer_list<float> weights, std::function<void()> fn) {
     fn();
     rc.active = false;
     g_ctx.cursor_y += rc.row_height + g_style.item_spacing;
+}
+
+void split(std::initializer_list<float> columns, std::function<void()> fn) {
+    if (!g_drawing || !fn || columns.size() == 0) return;
+    auto& rc = g_ctx.row_ctx;
+    float gap = g_style.item_spacing;
+    rc.active = true;
+    rc.weighted = true;
+    rc.split = true;
+    rc.cols = (int)columns.size();
+    rc.gap = gap;
+    rc.cell_w = 0.0f;
+    rc.start_x = g_ctx.cursor_x;
+    rc.start_y = g_ctx.cursor_y;
+    rc.total_w = g_ctx.content_region.w;
+    rc.used_x = 0.0f;
+    rc.total_weight = 0.0f;
+    rc.fixed_total = 0.0f;
+    rc.flex_total = 0.0f;
+    rc.weights = columns.begin();
+    for (float c : columns) {
+        if (c >= 16.0f) rc.fixed_total += c;
+        else rc.flex_total += c > 0.0f ? c : 1.0f;
+    }
+    if (rc.flex_total <= 0.0f) rc.flex_total = 1.0f;
+    rc.col_index = 0;
+    rc.row_height = 0.0f;
+    fn();
+    float row_h = rc.row_height;
+    rc = {};
+    g_ctx.cursor_y += row_h + g_style.item_spacing;
+}
+
+void side_layout(float side_width, std::function<void()> fn) {
+    split({side_width, 1.0f}, fn);
+}
+
+void content(std::function<void()> fn) {
+    if (!g_drawing || !fn) return;
+    Rect cell = next_rect(0.0f);
+    RowContext parent_row = g_ctx.row_ctx;
+    Rect saved_region = g_ctx.content_region;
+    float saved_cursor_x = g_ctx.cursor_x;
+    float saved_cursor_y = g_ctx.cursor_y;
+
+    float available_h = saved_region.y + saved_region.h - cell.y;
+    if (available_h < 0.0f) available_h = 0.0f;
+    g_ctx.content_region = {cell.x, cell.y, cell.w, available_h};
+    g_ctx.cursor_x = cell.x;
+    g_ctx.cursor_y = cell.y;
+    g_ctx.row_ctx = {};
+    fn();
+    float used_h = g_ctx.cursor_y - cell.y;
+
+    g_ctx.content_region = saved_region;
+    g_ctx.cursor_x = saved_cursor_x;
+    g_ctx.cursor_y = saved_cursor_y;
+    if (used_h > parent_row.row_height) parent_row.row_height = used_h;
+    g_ctx.row_ctx = parent_row;
 }
 
 } // namespace ftui

@@ -64,7 +64,7 @@ int main() {
     static const char* profile_items[] = { "Admin", "Observer", "Maintainer", "Support" };
     static const char* shell_items[] = { "Powershell", "Bash", "Cmd" };
     static const char* theme_names[] = {
-        "Default Dark", "Catppuccin Mocha", "Nord", "Gruvbox Dark", "One Dark"
+        "Default Dark", "Catppuccin Mocha", "Nord", "Gruvbox Dark", "One Dark", "Ghostty Green"
     };
     static const char* icon_names[] = {
         "Symbol", "Symbol + text"
@@ -75,6 +75,7 @@ int main() {
         ftui::nord_style,
         ftui::gruvbox_dark_style,
         ftui::one_dark_style,
+        ftui::ghostty_green_style,
     };
 
     int env_sel = 1;
@@ -82,7 +83,7 @@ int main() {
     int shell_sel = 0;
     int theme_idx = 0;
     int icon_idx = 0;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
         if (theme_fns[i] == FTUI_DEFAULT_STYLE) {
             theme_idx = i;
             break;
@@ -300,7 +301,7 @@ int main() {
                  click_count, safe_mode ? "on" : "off", blend, shell_items[shell_sel]);
         ftui::text(summary);
 
-        if (ftui::dropdown("Theme", theme_names, 5, &theme_idx, 5)) {
+        if (ftui::dropdown("Theme", theme_names, 6, &theme_idx, 6)) {
             ftui::set_style(theme_fns[theme_idx]());
             append_line(logs, sizeof(logs), "[Settings] Theme changed.");
         }

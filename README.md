@@ -28,6 +28,7 @@ int main() {
     cfg.title = "My App";
     cfg.width = 960;
     cfg.height = 640;
+    cfg.fps_limit = 60; // default; use 0 for uncapped
 
     if (!ftui::create_window(cfg)) return 1;
 
@@ -52,6 +53,37 @@ int main() {
 ```
 
 Every other translation unit should include `ftui.hpp` without `FTUI_IMPLEMENTATION`.
+
+## Frame pacing
+
+FTUI caps rendering at `Config::fps_limit`, which defaults to `60`.
+
+```cpp
+ftui::Config cfg;
+cfg.fps_limit = 144; // or 0 for uncapped rendering
+```
+
+You can also change it at runtime:
+
+```cpp
+ftui::set_fps_limit(30);
+```
+
+FTUI sleeps while idle, then redraws on native input/window events, active interaction, active debug/effect overlays, or an explicit request:
+
+```cpp
+ftui::request_redraw();
+```
+
+The Linux backend renders into an X11 pixmap back buffer and swaps it to the window.
+
+Effects backdrops can use the default blur-style panel on Windows, or a theme-colored Bayer dither pattern on both Windows and Linux:
+
+```cpp
+ftui::Config cfg;
+cfg.backdrop_effect = ftui::BackdropEffect::BayerDither;
+cfg.dither_size = 5;
+```
 
 ## Build
 
@@ -118,6 +150,7 @@ ftui::set_style(ftui::catppuccin_mocha_style());
 ftui::set_style(ftui::nord_style());
 ftui::set_style(ftui::gruvbox_dark_style());
 ftui::set_style(ftui::one_dark_style());
+ftui::set_style(ftui::ghostty_green_style());
 ```
 
 The built-in presets are the library’s named color packs. Each one fully initializes the semantic color roles used by FTUI, including `accent`, `warning`, and `success`.
@@ -200,6 +233,61 @@ Visible labels can be reused by suffixing an internal ID:
 ```cpp
 ftui::button("Open##file");
 ftui::button("Open##folder");
+```
+
+### Side menus
+
+```cpp
+static const char* pages[] = {"Dashboard", "Network", "Services", "Logs", "Settings"};
+int page = 0;
+
+ftui::side_layout(220.0f, [&]() {
+    ftui::side_menu("Navigation", pages, 5, &page);
+    ftui::content([&]() {
+        if (page == 0) ftui::text("Dashboard");
+        else if (page == 1) ftui::text("Network");
+    });
+});
+```
+
+Use `split({220.0f, 1.0f}, ...)` directly when you want more control. Values `>= 16` are fixed pixel columns; smaller values are flexible weights.
+
+### Toasts
+
+```cpp
+ftui::toast("Saved");
+ftui::toast_success("Configuration saved");
+ftui::toast_warning("High CPU usage");
+ftui::toast_error("Connection failed");
+```
+
+For custom timing:
+
+```cpp
+ftui::Toast t;
+t.message = "Relay restarted";
+t.duration_ms = 5000;
+t.dismissible = true;
+t.type = ftui::ToastType::Success;
+ftui::toast(t);
+```
+
+### Progress bars
+
+```cpp
+float progress = 0.73f;
+ftui::progress_bar(progress);
+ftui::progress_bar(progress, "Loading assets");
+```
+
+Masked progress bars fill the white/opaque area of an SVG or image from left to right:
+
+```cpp
+ftui::ProgressStyle style;
+style.mask_path = "battery.svg";
+style.wave_front = true;
+style.glint = true;
+ftui::progress_bar(progress, style);
 ```
 
 ### Single-line input
