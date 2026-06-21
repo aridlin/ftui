@@ -109,10 +109,10 @@ Windows supports `Opaque`, `Plain`, `BayerDither`, and `Blur`. Linux supports `O
 Windows with `clang++`:
 
 ```bash
-clang++ main.cpp -o app.exe -std=c++17 -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -lwindowscodecs
+clang++ main.cpp -o app.exe -std=c++17
 ```
 
-Windows with MSVC:
+Windows with MSVC or MSVC-targeting `clang++`:
 
 - `ftui.hpp` already includes the required `#pragma comment(lib, ...)` lines.
 
@@ -129,8 +129,8 @@ Linux note:
 Example builds from the repo root:
 
 ```bash
-clang++ demo.cpp -o demo.exe -std=c++17 -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -lwindowscodecs
-clang++ examples/benchmark.cpp -o benchmark.exe -std=c++17 -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -lwindowscodecs
+clang++ demo.cpp -o demo.exe -std=c++17
+clang++ examples/benchmark.cpp -o benchmark.exe -std=c++17
 ```
 
 ## Repository layout

@@ -37,6 +37,9 @@
 #endif
 
 #pragma once
+#if defined(_WIN32) && !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
@@ -341,7 +344,20 @@ DebugState& debug();
 
 #ifdef _WIN32
 
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0A00
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#if !defined(NTDDI_VERSION) || NTDDI_VERSION < 0x0A000000
+#undef NTDDI_VERSION
+#define NTDDI_VERSION 0x0A000000
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <windowsx.h>
@@ -349,8 +365,18 @@ DebugState& debug();
 #include <dwrite.h>
 #include <shobjidl.h>
 #include <wincodec.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "user32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #ifndef FTUI_KEEP_CONSOLE
 #pragma comment(linker, "/subsystem:windows /entry:mainCRTStartup")
