@@ -37,6 +37,7 @@ int main() {
     cfg.height = 920;
 
     if (!ftui::create_window(cfg)) return 1;
+    ftui::set_window_icon_builtin();
 
     char username[64] = "operator";
     char password[64] = "";
@@ -69,10 +70,10 @@ int main() {
     static const char* profile_items[] = { "Admin", "Observer", "Maintainer", "Support" };
     static const char* shell_items[] = { "Powershell", "Bash", "Cmd" };
     static const char* theme_names[] = {
-        "Default Dark", "Catppuccin Mocha", "Nord", "Gruvbox Dark", "One Dark", "Ghostty Green"
+        "Default Dark", "Catppuccin Mocha", "Nord", "Gruvbox Dark", "One Dark", "Ghostty Green", "Signal Geometry"
     };
     static const char* theme_keys[] = {
-        "default-dark", "catppuccin-mocha", "nord", "gruvbox-dark", "one-dark", "ghostty-green"
+        "default-dark", "catppuccin-mocha", "nord", "gruvbox-dark", "one-dark", "ghostty-green", "signal-geometry"
     };
     static const char* transparency_names[] = {
         "Opaque", "Plain transparency", "Soft dither", "Windows blur"
@@ -87,7 +88,12 @@ int main() {
         ftui::gruvbox_dark_style,
         ftui::one_dark_style,
         ftui::ghostty_green_style,
+        ftui::signal_geometry_style,
     };
+
+    constexpr int theme_count = sizeof(theme_keys) / sizeof(theme_keys[0]);
+    static_assert(theme_count == sizeof(theme_names) / sizeof(theme_names[0]));
+    static_assert(theme_count == sizeof(theme_fns) / sizeof(theme_fns[0]));
 
     int env_sel = 1;
     int profile_sel = 0;
@@ -95,7 +101,7 @@ int main() {
     int theme_idx = 0;
     int icon_idx = 0;
     int transparency_idx = 0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < theme_count; ++i) {
         if (strcmp(theme_keys[i], ftui::current_style_name()) == 0) {
             theme_idx = i;
             break;
@@ -361,13 +367,13 @@ int main() {
                  click_count, safe_mode ? "on" : "off", blend, shell_items[shell_sel]);
         ftui::text(summary);
 
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < theme_count; ++i) {
             if (strcmp(theme_keys[i], ftui::current_style_name()) == 0) {
                 theme_idx = i;
                 break;
             }
         }
-        if (ftui::dropdown("Theme", theme_names, 6, &theme_idx, 6)) {
+        if (ftui::dropdown("Theme", theme_names, theme_count, &theme_idx, theme_count)) {
             ftui::set_style(theme_fns[theme_idx]());
             append_line(logs, sizeof(logs), "[Settings] Theme changed.");
         }

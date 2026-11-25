@@ -171,6 +171,8 @@ Vim-style commands:
 - `:tg` Gruvbox dark
 - `:to` One Dark
 - `:th` Ghostty green
+- `:deep-theme signal-geometry` Signal Geometry
+- `:deep-theme standard` return to One Dark
 - `:fps60` set the frame limit; use any integer, or `:fps0` to disable limiting
 - `:fx`, `:fx0`, `:fx1` toggle, disable, or enable animations/effects
 - `:df`, `:dl`, `:di`, `:dw` toggle FPS, layout rects, widget IDs, or widget logging
@@ -191,9 +193,10 @@ ftui::set_style(ftui::nord_style());
 ftui::set_style(ftui::gruvbox_dark_style());
 ftui::set_style(ftui::one_dark_style());
 ftui::set_style(ftui::ghostty_green_style());
+ftui::set_deep_theme("signal-geometry");
 ```
 
-The built-in presets are the library’s named color packs. Each one fully initializes the semantic color roles used by FTUI, including `accent`, `warning`, and `success`.
+Each preset initializes the semantic color roles used by FTUI, including `accent`, `warning`, and `success`. Signal Geometry also draws responsive control outlines, input rails, and a cream marker on progress bars. Select it from the showcase’s **Theme** picker, call `ftui::set_deep_theme("signal-geometry")`, or start the app with `FTUI_THEME=signal-geometry`.
 
 Hex colors are supported directly:
 
