@@ -41,6 +41,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include <cstring>
+#include <cstdint>
 #include <cstdio>
 #include <cstdarg>
 #include <cmath>
@@ -65,6 +66,8 @@ enum class Align { Start, Center, End };
 
 struct Color { float r, g, b, a; };
 
+enum class DeepTheme { Standard, SignalGeometry };
+
 struct Style {
     Color background    = {0.055f,0.055f,0.059f,1.0f};
     Color panel         = {0.090f,0.094f,0.102f,1.0f};
@@ -85,6 +88,7 @@ struct Style {
     float rounding       = 8.0f;
     float border_width   = 1.0f;
     float font_size      = 16.0f;
+    DeepTheme deep_theme = DeepTheme::Standard;
 };
 
 enum class ColorRole {
@@ -109,6 +113,8 @@ Style nord_style();
 Style gruvbox_dark_style();
 Style one_dark_style();
 Style ghostty_green_style();
+Style signal_geometry_style();
+bool set_deep_theme(const char* name);
 Style style_from_name(const char* name);
 const char* style_name(const Style& style);
 const char* current_style_name();
@@ -508,7 +514,7 @@ struct UIContext {
     bool last_item_focused = false;
 };
 
-struct CmdState { bool active = false; char buf[16] = {}; int len = 0; };
+struct CmdState { bool active = false; char buf[64] = {}; int len = 0; };
 
 struct MotionSlot {
     int   key = 0;
@@ -1099,7 +1105,29 @@ static void update_motion_slot(MotionSlot& slot, bool hover_on, bool active_on, 
 }
 
 static void draw_widget_chrome(Rect r, float rounding, Color fill, Color border,
-                               float hover_p, float active_p, float focus_p) {
+                               float hover_p, float active_p, float focus_p, bool input = false) {
+    if (g_style.deep_theme == DeepTheme::SignalGeometry && r.w >= 26 && r.h >= 18) {
+        const bool enabled = g_disabled_depth == 0;
+        const bool focused = enabled && focus_p > .5f;
+        const float radius = input ? 0.f : 4.f * hover_p + 3.f * active_p;
+        const float inset = input ? 0.f : active_p * 1.5f;
+        const Rect face = {r.x + inset, r.y + inset, r.w - 2.f * inset, r.h - 2.f * inset};
+        fill_round_rect(face, radius, fill);
+        stroke_round_rect(face, radius, g_style.border_width, border);
+        if (!enabled) return;
+
+        const Color cream = resolve_color(ColorRole::InputFocus);
+        const Color red = resolve_color(ColorRole::Accent);
+        if (input) {
+            const float y = face.y + face.h - 1.f;
+            fill_rect({face.x, y, face.w, 1}, parse_hex_color("#b78a8d"));
+            fill_rect({face.x, face.y, focused ? 3.f : 2.f, face.h}, focused ? cream : red);
+            if (focused) fill_rect({face.x + face.w - 10, y - 2.f, 10, 3}, cream);
+        } else if (focused) {
+            stroke_round_rect(face, radius, 1.f, cream);
+        }
+        return;
+    }
     if (!effects_enabled()) {
         fill_round_rect(r, rounding, fill);
         stroke_round_rect(r, rounding, g_style.border_width, border);
@@ -1366,7 +1394,7 @@ static void draw_side_drawer_overlay(int window_w, int window_h) {
 static void draw_command_overlay(int window_w, int window_h) {
     if (!g_cmd.active) return;
 
-    char cmd[32];
+    char cmd[sizeof(g_cmd.buf) + 2];
     snprintf(cmd, sizeof(cmd), ":%s_", g_cmd.buf);
     const char* hint = ":td :fps60 :fx :df :dit :q";
     float lh = text_line_height();
@@ -1656,6 +1684,12 @@ static bool parse_cmd_int(const char* prefix, int* out) {
 
 static bool apply_cmd_action() {
     if (!g_cmd.buf[0]) return false;
+    constexpr char deep_theme_prefix[] = "deep-theme ";
+    if (strncmp(g_cmd.buf, deep_theme_prefix, sizeof(deep_theme_prefix) - 1) == 0) {
+        if (!ftui::set_deep_theme(g_cmd.buf + sizeof(deep_theme_prefix) - 1)) return false;
+        set_theme_env(g_style_name.c_str());
+        return true;
+    }
 
     const std::string before_theme = g_style_name;
     apply_cmd_theme();
@@ -2412,12 +2446,41 @@ Style ghostty_green_style() {
     return s;
 }
 
+Style signal_geometry_style() {
+    Style s;
+    s.background = color_from_hex("#140f12");
+    s.panel = s.button = color_from_hex("#1e1419");
+    s.text = color_from_hex("#f9f1eb");
+    s.text_dim = color_from_hex("#c5b7bb");
+    s.border = color_from_hex("#66424a");
+    s.button_hover = color_from_hex("#3a1c23");
+    s.button_active = color_from_hex("#53252c");
+    s.input_bg = color_from_hex("#111111");
+    s.accent = color_from_hex("#ef5148");
+    s.input_focus = s.warning = color_from_hex("#ffe08a");
+    s.success = color_from_hex("#add5b4");
+    s.item_height = 44;
+    s.rounding = 0;
+    s.font_size = 15;
+    s.deep_theme = DeepTheme::SignalGeometry;
+    return s;
+}
+
+bool set_deep_theme(const char* name) {
+    if (!name) return false;
+    if (strcmp(name, "signal-geometry") == 0) set_style(signal_geometry_style());
+    else if (strcmp(name, "standard") == 0) set_style(one_dark_style());
+    else return false;
+    return true;
+}
+
 static bool style_eq(Color a, Color b) {
     return fabsf(a.r - b.r) < 0.0001f && fabsf(a.g - b.g) < 0.0001f &&
            fabsf(a.b - b.b) < 0.0001f && fabsf(a.a - b.a) < 0.0001f;
 }
 
 const char* style_name(const Style& style) {
+    if (style.deep_theme == DeepTheme::SignalGeometry) return "signal-geometry";
     struct NamedStyle { const char* name; Style (*fn)(); };
     static NamedStyle styles[] = {
         {"default-dark", default_dark_style},
@@ -2440,6 +2503,7 @@ const char* style_name(const Style& style) {
 
 Style style_from_name(const char* name) {
     if (!name || !name[0]) return FTUI_DEFAULT_STYLE();
+    if (strcmp(name, "signal-geometry") == 0) return signal_geometry_style();
     if (strcmp(name, "default-dark") == 0 || strcmp(name, "dark") == 0 || strcmp(name, "td") == 0) return default_dark_style();
     if (strcmp(name, "catppuccin-mocha") == 0 || strcmp(name, "catppuccin") == 0 || strcmp(name, "tc") == 0) return catppuccin_mocha_style();
     if (strcmp(name, "nord") == 0 || strcmp(name, "tn") == 0) return nord_style();
@@ -3068,7 +3132,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wc==L'\b'){if(g_cmd.len>0)g_cmd.buf[--g_cmd.len]='\0';}
             else if(wc==L'\r'||wc==L'\n') execute_command();
             else if(wc==27) cmd_clear();
-            else if(wc>=32&&g_cmd.len<15){g_cmd.buf[g_cmd.len++]=(char)wc;g_cmd.buf[g_cmd.len]='\0';}
+            else if(wc>=32&&g_cmd.len<static_cast<int>(sizeof(g_cmd.buf))-1){g_cmd.buf[g_cmd.len++]=(char)wc;g_cmd.buf[g_cmd.len]='\0';}
             return 0;
         }
         if (wc==L'\b') g_input.key_backspace=true;
@@ -3705,7 +3769,50 @@ static void sync_native_window_transparency() {
     }
     XFlush(g_platform.display);
 }
-static void apply_window_icon_handles(void*, void*, bool, BuiltinIcon) {}
+// EWMH stores straight-alpha ARGB pixels as 32-bit CARDINAL items, even when
+// Xlib's host unsigned long is 64 bits. Include several native-size variants.
+static std::vector<unsigned long> builtin_icon_property(BuiltinIcon variant) {
+    std::vector<unsigned long> property;
+    for(int size:{32,64,128,256}) {
+        auto* surface=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,size,size);
+        if(cairo_surface_status(surface)!=CAIRO_STATUS_SUCCESS){cairo_surface_destroy(surface);continue;}
+        auto* cr=cairo_create(surface);
+        const double margin=size*553.0/4961.0, edge=size-2*margin;
+        cairo_set_source_rgb(cr,0,0,0);cairo_rectangle(cr,margin,margin,edge,edge);cairo_fill(cr);
+        cairo_set_source_rgb(cr,1,1,1);cairo_move_to(cr,size*.5,margin);
+        cairo_line_to(cr,size-margin,size-margin);cairo_line_to(cr,margin,size-margin);cairo_close_path(cr);cairo_fill(cr);
+        cairo_set_source_rgb(cr,1,130.0/255.0,0);cairo_set_line_width(cr,size*160.0/4961.0);
+        cairo_set_line_cap(cr,CAIRO_LINE_CAP_ROUND);cairo_move_to(cr,margin,margin);cairo_line_to(cr,size-margin,size-margin);cairo_stroke(cr);
+        cairo_set_line_width(cr,size*120.0/4961.0);cairo_rectangle(cr,margin,margin,edge,edge);cairo_stroke(cr);
+        if(variant==BuiltinIcon::SymbolWithText) {
+            cairo_select_font_face(cr,"sans-serif",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr,size*.22);cairo_text_extents_t ext;cairo_text_extents(cr,"FTUI",&ext);
+            cairo_set_source_rgb(cr,1,130.0/255.0,0);cairo_move_to(cr,(size-ext.x_advance)*.5,size*.88);cairo_show_text(cr,"FTUI");
+        }
+        cairo_surface_flush(surface);property.push_back(size);property.push_back(size);
+        auto* data=cairo_image_surface_get_data(surface);int stride=cairo_image_surface_get_stride(surface);
+        for(int y=0;y<size;++y)for(int x=0;x<size;++x) {
+            std::uint32_t pixel;memcpy(&pixel,data+y*stride+x*4,4);
+            unsigned a=pixel>>24,r=(pixel>>16)&255,g=(pixel>>8)&255,b=pixel&255;
+            if(a){r=std::min(255u,(r*255+a/2)/a);g=std::min(255u,(g*255+a/2)/a);b=std::min(255u,(b*255+a/2)/a);}
+            property.push_back((a<<24)|(r<<16)|(g<<8)|b);
+        }
+        cairo_destroy(cr);cairo_surface_destroy(surface);
+    }
+    return property;
+}
+
+static void apply_window_icon_handles(void*, void*, bool builtin, BuiltinIcon variant) {
+    // Native handles remain Windows-specific. Linux apps may install their own
+    // _NET_WM_ICON after creation; theme changes never overwrite that property.
+    if(!builtin)return;
+    if(!g_platform.display || !g_platform.window)return;
+    auto property=builtin_icon_property(variant);
+    if(property.empty())return;
+    XChangeProperty(g_platform.display,g_platform.window,XInternAtom(g_platform.display,"_NET_WM_ICON",False),
+                    XA_CARDINAL,32,PropModeReplace,reinterpret_cast<unsigned char*>(property.data()),int(property.size()));
+    XFlush(g_platform.display);
+}
 
 static void rrect_path(cairo_t* cr, float x, float y, float w, float h, float r) {
     if (r <= 0.0f || w <= 0.0f || h <= 0.0f) { cairo_rectangle(cr,x,y,w,h); return; }
@@ -4097,7 +4204,7 @@ static void handle_xevent(XEvent& ev) {
         if (g_cmd.active) {
             if (ks==XK_BackSpace){if(g_cmd.len>0)g_cmd.buf[--g_cmd.len]='\0';}
             else if(ks==XK_Return||ks==XK_KP_Enter) execute_command();
-            else if(n>0&&buf[0]>=32&&g_cmd.len<15){g_cmd.buf[g_cmd.len++]=buf[0];g_cmd.buf[g_cmd.len]='\0';}
+            else if(n>0&&buf[0]>=32&&g_cmd.len<static_cast<int>(sizeof(g_cmd.buf))-1){g_cmd.buf[g_cmd.len++]=buf[0];g_cmd.buf[g_cmd.len]='\0';}
             break;
         }
         if (n>0&&buf[0]==':'&&g_ctx.focused_input_id==0&&g_shortcuts_enabled) {
@@ -4701,7 +4808,15 @@ static bool button_impl(const char* label, const Color* tint_override, const Col
     if (cfx.clip_active) push_clip(cfx.clip);
     draw_widget_chrome(r, g_style.rounding, maybe_disabled(bg), maybe_disabled(border), motion.hover, motion.active, focused ? 1.0f : 0.0f);
     Rect text_r = offset_rect(r, 0.0f, motion.active * 1.0f);
-    draw_text_utf8_centered(vis, text_r, maybe_disabled(lerp_color(text_dim, text, 0.72f + motion.hover * 0.20f + motion.active * 0.08f)));
+    Color label_color = lerp_color(text_dim, text, .72f + motion.hover * .20f + motion.active * .08f);
+    if (g_style.deep_theme == DeepTheme::SignalGeometry) {
+        auto linear = [](float channel) {
+            return channel <= .04045f ? channel / 12.92f : std::pow((channel + .055f) / 1.055f, 2.4f);
+        };
+        const float luminance = .2126f * linear(bg.r) + .7152f * linear(bg.g) + .0722f * linear(bg.b);
+        if (luminance > .19f) label_color = g_style.background;
+    }
+    draw_text_utf8_centered(vis, text_r, maybe_disabled(label_color));
     if (cfx.clip_active) pop_clip();
 
     mark_last_item(id, r, raw_hov, focused);
@@ -5088,7 +5203,7 @@ bool input(const char* label, char* buffer, int buffer_size,
     Color panel_col = lerp_color(input_bg, panel, motion.hover * 0.18f + motion.focus * 0.08f);
     Color border_col = lerp_color(border, focus, motion.focus);
     if (cfx.clip_active) push_clip(cfx.clip);
-    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus, true);
 
     float pad = 8.0f;
     float inner_w = r.w - pad * 2.0f - 4.0f;
@@ -5363,7 +5478,7 @@ bool text_area_ex(const char* label, char* buffer, int buffer_size, int rows, Te
     Color border_col = lerp_color(border, focus, motion.focus);
     Color panel_col = lerp_color(input_bg, panel, motion.hover * 0.18f + motion.focus * 0.08f);
     if (cfx.clip_active) push_clip(cfx.clip);
-    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus);
+    draw_widget_chrome(r, g_style.rounding, maybe_disabled(panel_col), maybe_disabled(border_col), motion.hover, motion.active, motion.focus, true);
 
     Rect clip_r = {r.x + 2, r.y + 2, r.w - 4, r.h - 4};
     if (clip_r.w < 0.0f) clip_r.w = 0.0f;
@@ -5879,7 +5994,12 @@ void progress_bar(float progress, const ProgressStyle& style) {
         Rect inner = {r.x + 3.0f, r.y + 3.0f, r.w - 6.0f, r.h - 6.0f};
         if (inner.w > 0.0f && inner.h > 0.0f && p > 0.0f) {
             float fill_w = inner.w * p;
-            if (style.wave_front && p < 0.995f) {
+            if (g_style.deep_theme == DeepTheme::SignalGeometry && !style.wave_front) {
+                fill_rect({inner.x,inner.y,fill_w,inner.h}, maybe_disabled(fill));
+                const float tip = std::min(3.f, fill_w);
+                fill_rect({inner.x + fill_w - tip,inner.y,tip,inner.h},
+                          maybe_disabled(resolve_color(ColorRole::InputFocus)));
+            } else if (style.wave_front && p < 0.995f) {
                 float amp = fminf(5.0f, fmaxf(1.5f, inner.h * 0.18f));
                 float core_w = clampf(fill_w - amp - 1.0f, 0.0f, inner.w);
                 if (core_w > 0.0f) {
